@@ -1,0 +1,28 @@
+[package]
+name = "mcp-manager"
+version = "0.1.0"
+description = "Verwaltung lokaler MCP-Server für Claude Code"
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "mcp_manager_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+wait-timeout = "0.2"
+libc = "0.2"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

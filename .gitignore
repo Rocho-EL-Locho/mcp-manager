@@ -1,0 +1,19 @@
+# Frontend
+/node_modules
+/dist
+
+# Rust / Tauri
+/src-tauri/target
+/src-tauri/gen
+
+# Claude Code / lokale Konfiguration
+.claude/
+.claude.json
+*.mcpmgr.bak
+*.bak
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.log
