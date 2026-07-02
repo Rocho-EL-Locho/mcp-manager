@@ -754,6 +754,45 @@ body {
   font-size: 0.78rem;
 }
 
+/* Erfasster stderr des Servers (aufklappbar, scrollbar). */
+.caps-logs {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.caps-logs > summary {
+  cursor: pointer;
+  padding: 0.45rem 0.7rem;
+  background: var(--surface-2);
+  font-size: 0.8rem;
+  color: var(--muted);
+  user-select: none;
+}
+
+.caps-log {
+  margin: 0;
+  padding: 0.55rem 0.7rem;
+  background: var(--bg);
+  border-top: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 16rem;
+  overflow: auto;
+  user-select: text;
+}
+
+/* Sichtbare Fehlergrund-Zeile direkt unter den Status-Badges. */
+.detail-status {
+  margin-top: -0.4rem;
+  margin-bottom: 0.6rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 /* ---------- Formular ---------- */
 .field {
   margin-bottom: 0.9rem;

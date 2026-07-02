@@ -1,7 +1,7 @@
 import { h, clear } from "../dom";
 import { icon, setIcon } from "../icons";
-import type { MergedServer, ServerEntry, Scope, Introspection } from "../ipc";
-import { revealServerEntry, setScope, introspectServer, peekIntrospection } from "../ipc";
+import type { MergedServer, ServerEntry, Scope, Introspection, ServerStatus } from "../ipc";
+import { revealServerEntry, setScope, introspectServer, peekIntrospection, healthCheck } from "../ipc";
 import { openModal } from "../modal";
 import { openConfirm } from "../confirm";
 import { toast } from "../toast";
@@ -84,44 +84,64 @@ function capsGroup(label: string, items: CapItem[]): HTMLElement {
   );
 }
 
-/// Rendert das Introspektions-Ergebnis: Zähler, Server-Info, aufklappbare Listen, Hinweise.
+/// Rendert das Introspektions-Ergebnis: bei Erfolg Zähler/Server-Info/Listen,
+/// bei Fehler ein Banner. Notizen und ein erfasster stderr-Log-Block (falls
+/// vorhanden) werden in beiden Fällen angehängt.
 function renderIntrospection(intro: Introspection): HTMLElement {
   const wrap = h("div", { class: "caps" });
 
-  wrap.append(
-    h(
-      "div",
-      { class: "caps-summary" },
-      h("span", { class: "badge badge-scope", text: `${intro.tools.length} Tools` }),
-      h("span", { class: "badge badge-scope", text: `${intro.resources.length} Ressourcen` }),
-      h("span", { class: "badge badge-scope", text: `${intro.prompts.length} Prompts` }),
-    ),
-  );
-
-  if (intro.serverName) {
-    const ver = intro.serverVersion ? ` v${intro.serverVersion}` : "";
-    wrap.append(h("p", { class: "muted mono", text: `${intro.serverName}${ver}` }));
-  }
-
-  const groups = h("div", { class: "caps-groups" });
-  if (intro.tools.length) {
-    groups.append(capsGroup("Tools", intro.tools.map((t) => ({ title: t.name, desc: t.description }))));
-  }
-  if (intro.resources.length) {
-    groups.append(
-      capsGroup(
-        "Ressourcen",
-        intro.resources.map((r) => ({ title: r.name ?? r.uri, desc: r.description ?? r.uri })),
+  if (intro.error) {
+    wrap.append(h("p", { class: "form-status error", text: intro.error }));
+  } else {
+    wrap.append(
+      h(
+        "div",
+        { class: "caps-summary" },
+        h("span", { class: "badge badge-scope", text: `${intro.tools.length} Tools` }),
+        h("span", { class: "badge badge-scope", text: `${intro.resources.length} Ressourcen` }),
+        h("span", { class: "badge badge-scope", text: `${intro.prompts.length} Prompts` }),
       ),
     );
+
+    if (intro.serverName) {
+      const ver = intro.serverVersion ? ` v${intro.serverVersion}` : "";
+      wrap.append(h("p", { class: "muted mono", text: `${intro.serverName}${ver}` }));
+    }
+
+    const groups = h("div", { class: "caps-groups" });
+    if (intro.tools.length) {
+      groups.append(capsGroup("Tools", intro.tools.map((t) => ({ title: t.name, desc: t.description }))));
+    }
+    if (intro.resources.length) {
+      groups.append(
+        capsGroup(
+          "Ressourcen",
+          intro.resources.map((r) => ({ title: r.name ?? r.uri, desc: r.description ?? r.uri })),
+        ),
+      );
+    }
+    if (intro.prompts.length) {
+      groups.append(capsGroup("Prompts", intro.prompts.map((p) => ({ title: p.name, desc: p.description }))));
+    }
+    if (groups.childElementCount) wrap.append(groups);
   }
-  if (intro.prompts.length) {
-    groups.append(capsGroup("Prompts", intro.prompts.map((p) => ({ title: p.name, desc: p.description }))));
-  }
-  if (groups.childElementCount) wrap.append(groups);
 
   for (const note of intro.notes) {
     wrap.append(h("p", { class: "muted caps-note", text: note }));
+  }
+
+  // Erfasster stderr des Server-Subprozesses (redigiert). Aufklappbar, damit er
+  // bei Erfolg nicht stört, bei Fehler aber den echten Grund liefert.
+  if (intro.logs) {
+    const logs = h(
+      "details",
+      { class: "caps-logs" },
+      h("summary", { text: "Server-Log (stderr)" }),
+      h("pre", { class: "mono caps-log", text: intro.logs }),
+    ) as HTMLDetailsElement;
+    // Bei einem Fehler direkt aufgeklappt zeigen.
+    if (intro.error) logs.open = true;
+    wrap.append(logs);
   }
   return wrap;
 }
@@ -135,8 +155,12 @@ function capabilitiesSection(server: MergedServer, opts: DetailOptions): HTMLEle
 
   const content = h("div", { class: "caps-content" }, h("p", { class: "muted", text: "Noch nicht geladen." }));
 
+  // Für fehlgeschlagene stdio-Server ist der Knopf primär ein Diagnose-Werkzeug
+  // (erfasst den echten stderr), daher kontextabhängige Beschriftung.
+  const isStdio = !!server.entry.command;
+  const diagnose = server.status.kind === "failed" && isStdio;
   const btnIcon = icon("refresh");
-  const btnLabel = h("span", { text: "Fähigkeiten laden" });
+  const btnLabel = h("span", { text: diagnose ? "Diagnose ausführen" : "Fähigkeiten laden" });
   const loadBtn = h("button", { class: "btn btn-small" }, btnIcon, btnLabel) as HTMLButtonElement;
   let loadedOnce = false;
 
@@ -148,8 +172,9 @@ function capabilitiesSection(server: MergedServer, opts: DetailOptions): HTMLEle
     content.append(renderIntrospection(intro));
     loadedOnce = true;
     btnLabel.textContent = "Aktualisieren";
-    // Liste im Hintergrund über die neuen Zähler informieren.
-    opts.onIntrospected?.(server, intro);
+    // Liste nur bei erfolgreicher Introspektion über die Zähler informieren –
+    // ein Fehlversuch (leere Listen) soll kein „0·0·0"-Badge erzeugen.
+    if (!intro.error) opts.onIntrospected?.(server, intro);
   };
 
   const load = async (refresh: boolean) => {
@@ -195,23 +220,67 @@ export interface DetailOptions {
   onChanged?: () => void;
   /// Wird nach erfolgreicher Introspektion aufgerufen (z. B. um Listen-Zähler zu aktualisieren).
   onIntrospected?: (server: MergedServer, intro: Introspection) => void;
+  /// Wird nach einem erneuten Health-Check aufgerufen, damit die Liste den neuen
+  /// Status ohne teuren Full-Refresh übernehmen kann.
+  onRechecked?: (server: MergedServer, status: ServerStatus) => void;
 }
 
 export function openDetail(server: MergedServer, opts: DetailOptions = {}): void {
-  const st = statusMeta(server.status);
+  // Status-Bereich (Badges + sichtbare Fehlergrund-Zeile) neu-rendbar halten,
+  // damit „Erneut prüfen" ihn nach einem Health-Check aktualisieren kann.
+  const metaWrap = h("div");
+  const recheckIcon = icon("refresh");
+  const recheckBtn = h(
+    "button",
+    { class: "btn btn-small", title: "Status neu prüfen" },
+    recheckIcon,
+    h("span", { text: "Erneut prüfen" }),
+  ) as HTMLButtonElement;
 
-  const meta = h(
-    "div",
-    { class: "detail-meta" },
-    h("span", { class: "badge badge-scope", text: server.origin }),
-    h("span", { class: `badge ${st.cls}`, title: st.title }, st.label),
-    server.enabled
-      ? h("span", { class: "badge badge-ok", text: "aktiv" })
-      : h("span", { class: "badge badge-muted", text: "deaktiviert" }),
-    server.collision
-      ? h("span", { class: "badge badge-warn", text: "Namens-Kollision" })
-      : null,
-  );
+  const renderStatus = () => {
+    clear(metaWrap);
+    const st = statusMeta(server.status);
+    metaWrap.append(
+      h(
+        "div",
+        { class: "detail-meta" },
+        h("span", { class: "badge badge-scope", text: server.origin }),
+        h("span", { class: `badge ${st.cls}`, title: st.title }, st.label),
+        server.enabled
+          ? h("span", { class: "badge badge-ok", text: "aktiv" })
+          : h("span", { class: "badge badge-muted", text: "deaktiviert" }),
+        server.collision
+          ? h("span", { class: "badge badge-warn", text: "Namens-Kollision" })
+          : null,
+        h("span", { class: "spacer" }),
+        recheckBtn,
+      ),
+    );
+    // Fehlergrund sichtbar machen (nicht nur als Tooltip am Badge).
+    if (server.status.kind === "failed" && server.status.detail) {
+      metaWrap.append(h("p", { class: "form-status error detail-status", text: server.status.detail }));
+    }
+  };
+
+  recheckBtn.addEventListener("click", async () => {
+    recheckBtn.disabled = true;
+    recheckIcon.classList.add("spin");
+    try {
+      const status = await healthCheck(server.name, server.project_path ?? undefined);
+      server.status = status;
+      renderStatus();
+      opts.onRechecked?.(server, status);
+      const m = statusMeta(status);
+      toast(`Status: ${m.label}`, status.kind === "failed" ? "error" : "ok");
+    } catch (e) {
+      toast("Prüfen fehlgeschlagen: " + String(e), "error");
+    } finally {
+      recheckBtn.disabled = false;
+      recheckIcon.classList.remove("spin");
+    }
+  });
+
+  renderStatus();
 
   const defWrap = h("div");
   let revealed = false;
@@ -294,7 +363,7 @@ export function openDetail(server: MergedServer, opts: DetailOptions = {}): void
   const body = h(
     "div",
     { class: "detail" },
-    meta,
+    metaWrap,
     server.project_path
       ? h("p", { class: "muted mono", text: `Projekt: ${server.project_path}` })
       : null,
