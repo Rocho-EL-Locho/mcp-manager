@@ -1,7 +1,7 @@
 import { h, clear } from "../dom";
 import { icon, setIcon } from "../icons";
-import type { MergedServer, ServerEntry, Scope } from "../ipc";
-import { revealServerEntry, setScope } from "../ipc";
+import type { MergedServer, ServerEntry, Scope, Introspection } from "../ipc";
+import { revealServerEntry, setScope, introspectServer, peekIntrospection } from "../ipc";
 import { openModal } from "../modal";
 import { openConfirm } from "../confirm";
 import { toast } from "../toast";
@@ -58,8 +58,143 @@ function definitionBody(entry: ServerEntry): HTMLElement {
   return wrap;
 }
 
+interface CapItem {
+  title: string;
+  desc?: string;
+}
+
+/// Eine aufklappbare Gruppe (Tools/Ressourcen/Prompts) mit Namen + Beschreibung.
+function capsGroup(label: string, items: CapItem[]): HTMLElement {
+  const list = h("div", { class: "caps-list" });
+  for (const it of items) {
+    list.append(
+      h(
+        "div",
+        { class: "caps-item" },
+        h("div", { class: "mono caps-item-name", text: it.title }),
+        it.desc ? h("div", { class: "muted caps-item-desc", text: it.desc }) : null,
+      ),
+    );
+  }
+  return h(
+    "details",
+    { class: "caps-group" },
+    h("summary", { text: `${label} (${items.length})` }),
+    list,
+  );
+}
+
+/// Rendert das Introspektions-Ergebnis: Zähler, Server-Info, aufklappbare Listen, Hinweise.
+function renderIntrospection(intro: Introspection): HTMLElement {
+  const wrap = h("div", { class: "caps" });
+
+  wrap.append(
+    h(
+      "div",
+      { class: "caps-summary" },
+      h("span", { class: "badge badge-scope", text: `${intro.tools.length} Tools` }),
+      h("span", { class: "badge badge-scope", text: `${intro.resources.length} Ressourcen` }),
+      h("span", { class: "badge badge-scope", text: `${intro.prompts.length} Prompts` }),
+    ),
+  );
+
+  if (intro.serverName) {
+    const ver = intro.serverVersion ? ` v${intro.serverVersion}` : "";
+    wrap.append(h("p", { class: "muted mono", text: `${intro.serverName}${ver}` }));
+  }
+
+  const groups = h("div", { class: "caps-groups" });
+  if (intro.tools.length) {
+    groups.append(capsGroup("Tools", intro.tools.map((t) => ({ title: t.name, desc: t.description }))));
+  }
+  if (intro.resources.length) {
+    groups.append(
+      capsGroup(
+        "Ressourcen",
+        intro.resources.map((r) => ({ title: r.name ?? r.uri, desc: r.description ?? r.uri })),
+      ),
+    );
+  }
+  if (intro.prompts.length) {
+    groups.append(capsGroup("Prompts", intro.prompts.map((p) => ({ title: p.name, desc: p.description }))));
+  }
+  if (groups.childElementCount) wrap.append(groups);
+
+  for (const note of intro.notes) {
+    wrap.append(h("p", { class: "muted caps-note", text: note }));
+  }
+  return wrap;
+}
+
+/// Abschnitt „Fähigkeiten": On-Demand-Introspektion mit Laden/Aktualisieren-Button.
+/// Beim Öffnen wird ein bereits gecachtes Ergebnis (ohne Prozessstart) vorgeladen.
+function capabilitiesSection(server: MergedServer, opts: DetailOptions): HTMLElement | null {
+  // Nur für Server mit lokaler Definition (Scope bekannt) sinnvoll.
+  if (!server.entry || !server.scope) return null;
+  const scope = server.scope;
+
+  const content = h("div", { class: "caps-content" }, h("p", { class: "muted", text: "Noch nicht geladen." }));
+
+  const btnIcon = icon("refresh");
+  const btnLabel = h("span", { text: "Fähigkeiten laden" });
+  const loadBtn = h("button", { class: "btn btn-small" }, btnIcon, btnLabel) as HTMLButtonElement;
+  let loadedOnce = false;
+
+  const showResult = (intro: Introspection) => {
+    // Wurde das Modal inzwischen geschlossen (Promise löst verspätet auf),
+    // nichts mehr rendern oder als Seiteneffekt die Liste neu zeichnen.
+    if (!content.isConnected) return;
+    clear(content);
+    content.append(renderIntrospection(intro));
+    loadedOnce = true;
+    btnLabel.textContent = "Aktualisieren";
+    // Liste im Hintergrund über die neuen Zähler informieren.
+    opts.onIntrospected?.(server, intro);
+  };
+
+  const load = async (refresh: boolean) => {
+    loadBtn.disabled = true;
+    btnIcon.classList.add("spin");
+    btnLabel.textContent = loadedOnce ? "Aktualisiere…" : "Lade…";
+    clear(content);
+    content.append(h("p", { class: "muted", text: "Server wird gestartet und abgefragt…" }));
+    try {
+      showResult(await introspectServer(server.name, scope, server.project_path ?? undefined, refresh));
+    } catch (e) {
+      clear(content);
+      content.append(
+        h("p", { class: "form-status error", text: "Introspektion fehlgeschlagen: " + String(e) }),
+      );
+      btnLabel.textContent = loadedOnce ? "Aktualisieren" : "Erneut versuchen";
+    } finally {
+      loadBtn.disabled = false;
+      btnIcon.classList.remove("spin");
+    }
+  };
+
+  loadBtn.addEventListener("click", () => void load(loadedOnce));
+
+  // Bereits gecachtes Ergebnis sofort anzeigen (kein Prozessstart).
+  void peekIntrospection(server.name, scope, server.project_path ?? undefined)
+    .then((cached) => {
+      if (cached && !loadedOnce) showResult(cached);
+    })
+    .catch(() => {
+      /* Cache-Abruf ist best effort; Fehler ignorieren. */
+    });
+
+  return h(
+    "div",
+    { class: "detail-caps" },
+    h("div", { class: "detail-defhead" }, h("h3", { text: "Fähigkeiten" }), loadBtn),
+    content,
+  );
+}
+
 export interface DetailOptions {
   onChanged?: () => void;
+  /// Wird nach erfolgreicher Introspektion aufgerufen (z. B. um Listen-Zähler zu aktualisieren).
+  onIntrospected?: (server: MergedServer, intro: Introspection) => void;
 }
 
 export function openDetail(server: MergedServer, opts: DetailOptions = {}): void {
@@ -170,6 +305,7 @@ export function openDetail(server: MergedServer, opts: DetailOptions = {}): void
       server.editable && server.has_secrets ? revealBtn : null,
     ),
     defWrap,
+    capabilitiesSection(server, opts),
     scopeSection,
   );
 

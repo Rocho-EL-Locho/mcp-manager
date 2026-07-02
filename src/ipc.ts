@@ -40,6 +40,38 @@ export interface MergedServer {
   editable: boolean;
   has_secrets: boolean;
   collision: boolean;
+  /** Nur gesetzt, wenn der Server bereits introspiziert wurde (aus dem Cache). */
+  tool_count?: number;
+  resource_count?: number;
+  prompt_count?: number;
+}
+
+export interface McpTool {
+  name: string;
+  description?: string;
+  inputSchema?: unknown;
+}
+
+export interface McpResource {
+  uri: string;
+  name?: string;
+  description?: string;
+  mimeType?: string;
+}
+
+export interface McpPrompt {
+  name: string;
+  description?: string;
+}
+
+export interface Introspection {
+  tools: McpTool[];
+  resources: McpResource[];
+  prompts: McpPrompt[];
+  serverName?: string;
+  serverVersion?: string;
+  notes: string[];
+  introspectedAt: number;
 }
 
 export interface ProjectInfo {
@@ -91,6 +123,33 @@ export async function revealServerEntry(
   return invoke<ServerEntry | null>("reveal_server_entry", {
     scope,
     name,
+    projectPath: projectPath ?? null,
+  });
+}
+
+export async function introspectServer(
+  name: string,
+  scope: Scope,
+  projectPath?: string,
+  refresh = false,
+): Promise<Introspection> {
+  return invoke<Introspection>("introspect_server", {
+    name,
+    scope,
+    projectPath: projectPath ?? null,
+    refresh,
+  });
+}
+
+/// Gecachtes Introspektions-Ergebnis abrufen, ohne den Server-Prozess zu starten.
+export async function peekIntrospection(
+  name: string,
+  scope: Scope,
+  projectPath?: string,
+): Promise<Introspection | null> {
+  return invoke<Introspection | null>("peek_introspection", {
+    name,
+    scope,
     projectPath: projectPath ?? null,
   });
 }

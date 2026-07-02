@@ -70,6 +70,55 @@ pub struct ListItem {
     pub status: ServerStatus,
 }
 
+/// Ein vom Server bereitgestelltes Tool (aus `tools/list`).
+#[derive(Debug, Clone, Serialize)]
+pub struct McpTool {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// JSON-Schema der Eingabe; maskiert, falls es geheim aussehende Werte enthält.
+    #[serde(rename = "inputSchema", skip_serializing_if = "Option::is_none")]
+    pub input_schema: Option<serde_json::Value>,
+}
+
+/// Eine vom Server bereitgestellte Ressource (aus `resources/list`).
+#[derive(Debug, Clone, Serialize)]
+pub struct McpResource {
+    pub uri: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+}
+
+/// Ein vom Server bereitgestellter Prompt (aus `prompts/list`).
+#[derive(Debug, Clone, Serialize)]
+pub struct McpPrompt {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Ergebnis des MCP-Handshakes: was ein Server tatsächlich bereitstellt.
+#[derive(Debug, Clone, Serialize)]
+pub struct Introspection {
+    pub tools: Vec<McpTool>,
+    pub resources: Vec<McpResource>,
+    pub prompts: Vec<McpPrompt>,
+    /// Name/Version aus `serverInfo` des `initialize`-Ergebnisses.
+    #[serde(rename = "serverName", skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
+    #[serde(rename = "serverVersion", skip_serializing_if = "Option::is_none")]
+    pub server_version: Option<String>,
+    /// Nicht-fatale Hinweise (z. B. „resources nicht unterstützt", HTTP/SSE-Hinweis).
+    pub notes: Vec<String>,
+    /// Unix-Zeitstempel (Sekunden) der Introspektion.
+    #[serde(rename = "introspectedAt")]
+    pub introspected_at: u64,
+}
+
 /// Was das Frontend tatsächlich rendert: Definition (aus JSON) + Status (aus CLI).
 #[derive(Debug, Clone, Serialize)]
 pub struct MergedServer {
@@ -89,6 +138,14 @@ pub struct MergedServer {
     pub has_secrets: bool,
     /// true, wenn derselbe Name in mehreren Scopes existiert.
     pub collision: bool,
+    /// Anzahl introspizierter Tools/Ressourcen/Prompts (nur gesetzt, wenn der
+    /// Server bereits introspiziert wurde – aus dem Introspektions-Cache).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_count: Option<usize>,
 }
 
 /// Ein Claude-Code-Projekt (Eintrag unter `projects` in ~/.claude.json).
