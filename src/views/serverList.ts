@@ -73,6 +73,25 @@ export function scopeLabel(scope: Scope | null): string {
   }
 }
 
+/// Kompaktes Zähler-Badge (Tools·Ressourcen·Prompts), nur wenn schon introspiziert.
+function capsBadge(server: MergedServer): HTMLElement | null {
+  if (
+    server.tool_count === undefined &&
+    server.resource_count === undefined &&
+    server.prompt_count === undefined
+  ) {
+    return null;
+  }
+  const t = server.tool_count ?? 0;
+  const r = server.resource_count ?? 0;
+  const p = server.prompt_count ?? 0;
+  return h(
+    "span",
+    { class: "badge badge-caps", title: `${t} Tools · ${r} Ressourcen · ${p} Prompts` },
+    `${t}·${r}·${p}`,
+  );
+}
+
 function serverCard(server: MergedServer, handlers: ListHandlers): HTMLElement {
   const st = statusMeta(server.status);
 
@@ -81,6 +100,7 @@ function serverCard(server: MergedServer, handlers: ListHandlers): HTMLElement {
     { class: "card-title" },
     h("span", { class: "server-name", text: server.name }),
     h("span", { class: "badge badge-scope", text: server.origin }),
+    capsBadge(server),
     server.has_secrets ? icon("lock", "lock", "enthält Geheimnisse") : null,
     server.collision ? icon("alert", "warn-icon", "Name existiert in mehreren Scopes") : null,
   );

@@ -301,7 +301,23 @@ function renderContent(): void {
     renderServerList(
       state.servers,
       {
-        onDetails: (s) => openDetail(s, { onChanged: () => void refresh() }),
+        onDetails: (s) =>
+          openDetail(s, {
+            onChanged: () => void refresh(),
+            onIntrospected: (srv, intro) => {
+              // Zähler des betroffenen Servers aktualisieren und Liste neu rendern
+              // (kein teurer Full-Refresh mit Health-Check).
+              const target = state.servers.find(
+                (x) => x.name === srv.name && x.scope === srv.scope,
+              );
+              if (target) {
+                target.tool_count = intro.tools.length;
+                target.resource_count = intro.resources.length;
+                target.prompt_count = intro.prompts.length;
+                renderContent();
+              }
+            },
+          }),
         onRecheck: recheck,
         onEdit,
         onRemove,

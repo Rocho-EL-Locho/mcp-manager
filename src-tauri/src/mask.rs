@@ -294,6 +294,22 @@ fn redact_token(token: &str) -> String {
     }
 }
 
+/// Redigiert rekursiv jeden String-Blattwert eines JSON-Werts über
+/// `redact_secrets`. Für Tool-Schemata/Beschreibungen aus der Introspektion,
+/// damit versehentlich eingebettete Secrets nicht ins UI gelangen. Struktur und
+/// Objekt-Schlüssel bleiben unangetastet.
+pub fn redact_json(value: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::String(s) => Value::String(redact_secrets(s)),
+        Value::Array(arr) => Value::Array(arr.iter().map(redact_json).collect()),
+        Value::Object(map) => {
+            Value::Object(map.iter().map(|(k, v)| (k.clone(), redact_json(v))).collect())
+        }
+        other => other.clone(),
+    }
+}
+
 /// Kurzbeschreibung für die Listenzeile aus einer Definition ableiten.
 pub fn summarize_entry(entry: &ServerEntry) -> String {
     if let Some(url) = &entry.url {
@@ -345,5 +361,27 @@ mod tests {
         // Freitext mit Pfad bleibt lesbar.
         let plain = "spawn failed for /home/user/mcp-servers/example-mcp";
         assert_eq!(redact_secrets(plain), plain);
+    }
+
+    #[test]
+    fn redact_json_maskiert_verschachtelte_secrets() {
+        use serde_json::json;
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "api_key": { "type": "string", "default": "ghp_ABC123def456ghi789" },
+                "path": { "type": "string", "default": "/home/user/data" }
+            },
+            "examples": ["eyJhbGciOiJIUzI1NiJ9.abc.def"]
+        });
+        let red = redact_json(&schema);
+        let s = red.to_string();
+        assert!(!s.contains("ghp_ABC123def456ghi789"), "Token darf nicht durchrutschen: {s}");
+        assert!(!s.contains("eyJhbGciOiJIUzI1NiJ9"), "JWT darf nicht durchrutschen: {s}");
+        assert!(s.contains(MASK));
+        // Strukturelle Schlüssel und harmlose Werte bleiben erhalten.
+        assert!(s.contains("properties"));
+        assert!(s.contains("/home/user/data"));
+        assert!(s.contains("object"));
     }
 }

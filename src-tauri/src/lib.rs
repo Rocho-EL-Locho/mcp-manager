@@ -2,6 +2,7 @@ mod assistant;
 mod claude_cli;
 mod commands;
 mod config_read;
+mod introspect;
 mod mask;
 mod models;
 mod parse;
@@ -19,6 +20,8 @@ pub fn run() {
             commands::delete_project,
             commands::health_check,
             commands::reveal_server_entry,
+            commands::introspect_server,
+            commands::peek_introspection,
             commands::add_server,
             commands::update_server,
             commands::remove_server,

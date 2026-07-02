@@ -13,9 +13,12 @@ use crate::config_read::{
     claude_json_path, collect_definitions, collect_disabled, default_project_path,
     project_settings_local_path, read_json_value, settings_local_path,
 };
-use crate::mask::{entry_has_secrets, mask_entry, mask_summary, redact_secrets, summarize_entry};
+use crate::mask::{
+    entry_has_secrets, mask_entry, mask_summary, redact_json, redact_secrets, summarize_entry,
+};
 use crate::models::{
-    AppError, ClaudeInfo, MergedServer, ProjectInfo, Scope, ServerEntry, ServerStatus,
+    AppError, ClaudeInfo, Introspection, MergedServer, ProjectInfo, Scope, ServerEntry,
+    ServerStatus,
 };
 use crate::parse::{parse_list, status_from_text};
 
@@ -23,6 +26,9 @@ const LIST_TIMEOUT: Duration = Duration::from_secs(45);
 const GET_TIMEOUT: Duration = Duration::from_secs(20);
 const MUT_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(180);
+/// Zeitbudget für den Introspektions-Handshake. Großzügig, weil der erste
+/// `npx`/`uvx`-Start (Download/Cold-Start) spürbar dauern kann.
+const INTROSPECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Zuletzt bekannter Status + Kurzbeschreibung eines Servers (für den Cache).
 #[derive(Clone)]
@@ -35,9 +41,20 @@ struct CachedItem {
 /// und den Schnell-Start ohne erneuten Health-Check flott.
 type StatusCache = Mutex<HashMap<String, HashMap<String, CachedItem>>>;
 
+/// Cache der Introspektions-Ergebnisse. Key: "scope::name::projektpfad".
+/// Wird nur auf ausdrückliche Nutzer-Aktion befüllt (startet den Server-Prozess).
+type IntrospectionCache = Mutex<HashMap<String, Introspection>>;
+
 #[derive(Default)]
 pub struct AppState {
     status_cache: StatusCache,
+    introspection_cache: IntrospectionCache,
+}
+
+/// Stabiler Cache-Schlüssel für die Introspektion eines Servers.
+fn introspection_key(scope: Scope, name: &str, project_path: &Option<String>) -> String {
+    let dir = resolve_project_dir(project_path.clone());
+    format!("{}::{}::{}", scope.cli_value(), name, dir.to_string_lossy())
 }
 
 /// Prüft beim Start, ob die claude-CLI verfügbar ist, und liefert ihre Version.
@@ -97,7 +114,22 @@ pub async fn list_servers(
     reveal: bool,
     with_status: bool,
 ) -> Result<Vec<MergedServer>, AppError> {
-    gather_servers(&state.status_cache, project_path, reveal, with_status)
+    let mut servers = gather_servers(&state.status_cache, project_path, reveal, with_status)?;
+    // Zähler aus bereits vorhandenen Introspektions-Ergebnissen anreichern.
+    let cache = state
+        .introspection_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for s in &mut servers {
+        if let Some(scope) = s.scope {
+            if let Some(intro) = cache.get(&introspection_key(scope, &s.name, &s.project_path)) {
+                s.tool_count = Some(intro.tools.len());
+                s.resource_count = Some(intro.resources.len());
+                s.prompt_count = Some(intro.prompts.len());
+            }
+        }
+    }
+    Ok(servers)
 }
 
 fn gather_servers(
@@ -214,6 +246,9 @@ fn gather_servers(
             editable: true,
             has_secrets,
             collision: name_counts.get(&d.name).copied().unwrap_or(0) > 1,
+            tool_count: None,
+            resource_count: None,
+            prompt_count: None,
         });
     }
 
@@ -237,6 +272,9 @@ fn gather_servers(
             editable: false,
             has_secrets: false,
             collision: false,
+            tool_count: None,
+            resource_count: None,
+            prompt_count: None,
         });
     }
 
@@ -264,6 +302,9 @@ fn gather_servers(
             editable: true,
             has_secrets,
             collision: false,
+            tool_count: None,
+            resource_count: None,
+            prompt_count: None,
         });
     }
 
@@ -322,6 +363,127 @@ pub fn reveal_server_entry(
         }
     }
     Ok(None)
+}
+
+/// Introspiziert einen Server per MCP-Handshake (`tools`/`resources`/`prompts`).
+/// Startet dazu den Server-Prozess (nur stdio). `refresh=false` liefert ein
+/// gecachtes Ergebnis, falls vorhanden. Secrets in Schemata/Beschreibungen
+/// werden vor der Rückgabe maskiert.
+#[tauri::command]
+pub async fn introspect_server(
+    state: State<'_, AppState>,
+    name: String,
+    scope: Scope,
+    project_path: Option<String>,
+    refresh: bool,
+) -> Result<Introspection, AppError> {
+    let key = introspection_key(scope, &name, &project_path);
+
+    if !refresh {
+        if let Some(cached) = state
+            .introspection_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .cloned()
+        {
+            return Ok(cached);
+        }
+    }
+
+    // Unmaskierte Definition auflösen (wie reveal_server_entry): der Handshake
+    // braucht die echten env/args, um den Prozess zu starten.
+    let dir = resolve_project_dir(project_path.clone());
+    let entry = collect_definitions(&dir)
+        .into_iter()
+        .find(|d| d.scope == scope && d.name == name)
+        .map(|d| d.entry)
+        .or_else(|| {
+            (scope == Scope::User)
+                .then(|| crate::stash::peek(&name).map(|i| i.entry))
+                .flatten()
+        })
+        .ok_or_else(|| AppError::Io("Server-Definition nicht gefunden".into()))?;
+
+    let mut introspection = if entry.command.is_some() {
+        crate::introspect::introspect_stdio(&entry, INTROSPECT_TIMEOUT)?
+    } else {
+        // HTTP/SSE: in dieser Version nicht unterstützt (kein Prozess-Start).
+        Introspection {
+            tools: Vec::new(),
+            resources: Vec::new(),
+            prompts: Vec::new(),
+            server_name: None,
+            server_version: None,
+            notes: vec![
+                "Introspektion wird derzeit nur für stdio-Server unterstützt (HTTP/SSE folgt)."
+                    .into(),
+            ],
+            introspected_at: crate::introspect::unix_now(),
+        }
+    };
+
+    mask_introspection(&mut introspection);
+
+    state
+        .introspection_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, introspection.clone());
+
+    Ok(introspection)
+}
+
+/// Liefert das bereits gecachte Introspektions-Ergebnis eines Servers – **ohne**
+/// den Server-Prozess zu starten. Die Detail-Ansicht nutzt das beim Öffnen, um
+/// zuvor geladene Fähigkeiten sofort wieder anzuzeigen.
+#[tauri::command]
+pub fn peek_introspection(
+    state: State<'_, AppState>,
+    name: String,
+    scope: Scope,
+    project_path: Option<String>,
+) -> Result<Option<Introspection>, AppError> {
+    let key = introspection_key(scope, &name, &project_path);
+    Ok(state
+        .introspection_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned())
+}
+
+/// Maskiert geheim aussehende Werte in Tool-Schemata, Beschreibungen und Notizen,
+/// bevor das Ergebnis das Backend verlässt.
+fn mask_introspection(intro: &mut Introspection) {
+    for t in &mut intro.tools {
+        t.name = redact_secrets(&t.name);
+        if let Some(d) = t.description.as_mut() {
+            *d = redact_secrets(d);
+        }
+        if let Some(schema) = t.input_schema.take() {
+            t.input_schema = Some(redact_json(&schema));
+        }
+    }
+    for r in &mut intro.resources {
+        // uri kann geheime Query-Parameter enthalten (z. B. ?token=…).
+        r.uri = redact_secrets(&r.uri);
+        if let Some(n) = r.name.as_mut() {
+            *n = redact_secrets(n);
+        }
+        if let Some(d) = r.description.as_mut() {
+            *d = redact_secrets(d);
+        }
+    }
+    for p in &mut intro.prompts {
+        p.name = redact_secrets(&p.name);
+        if let Some(d) = p.description.as_mut() {
+            *d = redact_secrets(d);
+        }
+    }
+    for n in &mut intro.notes {
+        *n = redact_secrets(n);
+    }
 }
 
 /// Arbeitsverzeichnis für einen Scope: user = Home, local/project = Projektpfad.

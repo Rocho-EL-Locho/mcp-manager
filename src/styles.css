@@ -679,6 +679,81 @@ body {
   color: var(--muted);
 }
 
+/* ---------- Fähigkeiten (Introspektion) ---------- */
+.badge-caps {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: transparent;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.02em;
+}
+
+.detail-caps {
+  margin-top: 1.2rem;
+  border-top: 1px solid var(--border);
+  padding-top: 0.4rem;
+}
+
+.caps {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.caps-summary {
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.caps-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.caps-group {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.caps-group > summary {
+  cursor: pointer;
+  padding: 0.45rem 0.7rem;
+  background: var(--surface-2);
+  font-size: 0.8rem;
+  color: var(--muted);
+  user-select: none;
+}
+
+.caps-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.caps-item {
+  padding: 0.45rem 0.7rem;
+  border-top: 1px solid var(--border);
+}
+
+.caps-item-name {
+  font-size: 0.82rem;
+  overflow-wrap: anywhere;
+}
+
+.caps-item-desc {
+  font-size: 0.78rem;
+  margin-top: 0.15rem;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.caps-note {
+  font-size: 0.78rem;
+}
+
 /* ---------- Formular ---------- */
 .field {
   margin-bottom: 0.9rem;
