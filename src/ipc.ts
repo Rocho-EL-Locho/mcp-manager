@@ -71,6 +71,10 @@ export interface Introspection {
   serverName?: string;
   serverVersion?: string;
   notes: string[];
+  /** Redigierter stderr-Auszug des Server-Subprozesses (nur stdio). */
+  logs?: string;
+  /** Fehlermeldung, falls Start/Handshake fehlschlug (redigiert). */
+  error?: string;
   introspectedAt: number;
 }
 

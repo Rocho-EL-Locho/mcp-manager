@@ -114,6 +114,12 @@ pub struct Introspection {
     pub server_version: Option<String>,
     /// Nicht-fatale Hinweise (z. B. „resources nicht unterstützt", HTTP/SSE-Hinweis).
     pub notes: Vec<String>,
+    /// Redigierter stderr-Auszug des Server-Subprozesses (nur stdio). None wenn leer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logs: Option<String>,
+    /// Fehlermeldung, falls Start/Handshake fehlschlug (redigiert). None bei Erfolg.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     /// Unix-Zeitstempel (Sekunden) der Introspektion.
     #[serde(rename = "introspectedAt")]
     pub introspected_at: u64,

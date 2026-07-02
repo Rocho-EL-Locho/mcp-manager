@@ -304,6 +304,16 @@ function renderContent(): void {
         onDetails: (s) =>
           openDetail(s, {
             onChanged: () => void refresh(),
+            onRechecked: (srv, status) => {
+              // Neuen Health-Status ohne teuren Full-Refresh in die Liste übernehmen.
+              const target = state.servers.find(
+                (x) => x.name === srv.name && x.scope === srv.scope,
+              );
+              if (target) {
+                target.status = status;
+                renderContent();
+              }
+            },
             onIntrospected: (srv, intro) => {
               // Zähler des betroffenen Servers aktualisieren und Liste neu rendern
               // (kein teurer Full-Refresh mit Health-Check).

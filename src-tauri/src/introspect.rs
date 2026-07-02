@@ -35,6 +35,10 @@ const MAX_PAGES: usize = 10;
 /// Ausgabe unbegrenzt Speicher belegt (OOM).
 const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Obergrenze für den erfassten stderr-Auszug (Diagnose). Klein gehalten – das
+/// UI zeigt nur den relevanten Start-/Fehlertext, kein volles Log.
+const STDERR_CAP: u64 = 64 * 1024;
+
 /// Ausgang eines einzelnen JSON-RPC-Requests.
 enum RpcOutcome {
     /// Erfolgreiches `result`-Objekt.
@@ -44,16 +48,17 @@ enum RpcOutcome {
 }
 
 /// Introspiziert einen stdio-Server. `entry.command` muss gesetzt sein.
-pub fn introspect_stdio(entry: &ServerEntry, timeout: Duration) -> Result<Introspection, crate::models::AppError> {
-    use crate::models::AppError;
-
-    let command = entry
-        .command
-        .as_ref()
-        .ok_or_else(|| AppError::Io("Kein command für stdio-Introspektion".into()))?;
+///
+/// Gibt IMMER eine `Introspection` zurück: Start-/Handshake-Fehler landen in
+/// `error` (und ggf. erfasster stderr in `logs`), statt als `Err` verloren zu
+/// gehen. So kann die Detail-Ansicht den echten Fehlergrund zeigen.
+pub fn introspect_stdio(entry: &ServerEntry, timeout: Duration) -> Introspection {
+    let mut notes: Vec<String> = Vec::new();
+    let Some(command) = entry.command.as_ref() else {
+        return error_introspection("Kein command für stdio-Introspektion".into(), None, notes);
+    };
 
     let deadline = Instant::now() + timeout;
-    let mut notes: Vec<String> = Vec::new();
 
     // --- Prozess starten -----------------------------------------------------
     let mut cmd = Command::new(command);
@@ -71,33 +76,70 @@ pub fn introspect_stdio(entry: &ServerEntry, timeout: Duration) -> Result<Intros
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    let mut child = cmd.spawn().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            AppError::Io(format!("Befehl nicht gefunden: {command}"))
-        } else {
-            AppError::Io(e.to_string())
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = if e.kind() == std::io::ErrorKind::NotFound {
+                format!("Befehl nicht gefunden: {command}")
+            } else {
+                e.to_string()
+            };
+            return error_introspection(msg, None, notes);
         }
-    })?;
+    };
 
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| AppError::Io("stdin nicht verfügbar".into()))?;
+    let Some(mut stdin) = child.stdin.take() else {
+        cleanup(&mut child);
+        return error_introspection("stdin nicht verfügbar".into(), None, notes);
+    };
 
-    // stderr nebenläufig verwerfen (verhindert Pipe-Deadlock).
+    // stderr nebenläufig lesen und einmalig über einen Channel bereitstellen.
+    // Bewusst NICHT gejoint (detached), analog zum stdout-Reader: ein Kindeskind,
+    // das die Pipe erbt und offen hält, könnte join() sonst blockieren.
+    //
+    // WICHTIG: Die Pipe wird VOLLSTÄNDIG geleert – behalten wird aber nur der erste
+    // STDERR_CAP-Anteil. Würde man nach STDERR_CAP aufhören zu lesen (z. B.
+    // `take(STDERR_CAP)`), blockierte ein gesprächiger Server beim Schreiben, sobald
+    // der Pipe-Puffer voll ist; er antwortete dann nicht mehr auf stdout und der
+    // Handshake liefe fälschlich in den Timeout. Weiterlesen schützt zugleich vor OOM
+    // (Überschuss wird verworfen, nicht akkumuliert).
+    let (err_tx, err_rx) = mpsc::channel::<Vec<u8>>();
     if let Some(mut err_pipe) = child.stderr.take() {
         std::thread::spawn(move || {
-            let mut sink = Vec::new();
-            let _ = err_pipe.read_to_end(&mut sink);
+            let cap = STDERR_CAP as usize;
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 8192];
+            let mut truncated = false;
+            loop {
+                match err_pipe.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if buf.len() < cap {
+                            let take = (cap - buf.len()).min(n);
+                            buf.extend_from_slice(&chunk[..take]);
+                            if take < n {
+                                truncated = true;
+                            }
+                        } else {
+                            truncated = true;
+                        }
+                        // Überschuss bewusst verwerfen, aber weiterlesen (Pipe leeren).
+                    }
+                }
+            }
+            if truncated {
+                buf.extend_from_slice(b"\n\xe2\x80\xa6 (stderr gekuerzt)");
+            }
+            let _ = err_tx.send(buf);
         });
     }
 
     // stdout zeilenweise in einen Channel lesen. `take(MAX_RESPONSE_BYTES)`
     // deckelt den Gesamtspeicher (OOM-Schutz gegen riesige/zeilenlose Ausgaben).
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| AppError::Io("stdout nicht verfügbar".into()))?;
+    let Some(stdout) = child.stdout.take() else {
+        cleanup(&mut child);
+        return error_introspection("stdout nicht verfügbar".into(), None, notes);
+    };
     let (tx, rx) = mpsc::channel::<String>();
     // Bewusst NICHT gejoint (detached): killpg schließt zwar die Pipe, aber ein
     // Kindeskind, das die Pipe erbt und offen hält, könnte join() sonst blockieren.
@@ -120,7 +162,6 @@ pub fn introspect_stdio(entry: &ServerEntry, timeout: Duration) -> Result<Intros
     });
 
     // --- Handshake -----------------------------------------------------------
-    // Ab hier bei jedem Fehler den Prozess sicher aufräumen.
     let result = run_handshake(&mut stdin, &rx, &deadline, &mut notes);
 
     // stdin schließen, Prozessgruppe hart beenden. Der Reader-Thread wird nicht
@@ -128,17 +169,46 @@ pub fn introspect_stdio(entry: &ServerEntry, timeout: Duration) -> Result<Intros
     drop(stdin);
     cleanup(&mut child);
 
-    let (tools, resources, prompts, server_name, server_version) = result?;
+    // Erfassten stderr einsammeln: killpg hat die Pipe geschlossen -> der Reader
+    // sieht EOF und sendet. Kurzer, gedeckelter Wait; hält ein Kindeskind die Pipe
+    // offen, gibt es eben keine Logs (best effort). Roh belassen – die zentrale
+    // Maskierung (`mask_introspection`) redigiert vor Verlassen des Backends.
+    let logs = err_rx
+        .recv_timeout(Duration::from_millis(300))
+        .ok()
+        .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
+        .filter(|s| !s.is_empty());
 
-    Ok(Introspection {
-        tools,
-        resources,
-        prompts,
-        server_name,
-        server_version,
+    match result {
+        Ok((tools, resources, prompts, server_name, server_version)) => Introspection {
+            tools,
+            resources,
+            prompts,
+            server_name,
+            server_version,
+            notes,
+            logs,
+            error: None,
+            introspected_at: unix_now(),
+        },
+        Err(e) => error_introspection(e.to_string(), logs, notes),
+    }
+}
+
+/// Baut eine `Introspection` für einen Fehlerfall: leere Listen, `error` gesetzt,
+/// ggf. erfasster stderr in `logs`, bereits gesammelte `notes` beibehalten.
+fn error_introspection(error: String, logs: Option<String>, notes: Vec<String>) -> Introspection {
+    Introspection {
+        tools: Vec::new(),
+        resources: Vec::new(),
+        prompts: Vec::new(),
+        server_name: None,
+        server_version: None,
         notes,
+        logs,
+        error: Some(error),
         introspected_at: unix_now(),
-    })
+    }
 }
 
 type HandshakeData = (
@@ -405,7 +475,8 @@ mod tests {
             ]),
             ..Default::default()
         };
-        let intro = introspect_stdio(&entry, Duration::from_secs(60)).expect("handshake");
+        let intro = introspect_stdio(&entry, Duration::from_secs(60));
+        assert!(intro.error.is_none(), "Handshake sollte gelingen: {:?}", intro.error);
         eprintln!(
             "server={:?} v{:?} | {} tools, {} resources, {} prompts",
             intro.server_name,
@@ -418,5 +489,78 @@ mod tests {
             eprintln!("note: {n}");
         }
         assert!(!intro.tools.is_empty(), "everything-Server sollte Tools liefern");
+    }
+
+    /// Deterministisch (kein Netz): ein Prozess, der sofort nach stderr schreibt
+    /// und mit Fehler endet. Der Handshake schlägt fehl -> `error` gesetzt, der
+    /// stderr-Text landet (roh) in `logs`. Redaction passiert erst im Command-Layer.
+    #[test]
+    fn introspect_captures_stderr_on_failure() {
+        let entry = ServerEntry {
+            transport: Some("stdio".into()),
+            command: Some("sh".into()),
+            args: Some(vec![
+                "-c".into(),
+                "echo 'token=ghp_ABC123def456ghi789 boom' >&2; exit 1".into(),
+            ]),
+            ..Default::default()
+        };
+        let intro = introspect_stdio(&entry, Duration::from_secs(5));
+        assert!(intro.error.is_some(), "fehlgeschlagener Start muss error setzen");
+        assert!(intro.tools.is_empty());
+        let logs = intro.logs.expect("stderr sollte erfasst sein");
+        assert!(logs.contains("boom"), "stderr-Text fehlt: {logs}");
+    }
+
+    /// Nicht existierendes Kommando -> `error` mit „Befehl nicht gefunden", keine Logs.
+    #[test]
+    fn introspect_missing_command() {
+        let entry = ServerEntry {
+            transport: Some("stdio".into()),
+            command: Some("mcpmgr-nonexistent-binary-xyz".into()),
+            ..Default::default()
+        };
+        let intro = introspect_stdio(&entry, Duration::from_secs(5));
+        assert!(
+            intro.error.as_deref().unwrap_or_default().contains("Befehl nicht gefunden"),
+            "error: {:?}",
+            intro.error
+        );
+        assert!(intro.logs.is_none());
+    }
+
+    /// Regression: ein Kommando, das WEIT mehr als STDERR_CAP nach stderr schreibt
+    /// (und nichts nach stdout). Der Reader muss die Pipe komplett leeren – sonst
+    /// blockierte der Schreiber und der Handshake liefe erst in den Timeout. Beweis
+    /// über die Laufzeit (deutlich unter dem Timeout) und den gedeckelten Auszug.
+    #[test]
+    fn introspect_drains_oversized_stderr() {
+        // 20000 Zeilen à 11 Bytes ≈ 220 KiB, rein POSIX-sh (keine externen Tools).
+        let entry = ServerEntry {
+            transport: Some("stdio".into()),
+            command: Some("sh".into()),
+            args: Some(vec![
+                "-c".into(),
+                "i=0; while [ $i -lt 20000 ]; do echo AAAAAAAAAA >&2; i=$((i+1)); done; exit 1"
+                    .into(),
+            ]),
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let intro = introspect_stdio(&entry, Duration::from_secs(20));
+        // Muss klar vor dem 20-s-Timeout fertig sein (kein Backpressure-Deadlock).
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "verdächtig langsam ({:?}) – stderr wurde evtl. nicht geleert",
+            started.elapsed()
+        );
+        assert!(intro.error.is_some());
+        // Behaltener Auszug ist gedeckelt (Cap + kurze Kürzungs-Marke).
+        let logs = intro.logs.unwrap_or_default();
+        assert!(
+            logs.len() <= STDERR_CAP as usize + 64,
+            "Auszug nicht gedeckelt: {} Bytes",
+            logs.len()
+        );
     }
 }

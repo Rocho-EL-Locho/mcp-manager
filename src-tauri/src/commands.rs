@@ -20,7 +20,7 @@ use crate::models::{
     AppError, ClaudeInfo, Introspection, MergedServer, ProjectInfo, Scope, ServerEntry,
     ServerStatus,
 };
-use crate::parse::{parse_list, status_from_text};
+use crate::parse::{failure_detail, parse_list, status_from_text};
 
 const LIST_TIMEOUT: Duration = Duration::from_secs(45);
 const GET_TIMEOUT: Duration = Duration::from_secs(20);
@@ -123,9 +123,13 @@ pub async fn list_servers(
     for s in &mut servers {
         if let Some(scope) = s.scope {
             if let Some(intro) = cache.get(&introspection_key(scope, &s.name, &s.project_path)) {
-                s.tool_count = Some(intro.tools.len());
-                s.resource_count = Some(intro.resources.len());
-                s.prompt_count = Some(intro.prompts.len());
+                // Ein gecachter Fehlversuch (error gesetzt, leere Listen) darf kein
+                // irreführendes „0·0·0"-Badge erzeugen.
+                if intro.error.is_none() {
+                    s.tool_count = Some(intro.tools.len());
+                    s.resource_count = Some(intro.resources.len());
+                    s.prompt_count = Some(intro.prompts.len());
+                }
             }
         }
     }
@@ -177,7 +181,12 @@ fn gather_servers(
                 .collect();
             for name in failed {
                 if let Ok(g) = run_claude(&claude, &["mcp", "get", &name], Some(&dir), GET_TIMEOUT) {
-                    let st = status_from_text(&format!("{}\n{}", g.stdout, g.stderr));
+                    let combined = format!("{}\n{}", g.stdout, g.stderr);
+                    let mut st = status_from_text(&combined);
+                    // Bestätigter Fehler: den Grund (redigiert) für die Anzeige anhängen.
+                    if let ServerStatus::Failed { detail } = &mut st {
+                        *detail = failure_detail(&combined).map(|d| redact_secrets(&d));
+                    }
                     if !matches!(st, ServerStatus::Unknown) {
                         status_map.insert(name, st);
                     }
@@ -340,7 +349,12 @@ pub async fn health_check(
     let out = run_claude(&claude, &["mcp", "get", &name], Some(&dir), GET_TIMEOUT)?;
     // `get` schreibt Details nach stdout; Status per Textbaustein erkennen.
     let combined = format!("{}\n{}", out.stdout, out.stderr);
-    Ok(status_from_text(&combined))
+    let mut status = status_from_text(&combined);
+    // Bei Fehler den Grund (redigiert) anhängen, damit die Detail-Ansicht ihn zeigt.
+    if let ServerStatus::Failed { detail } = &mut status {
+        *detail = failure_detail(&combined).map(|d| redact_secrets(&d));
+    }
+    Ok(status)
 }
 
 /// Liefert die UNMASKIERTE Definition eines Servers (nur auf ausdrückliche
@@ -406,7 +420,9 @@ pub async fn introspect_server(
         .ok_or_else(|| AppError::Io("Server-Definition nicht gefunden".into()))?;
 
     let mut introspection = if entry.command.is_some() {
-        crate::introspect::introspect_stdio(&entry, INTROSPECT_TIMEOUT)?
+        // Gibt immer eine Introspection zurück; Start-/Handshake-Fehler stehen in
+        // `error`/`logs` (statt als Err), damit die Detail-Ansicht sie zeigen kann.
+        crate::introspect::introspect_stdio(&entry, INTROSPECT_TIMEOUT)
     } else {
         // HTTP/SSE: in dieser Version nicht unterstützt (kein Prozess-Start).
         Introspection {
@@ -419,6 +435,8 @@ pub async fn introspect_server(
                 "Introspektion wird derzeit nur für stdio-Server unterstützt (HTTP/SSE folgt)."
                     .into(),
             ],
+            logs: None,
+            error: None,
             introspected_at: crate::introspect::unix_now(),
         }
     };
@@ -483,6 +501,14 @@ fn mask_introspection(intro: &mut Introspection) {
     }
     for n in &mut intro.notes {
         *n = redact_secrets(n);
+    }
+    // Erfasster stderr und Fehlermeldung können Tokens enthalten (z. B. „auth token
+    // expired: ghp_…" oder ein geechotes Config-JSON) – vor dem UI redigieren.
+    if let Some(l) = intro.logs.as_mut() {
+        *l = redact_secrets(l);
+    }
+    if let Some(e) = intro.error.as_mut() {
+        *e = redact_secrets(e);
     }
 }
 

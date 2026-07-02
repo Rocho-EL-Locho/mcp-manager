@@ -41,6 +41,50 @@ pub fn status_from_text(text: &str) -> ServerStatus {
     detect_status(text)
 }
 
+/// Extrahiert einen knappen Fehlergrund aus der Ausgabe von `claude mcp get`.
+/// Bevorzugt den Text ab der `Status:`-Zeile (dort stehen Grund/Detail), sonst
+/// Zeilen mit typischen Fehler-Stichwörtern, sonst den Gesamttext. Auf ~400
+/// Zeichen gekappt. Redaction erfolgt bewusst NICHT hier – der Aufrufer redigiert
+/// am Backend-Rand (Boundary-Prinzip).
+pub fn failure_detail(text: &str) -> Option<String> {
+    const KEYWORDS: &[&str] = &[
+        "error", "failed", "cannot", "not found", "refused", "timeout", "denied", "unable",
+    ];
+    const CAP: usize = 400;
+
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    let picked: Vec<&str> = if let Some(pos) = lines.iter().position(|l| l.starts_with("Status:")) {
+        lines[pos..].to_vec()
+    } else {
+        let kw: Vec<&str> = lines
+            .iter()
+            .copied()
+            .filter(|l| {
+                let low = l.to_ascii_lowercase();
+                KEYWORDS.iter().any(|k| low.contains(k))
+            })
+            .collect();
+        if kw.is_empty() {
+            lines.clone()
+        } else {
+            kw
+        }
+    };
+
+    let joined = picked.join("\n");
+    let trimmed = joined.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Zeichen-basiert kappen (UTF-8-sicher, kein Byte-Split mitten im Zeichen).
+    Some(trimmed.chars().take(CAP).collect())
+}
+
 /// Trennt die Status-Angabe von der Zusammenfassung ab.
 /// Sucht das letzte " - " und behandelt den Rest als Statustext.
 fn split_summary_status(rest: &str) -> (String, ServerStatus) {
@@ -110,5 +154,31 @@ mod tests {
         assert!(matches!(items[2].status, ServerStatus::NeedsAuth));
         assert_eq!(items[3].name, "plugin:github:github");
         assert!(matches!(items[4].status, ServerStatus::PendingApproval));
+    }
+
+    #[test]
+    fn failure_detail_prefers_status_line() {
+        let out = "example:\n  Scope: user\n  Type: stdio\n  Command: /usr/bin/foo\n  \
+                   Status: ✗ Failed to connect\n  Error: spawn foo ENOENT\n";
+        let d = failure_detail(out).expect("Detail erwartet");
+        assert!(d.contains("Failed to connect"), "d={d}");
+        assert!(d.contains("ENOENT"), "d={d}");
+        // Zeilen vor „Status:" (Scope/Type/Command) bleiben außen vor.
+        assert!(!d.contains("Scope:"), "d={d}");
+    }
+
+    #[test]
+    fn failure_detail_falls_back_to_keywords() {
+        let out = "some preamble line\nconnection refused by remote\nblah";
+        let d = failure_detail(out).expect("Detail erwartet");
+        assert!(d.contains("refused"), "d={d}");
+        assert!(!d.contains("preamble"), "d={d}");
+    }
+
+    #[test]
+    fn failure_detail_caps_length() {
+        let long = "Status: ".to_string() + &"x".repeat(1000);
+        let d = failure_detail(&long).expect("Detail erwartet");
+        assert!(d.chars().count() <= 400, "Länge={}", d.chars().count());
     }
 }
