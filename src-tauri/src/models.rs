@@ -152,6 +152,11 @@ pub struct MergedServer {
     pub resource_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_count: Option<usize>,
+    /// Preflight: benötigte Laufzeit (aus `command`) fehlt auf PATH.
+    /// None => nicht zutreffend (HTTP/SSE oder extern ohne Definition),
+    /// Some(false) => vorhanden, Some(true) => fehlt -> Warnung.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_missing: Option<bool>,
 }
 
 /// Ein Claude-Code-Projekt (Eintrag unter `projects` in ~/.claude.json).

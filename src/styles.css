@@ -689,10 +689,19 @@ body {
   letter-spacing: 0.02em;
 }
 
-.detail-caps {
+.detail-caps,
+.detail-runtime {
   margin-top: 1.2rem;
   border-top: 1px solid var(--border);
   padding-top: 0.4rem;
+}
+
+/* ---------- Laufzeit-Preflight ---------- */
+.runtime-row {
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  align-items: center;
 }
 
 .caps {

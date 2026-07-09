@@ -103,6 +103,9 @@ function serverCard(server: MergedServer, handlers: ListHandlers): HTMLElement {
     capsBadge(server),
     server.has_secrets ? icon("lock", "lock", "enthält Geheimnisse") : null,
     server.collision ? icon("alert", "warn-icon", "Name existiert in mehreren Scopes") : null,
+    server.runtime_missing
+      ? icon("terminal", "warn-icon", "Laufzeit nicht auf PATH – Details öffnen")
+      : null,
   );
 
   const summary = h("div", { class: "card-summary mono", title: server.summary }, server.summary || "—");

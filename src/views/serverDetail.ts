@@ -1,7 +1,7 @@
 import { h, clear } from "../dom";
 import { icon, setIcon } from "../icons";
-import type { MergedServer, ServerEntry, Scope, Introspection, ServerStatus } from "../ipc";
-import { revealServerEntry, setScope, introspectServer, peekIntrospection, healthCheck } from "../ipc";
+import type { MergedServer, ServerEntry, Scope, Introspection, ServerStatus, RuntimePreflight } from "../ipc";
+import { revealServerEntry, setScope, introspectServer, peekIntrospection, healthCheck, preflightServer } from "../ipc";
 import { openModal } from "../modal";
 import { openConfirm } from "../confirm";
 import { toast } from "../toast";
@@ -144,6 +144,63 @@ function renderIntrospection(intro: Introspection): HTMLElement {
     wrap.append(logs);
   }
   return wrap;
+}
+
+/// Rendert das Preflight-Ergebnis: gefunden (grün + Version/Pfad) oder nicht
+/// gefunden (rot + umsetzbarer Hinweis).
+function renderPreflight(pf: RuntimePreflight): HTMLElement {
+  const wrap = h("div", { class: "caps" });
+  wrap.append(
+    h(
+      "div",
+      { class: "runtime-row" },
+      pf.found
+        ? h("span", { class: "badge badge-ok", text: "verfügbar" })
+        : h("span", { class: "badge badge-error", text: "nicht auf PATH" }),
+      h("span", { class: "badge badge-scope", text: pf.runtime }),
+    ),
+  );
+
+  if (pf.found) {
+    if (pf.version) wrap.append(h("p", { class: "muted mono", text: pf.version }));
+    if (pf.path) wrap.append(h("p", { class: "muted mono", text: pf.path }));
+  } else if (pf.hint) {
+    wrap.append(h("p", { class: "form-status error", text: pf.hint }));
+  }
+  return wrap;
+}
+
+/// Abschnitt „Laufzeitumgebung": prüft beim Öffnen, ob der benötigte Befehl
+/// (node/npx, python/uvx, docker, …) auf PATH verfügbar ist. Billig – startet
+/// den Server nicht (Version nur für bekannte Laufzeiten via `--version`).
+function runtimeSection(server: MergedServer): HTMLElement | null {
+  // Nur für Server mit lokalem Befehl (stdio) und bekanntem Scope sinnvoll.
+  if (!server.entry?.command || !server.scope) return null;
+  const scope = server.scope;
+
+  const content = h("div", { class: "caps-content" }, h("p", { class: "muted", text: "Wird geprüft…" }));
+
+  void preflightServer(server.name, scope, server.project_path ?? undefined)
+    .then((pf) => {
+      // Modal inzwischen geschlossen? Dann nichts mehr rendern.
+      if (!content.isConnected) return;
+      clear(content);
+      content.append(
+        pf ? renderPreflight(pf) : h("p", { class: "muted", text: "Keine Laufzeit zu prüfen." }),
+      );
+    })
+    .catch((e) => {
+      if (!content.isConnected) return;
+      clear(content);
+      content.append(h("p", { class: "form-status error", text: "Preflight fehlgeschlagen: " + String(e) }));
+    });
+
+  return h(
+    "div",
+    { class: "detail-runtime" },
+    h("div", { class: "detail-defhead" }, h("h3", { text: "Laufzeitumgebung" })),
+    content,
+  );
 }
 
 /// Abschnitt „Fähigkeiten": On-Demand-Introspektion mit Laden/Aktualisieren-Button.
@@ -374,6 +431,7 @@ export function openDetail(server: MergedServer, opts: DetailOptions = {}): void
       server.editable && server.has_secrets ? revealBtn : null,
     ),
     defWrap,
+    runtimeSection(server),
     capabilitiesSection(server, opts),
     scopeSection,
   );

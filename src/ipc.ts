@@ -44,6 +44,10 @@ export interface MergedServer {
   tool_count?: number;
   resource_count?: number;
   prompt_count?: number;
+  /** Preflight: benötigte Laufzeit (aus `command`) fehlt auf PATH.
+   *  undefined => nicht zutreffend (HTTP/SSE oder extern), false => vorhanden,
+   *  true => fehlt (Warnung). */
+  runtime_missing?: boolean;
 }
 
 export interface McpTool {
@@ -76,6 +80,21 @@ export interface Introspection {
   /** Fehlermeldung, falls Start/Handshake fehlschlug (redigiert). */
   error?: string;
   introspectedAt: number;
+}
+
+export interface RuntimePreflight {
+  /** Der geprüfte Befehl, wie in der Definition ("npx", "/usr/bin/python3"). */
+  command: string;
+  /** Menschlicher Name der Laufzeit ("Node.js", "Python", "Docker", …). */
+  runtime: string;
+  /** Auf PATH gefunden bzw. (Pfad-Befehl) existent und ausführbar. */
+  found: boolean;
+  /** Aufgelöster Pfad, falls gefunden. */
+  path?: string;
+  /** Erkannte Version (best effort), falls ermittelbar. */
+  version?: string;
+  /** Umsetzbarer Hinweis – nur gesetzt, wenn nicht gefunden. */
+  hint?: string;
 }
 
 export interface ProjectInfo {
@@ -142,6 +161,20 @@ export async function introspectServer(
     scope,
     projectPath: projectPath ?? null,
     refresh,
+  });
+}
+
+/// Laufzeit-Preflight: prüft, ob der benötigte Befehl auf PATH verfügbar ist.
+/// Startet den Server NICHT. Null für HTTP/SSE-Server (kein lokaler Befehl).
+export async function preflightServer(
+  name: string,
+  scope: Scope,
+  projectPath?: string,
+): Promise<RuntimePreflight | null> {
+  return invoke<RuntimePreflight | null>("preflight_server", {
+    name,
+    scope,
+    projectPath: projectPath ?? null,
   });
 }
 

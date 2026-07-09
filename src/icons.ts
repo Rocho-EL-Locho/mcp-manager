@@ -17,6 +17,7 @@ const PATHS: Record<string, string> = {
   alert:
     '<path d="M10.3 4.3l-7.5 13A1.5 1.5 0 004.1 19.5h15.8a1.5 1.5 0 001.3-2.2l-7.5-13a1.5 1.5 0 00-2.6 0z"/><line x1="12" y1="9.5" x2="12" y2="13.5"/><line x1="12" y1="16.7" x2="12" y2="16.7"/>',
   x: '<line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/>',
+  terminal: '<polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>',
 };
 
 function markup(name: string): string {
