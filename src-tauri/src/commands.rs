@@ -21,6 +21,7 @@ use crate::models::{
     ServerStatus,
 };
 use crate::parse::{failure_detail, parse_list, status_from_text};
+use crate::preflight::RuntimePreflight;
 
 const LIST_TIMEOUT: Duration = Duration::from_secs(45);
 const GET_TIMEOUT: Duration = Duration::from_secs(20);
@@ -91,6 +92,18 @@ fn origin_for(scope: Scope) -> String {
         Scope::Project => "project",
     }
     .to_string()
+}
+
+/// Preflight-Kurzform für die Liste: fehlt der (stdio-)Befehl auf PATH?
+/// `None` für Server ohne Befehl (HTTP/SSE) – dort gibt es nichts zu prüfen.
+/// Rein dateisystembasiert (kein Subprozess), daher auch im Schnellmodus billig.
+fn runtime_missing_for(entry: &ServerEntry) -> Option<bool> {
+    entry
+        .command
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(|_| crate::preflight::resolve_command(entry).is_none())
 }
 
 /// Herkunft eines Servers, der nur in der CLI-Liste, aber in keiner lokalen
@@ -258,6 +271,7 @@ fn gather_servers(
             tool_count: None,
             resource_count: None,
             prompt_count: None,
+            runtime_missing: runtime_missing_for(&d.entry),
         });
     }
 
@@ -284,6 +298,8 @@ fn gather_servers(
             tool_count: None,
             resource_count: None,
             prompt_count: None,
+            // Externe Server haben keine lokale Definition -> keine Runtime-Prüfung.
+            runtime_missing: None,
         });
     }
 
@@ -314,6 +330,7 @@ fn gather_servers(
             tool_count: None,
             resource_count: None,
             prompt_count: None,
+            runtime_missing: runtime_missing_for(&item.entry),
         });
     }
 
@@ -469,6 +486,42 @@ pub fn peek_introspection(
         .unwrap_or_else(|e| e.into_inner())
         .get(&key)
         .cloned())
+}
+
+/// Laufzeit-Preflight für einen Server: prüft, ob der benötigte Befehl
+/// (`node`/`npx`, `python`/`uvx`, `docker`, …) auf PATH verfügbar ist, und
+/// liefert – falls nicht – einen umsetzbaren Hinweis (+ optional die Version).
+/// Startet den Server NICHT: nur PATH-Auflösung und – für bekannte Laufzeiten
+/// (node/npx/python/uv/docker/…) – ein kurzes, gefahrloses `--version`.
+/// Gibt `None` für HTTP/SSE-Server (kein lokaler Befehl).
+#[tauri::command]
+pub async fn preflight_server(
+    name: String,
+    scope: Scope,
+    project_path: Option<String>,
+) -> Result<Option<RuntimePreflight>, AppError> {
+    // Unmaskierte Definition auflösen (wie introspect_server): der Preflight
+    // braucht den echten command/env-PATH.
+    let dir = resolve_project_dir(project_path.clone());
+    let entry = collect_definitions(&dir)
+        .into_iter()
+        .find(|d| d.scope == scope && d.name == name)
+        .map(|d| d.entry)
+        .or_else(|| {
+            (scope == Scope::User)
+                .then(|| crate::stash::peek(&name).map(|i| i.entry))
+                .flatten()
+        })
+        .ok_or_else(|| AppError::Io("Server-Definition nicht gefunden".into()))?;
+
+    let mut preflight = crate::preflight::check(&entry);
+    // Version stammt aus Subprozess-Ausgabe – defensiv redigieren (Boundary).
+    if let Some(pf) = preflight.as_mut() {
+        if let Some(v) = pf.version.as_mut() {
+            *v = redact_secrets(v);
+        }
+    }
+    Ok(preflight)
 }
 
 /// Maskiert geheim aussehende Werte in Tool-Schemata, Beschreibungen und Notizen,

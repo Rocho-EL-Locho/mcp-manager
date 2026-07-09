@@ -6,6 +6,7 @@ mod introspect;
 mod mask;
 mod models;
 mod parse;
+mod preflight;
 mod stash;
 mod toggles;
 
@@ -22,6 +23,7 @@ pub fn run() {
             commands::reveal_server_entry,
             commands::introspect_server,
             commands::peek_introspection,
+            commands::preflight_server,
             commands::add_server,
             commands::update_server,
             commands::remove_server,

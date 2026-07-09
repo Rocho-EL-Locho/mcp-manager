@@ -28,6 +28,11 @@ a calm, native interface for the whole set.
 - **Overview & status** – all servers grouped by scope, with a real health
   check (connected / failed / needs auth / disabled). Status loads in the
   background, so the list appears instantly.
+- **Runtime preflight** – checks whether the runtime a server needs
+  (`node`/`npx`, `python`/`uvx`, `docker`, …) is actually on `PATH`. A missing
+  runtime is flagged in the list at a glance and the detail view shows the
+  detected version or an actionable install/PATH hint — turning a cryptic
+  "failed" into a clear next step.
 - **Project browser** – every Claude Code project in a collapsible sidebar; per
   project its `local`- and `project`-scope servers. Projects can be removed.
 - **Edit / add / remove** – a form for `stdio` (command/args/env) and
