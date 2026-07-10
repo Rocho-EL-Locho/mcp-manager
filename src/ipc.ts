@@ -44,6 +44,8 @@ export interface MergedServer {
   tool_count?: number;
   resource_count?: number;
   prompt_count?: number;
+  /** Verbindungs-/Startzeit (ms) aus dem letzten erfolgreichen Handshake. */
+  connect_ms?: number;
   /** Preflight: benötigte Laufzeit (aus `command`) fehlt auf PATH.
    *  undefined => nicht zutreffend (HTTP/SSE oder extern), false => vorhanden,
    *  true => fehlt (Warnung). */
@@ -79,6 +81,8 @@ export interface Introspection {
   logs?: string;
   /** Fehlermeldung, falls Start/Handshake fehlschlug (redigiert). */
   error?: string;
+  /** Verbindungs-/Startzeit (ms): Prozessstart bis initialize (nur stdio-Erfolg). */
+  connectMs?: number;
   introspectedAt: number;
 }
 

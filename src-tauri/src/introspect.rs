@@ -58,7 +58,8 @@ pub fn introspect_stdio(entry: &ServerEntry, timeout: Duration) -> Introspection
         return error_introspection("Kein command für stdio-Introspektion".into(), None, notes);
     };
 
-    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
+    let deadline = started + timeout;
 
     // --- Prozess starten -----------------------------------------------------
     let mut cmd = Command::new(command);
@@ -162,7 +163,10 @@ pub fn introspect_stdio(entry: &ServerEntry, timeout: Duration) -> Introspection
     });
 
     // --- Handshake -----------------------------------------------------------
-    let result = run_handshake(&mut stdin, &rx, &deadline, &mut notes);
+    // `connect_ms` wird im Handshake gesetzt, sobald `initialize` beantwortet ist
+    // (Prozessstart bis initialize = echte Verbindungs-/Startzeit).
+    let mut connect_ms: Option<u64> = None;
+    let result = run_handshake(&mut stdin, &rx, &deadline, started, &mut connect_ms, &mut notes);
 
     // stdin schließen, Prozessgruppe hart beenden. Der Reader-Thread wird nicht
     // gejoint (siehe oben); rx fällt beim Verlassen der Funktion weg.
@@ -189,9 +193,17 @@ pub fn introspect_stdio(entry: &ServerEntry, timeout: Duration) -> Introspection
             notes,
             logs,
             error: None,
+            connect_ms,
             introspected_at: unix_now(),
         },
-        Err(e) => error_introspection(e.to_string(), logs, notes),
+        Err(e) => {
+            // `initialize` kann bereits gelungen sein (connect_ms gesetzt), bevor ein
+            // späterer Listen-Aufruf scheiterte. Messung erhalten – gerade langsame
+            // Server (Issue-Use-Case) laufen so ggf. erst nach dem Handshake ins Timeout.
+            let mut intro = error_introspection(e.to_string(), logs, notes);
+            intro.connect_ms = connect_ms;
+            intro
+        }
     }
 }
 
@@ -207,6 +219,7 @@ fn error_introspection(error: String, logs: Option<String>, notes: Vec<String>) 
         notes,
         logs,
         error: Some(error),
+        connect_ms: None,
         introspected_at: unix_now(),
     }
 }
@@ -220,10 +233,14 @@ type HandshakeData = (
 );
 
 /// Führt initialize + Listen-Aufrufe durch. Nutzt `notes` für nicht-fatale Hinweise.
+/// `started`/`connect_ms`: sobald `initialize` beantwortet ist, wird die bis dahin
+/// verstrichene Zeit (Prozessstart bis initialize) als Verbindungs-/Startzeit gesetzt.
 fn run_handshake(
     stdin: &mut ChildStdin,
     rx: &Receiver<String>,
     deadline: &Instant,
+    started: Instant,
+    connect_ms: &mut Option<u64>,
     notes: &mut Vec<String>,
 ) -> Result<HandshakeData, crate::models::AppError> {
     let mut next_id: i64 = 1;
@@ -242,6 +259,8 @@ fn run_handshake(
             )))
         }
     };
+    // Verbindungs-/Startzeit: Prozessstart bis erfolgreiche initialize-Antwort.
+    *connect_ms = Some(started.elapsed().as_millis() as u64);
 
     let server_name = init
         .get("serverInfo")
@@ -477,13 +496,18 @@ mod tests {
         };
         let intro = introspect_stdio(&entry, Duration::from_secs(60));
         assert!(intro.error.is_none(), "Handshake sollte gelingen: {:?}", intro.error);
+        assert!(
+            intro.connect_ms.is_some(),
+            "erfolgreicher Handshake muss connect_ms setzen"
+        );
         eprintln!(
-            "server={:?} v{:?} | {} tools, {} resources, {} prompts",
+            "server={:?} v{:?} | {} tools, {} resources, {} prompts | connect={:?} ms",
             intro.server_name,
             intro.server_version,
             intro.tools.len(),
             intro.resources.len(),
-            intro.prompts.len()
+            intro.prompts.len(),
+            intro.connect_ms,
         );
         for n in &intro.notes {
             eprintln!("note: {n}");
@@ -508,8 +532,38 @@ mod tests {
         let intro = introspect_stdio(&entry, Duration::from_secs(5));
         assert!(intro.error.is_some(), "fehlgeschlagener Start muss error setzen");
         assert!(intro.tools.is_empty());
+        assert!(
+            intro.connect_ms.is_none(),
+            "ohne initialize darf keine connect_ms gesetzt sein"
+        );
         let logs = intro.logs.expect("stderr sollte erfasst sein");
         assert!(logs.contains("boom"), "stderr-Text fehlt: {logs}");
+    }
+
+    /// Deterministisch (kein Netz): der Server beantwortet `initialize`, schließt
+    /// aber danach stdout, sodass der folgende `tools/list`-Aufruf scheitert. Der
+    /// Handshake endet mit `error` – die vor dem Fehler gemessene Verbindungs-/
+    /// Startzeit (`connect_ms`) muss dennoch erhalten bleiben.
+    #[test]
+    fn introspect_keeps_connect_ms_when_listing_fails() {
+        let entry = ServerEntry {
+            transport: Some("stdio".into()),
+            command: Some("sh".into()),
+            args: Some(vec![
+                "-c".into(),
+                // Erste Zeile (initialize-Request) lesen, gültige Antwort mit id=1
+                // senden, dann enden -> stdout schließt, tools/list läuft ins Leere.
+                "read line; printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"serverInfo\":{\"name\":\"t\",\"version\":\"1\"}}}\\n'"
+                    .into(),
+            ]),
+            ..Default::default()
+        };
+        let intro = introspect_stdio(&entry, Duration::from_secs(5));
+        assert!(intro.error.is_some(), "Folgefehler nach initialize muss error setzen");
+        assert!(
+            intro.connect_ms.is_some(),
+            "connect_ms muss trotz Folgefehler erhalten bleiben"
+        );
     }
 
     /// Nicht existierendes Kommando -> `error` mit „Befehl nicht gefunden", keine Logs.

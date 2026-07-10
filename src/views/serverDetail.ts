@@ -5,7 +5,7 @@ import { revealServerEntry, setScope, introspectServer, peekIntrospection, healt
 import { openModal } from "../modal";
 import { openConfirm } from "../confirm";
 import { toast } from "../toast";
-import { statusMeta } from "./serverList";
+import { statusMeta, formatLatency } from "./serverList";
 
 const ALL_SCOPES: Scope[] = ["user", "local", "project"];
 
@@ -92,6 +92,17 @@ function renderIntrospection(intro: Introspection): HTMLElement {
 
   if (intro.error) {
     wrap.append(h("p", { class: "form-status error", text: intro.error }));
+    // Wenn initialize gelang, aber ein späterer Schritt scheiterte, ist die
+    // gemessene Verbindungs-/Startzeit trotzdem aussagekräftig (Diagnose).
+    if (intro.connectMs !== undefined) {
+      wrap.append(
+        h("p", {
+          class: "muted",
+          title: "Zeit bis zur initialize-Antwort – danach fehlgeschlagen",
+          text: `Verbindungs-/Startzeit: ${formatLatency(intro.connectMs)}`,
+        }),
+      );
+    }
   } else {
     wrap.append(
       h(
@@ -100,6 +111,13 @@ function renderIntrospection(intro: Introspection): HTMLElement {
         h("span", { class: "badge badge-scope", text: `${intro.tools.length} Tools` }),
         h("span", { class: "badge badge-scope", text: `${intro.resources.length} Ressourcen` }),
         h("span", { class: "badge badge-scope", text: `${intro.prompts.length} Prompts` }),
+        intro.connectMs !== undefined
+          ? h(
+              "span",
+              { class: "badge badge-latency", title: "Verbindungs-/Startzeit (bis initialize)" },
+              formatLatency(intro.connectMs),
+            )
+          : null,
       ),
     );
 

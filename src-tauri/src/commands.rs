@@ -142,6 +142,7 @@ pub async fn list_servers(
                     s.tool_count = Some(intro.tools.len());
                     s.resource_count = Some(intro.resources.len());
                     s.prompt_count = Some(intro.prompts.len());
+                    s.connect_ms = intro.connect_ms;
                 }
             }
         }
@@ -271,6 +272,7 @@ fn gather_servers(
             tool_count: None,
             resource_count: None,
             prompt_count: None,
+            connect_ms: None,
             runtime_missing: runtime_missing_for(&d.entry),
         });
     }
@@ -298,6 +300,7 @@ fn gather_servers(
             tool_count: None,
             resource_count: None,
             prompt_count: None,
+            connect_ms: None,
             // Externe Server haben keine lokale Definition -> keine Runtime-Prüfung.
             runtime_missing: None,
         });
@@ -330,6 +333,7 @@ fn gather_servers(
             tool_count: None,
             resource_count: None,
             prompt_count: None,
+            connect_ms: None,
             runtime_missing: runtime_missing_for(&item.entry),
         });
     }
@@ -454,6 +458,7 @@ pub async fn introspect_server(
             ],
             logs: None,
             error: None,
+            connect_ms: None,
             introspected_at: crate::introspect::unix_now(),
         }
     };

@@ -324,6 +324,7 @@ function renderContent(): void {
                 target.tool_count = intro.tools.length;
                 target.resource_count = intro.resources.length;
                 target.prompt_count = intro.prompts.length;
+                target.connect_ms = intro.connectMs;
                 renderContent();
               }
             },
