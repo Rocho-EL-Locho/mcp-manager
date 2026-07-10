@@ -689,6 +689,18 @@ body {
   letter-spacing: 0.02em;
 }
 
+/* Verbindungs-/Startzeit-Pill – dezent (Diagnose-Metrik), tabellarische Ziffern
+   damit die Zahl beim Aktualisieren nicht springt. */
+.badge-latency {
+  color: var(--muted);
+  background: var(--surface-3);
+  border-color: transparent;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.02em;
+  font-variant-numeric: tabular-nums;
+}
+
 .detail-caps,
 .detail-runtime {
   margin-top: 1.2rem;

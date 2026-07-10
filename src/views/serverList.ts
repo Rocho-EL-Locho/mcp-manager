@@ -73,6 +73,22 @@ export function scopeLabel(scope: Scope | null): string {
   }
 }
 
+/// Formatiert eine Verbindungs-/Startzeit: ganzzahlige Millisekunden, ab 1000 ms
+/// kompakt in Sekunden mit deutschem Dezimalkomma ("1,2 s").
+export function formatLatency(ms: number): string {
+  return ms >= 1000 ? `${(ms / 1000).toFixed(1).replace(".", ",")} s` : `${ms} ms`;
+}
+
+/// Kleines Latenz-Pill (Verbindungs-/Startzeit), nur wenn schon introspiziert.
+function latencyBadge(server: MergedServer): HTMLElement | null {
+  if (server.connect_ms === undefined) return null;
+  return h(
+    "span",
+    { class: "badge badge-latency", title: "Verbindungs-/Startzeit (bis initialize)" },
+    formatLatency(server.connect_ms),
+  );
+}
+
 /// Kompaktes Zähler-Badge (Tools·Ressourcen·Prompts), nur wenn schon introspiziert.
 function capsBadge(server: MergedServer): HTMLElement | null {
   if (
@@ -101,6 +117,7 @@ function serverCard(server: MergedServer, handlers: ListHandlers): HTMLElement {
     h("span", { class: "server-name", text: server.name }),
     h("span", { class: "badge badge-scope", text: server.origin }),
     capsBadge(server),
+    latencyBadge(server),
     server.has_secrets ? icon("lock", "lock", "enthält Geheimnisse") : null,
     server.collision ? icon("alert", "warn-icon", "Name existiert in mehreren Scopes") : null,
     server.runtime_missing

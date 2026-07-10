@@ -120,6 +120,10 @@ pub struct Introspection {
     /// Fehlermeldung, falls Start/Handshake fehlschlug (redigiert). None bei Erfolg.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Dauer (ms) von Prozessstart bis initialize-Antwort (nur bei stdio-Erfolg).
+    /// None bei Fehlschlag oder HTTP/SSE (kein Prozess-Start).
+    #[serde(rename = "connectMs", skip_serializing_if = "Option::is_none")]
+    pub connect_ms: Option<u64>,
     /// Unix-Zeitstempel (Sekunden) der Introspektion.
     #[serde(rename = "introspectedAt")]
     pub introspected_at: u64,
@@ -152,6 +156,10 @@ pub struct MergedServer {
     pub resource_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_count: Option<usize>,
+    /// Verbindungs-/Startzeit (ms) aus dem letzten erfolgreichen Introspektions-
+    /// Handshake (Prozessstart bis initialize). Nur gesetzt, wenn introspiziert.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connect_ms: Option<u64>,
     /// Preflight: benötigte Laufzeit (aus `command`) fehlt auf PATH.
     /// None => nicht zutreffend (HTTP/SSE oder extern ohne Definition),
     /// Some(false) => vorhanden, Some(true) => fehlt -> Warnung.
