@@ -1,6 +1,7 @@
 import { h, clear } from "../dom";
 import { icon } from "../icons";
 import { switchControl } from "../switch";
+import { transportOfEntry } from "../transport";
 import type { MergedServer, ServerStatus, Scope } from "../ipc";
 
 export interface ListHandlers {
@@ -50,13 +51,7 @@ export function isSelectable(s: MergedServer): boolean {
 /// Transport aus der Definition ableiten (analog serverForm). Null, wenn unbekannt
 /// (externe Server ohne Definition).
 export function serverTransport(s: MergedServer): "stdio" | "http" | "sse" | null {
-  const e = s.entry;
-  if (!e) return null;
-  if (e.type === "stdio" || e.type === "http" || e.type === "sse") return e.type;
-  // type fehlt: SSE-Endpunkte enden konventionell auf „/sse" – sonst http annehmen.
-  if (e.url) return /\/sse\/?$/i.test(e.url) ? "sse" : "http";
-  if (e.command) return "stdio";
-  return null;
+  return s.entry ? transportOfEntry(s.entry) : null;
 }
 
 function matchesStatus(s: MergedServer, f: StatusFilter): boolean {
