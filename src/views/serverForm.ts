@@ -3,12 +3,15 @@ import { icon } from "../icons";
 import type { MergedServer, Scope, ServerEntry } from "../ipc";
 import { addServer, updateServer, revealServerEntry } from "../ipc";
 import { openModal } from "../modal";
+import type { ServerPreset } from "../presets";
 import { toast } from "../toast";
 
 export interface ServerFormOptions {
   mode: "add" | "edit";
   server?: MergedServer;
   prefill?: { name?: string; entry?: ServerEntry };
+  /// Gewähltes Preset (Add-Modus): liefert Prefill, docsUrl und Secret-Führung.
+  preset?: ServerPreset;
   /// Zielprojekt für local/project-Scope (Add-Modus).
   projectPath?: string;
   /// Vorbelegter Scope im Add-Modus.
@@ -21,8 +24,9 @@ interface KvEditor {
   getValues: () => Record<string, string>;
 }
 
-function kvEditor(initial?: Record<string, string>): KvEditor {
+function kvEditor(initial?: Record<string, string>, secretKeys?: string[]): KvEditor {
   const rows = h("div", { class: "kv-editor" });
+  const secrets = new Set(secretKeys ?? []);
 
   const addRow = (k = "", v = "") => {
     const kIn = h("input", { class: "inp mono", placeholder: "KEY" }) as HTMLInputElement;
@@ -30,7 +34,12 @@ function kvEditor(initial?: Record<string, string>): KvEditor {
     kIn.value = k;
     vIn.value = v;
     const rm = h("button", { class: "btn btn-icon", type: "button", title: "Zeile entfernen" }, icon("x"));
-    const row = h("div", { class: "kv-editrow" }, kIn, vIn, rm);
+    const inputs = h("div", { class: "kv-editrow" }, kIn, vIn, rm);
+    // Vom Preset als Secret markierte Keys sichtbar als "erforderlich" führen.
+    const hint = secrets.has(k)
+      ? h("div", { class: "kv-secret-hint", text: "erforderlich – wird maskiert gespeichert" })
+      : null;
+    const row = hint ? h("div", { class: "kv-row" }, inputs, hint) : inputs;
     rm.addEventListener("click", () => row.remove());
     rows.append(row);
   };
@@ -106,12 +115,18 @@ export async function openServerForm(opts: ServerFormOptions): Promise<void> {
       }
     }
   } else {
+    if (opts.preset) {
+      name = opts.preset.id;
+      initEntry = opts.prefill?.entry ?? opts.preset.entry;
+    }
     if (opts.prefill) {
-      name = opts.prefill.name ?? "";
-      initEntry = opts.prefill.entry ?? {};
+      name = opts.prefill.name ?? name;
+      initEntry = opts.prefill.entry ?? initEntry;
     }
     if (opts.defaultScope) scope = opts.defaultScope;
   }
+
+  const secretKeys = opts.preset?.secretKeys ?? [];
 
   // Ursprüngliches type merken, um bei stdio keinen "type"-Key neu hinzuzufügen.
   const hadType = initEntry.type != null;
@@ -149,7 +164,7 @@ export async function openServerForm(opts: ServerFormOptions): Promise<void> {
   commandInput.value = initEntry.command ?? "";
   const argsArea = h("textarea", { class: "inp mono", rows: "4", placeholder: "ein Argument pro Zeile" }) as HTMLTextAreaElement;
   argsArea.value = (initEntry.args ?? []).join("\n");
-  const envEd = kvEditor(initEntry.env);
+  const envEd = kvEditor(initEntry.env, secretKeys);
   const stdioSection = h(
     "div",
     {},
@@ -161,7 +176,7 @@ export async function openServerForm(opts: ServerFormOptions): Promise<void> {
   // http/sse-Felder
   const urlInput = h("input", { class: "inp mono", placeholder: "https://…" }) as HTMLInputElement;
   urlInput.value = initEntry.url ?? "";
-  const headersEd = kvEditor(initEntry.headers);
+  const headersEd = kvEditor(initEntry.headers, secretKeys);
   const remoteSection = h("div", {}, field("URL", urlInput), field("Headers", headersEd.el));
 
   const applyTransport = () => {
@@ -174,9 +189,26 @@ export async function openServerForm(opts: ServerFormOptions): Promise<void> {
 
   const status = h("div", { class: "form-status" });
 
+  // Preset-Kopf: Beschreibung + prominenter Link auf die offizielle Doku
+  // (Presets veralten; die Doku ist die maßgebliche Quelle).
+  const presetHead = opts.preset
+    ? h(
+        "div",
+        { class: "preset-head" },
+        h("div", { class: "preset-head-desc", text: opts.preset.description }),
+        h(
+          "a",
+          { class: "preset-head-docs", href: opts.preset.docsUrl, target: "_blank", rel: "noreferrer noopener" },
+          icon("globe"),
+          "Offizielle Doku",
+        ),
+      )
+    : null;
+
   const body = h(
     "div",
     { class: "server-form" },
+    presetHead,
     field("Name", nameInput, isEdit ? "Name unveränderlich (zum Umbenennen: entfernen + neu anlegen)." : undefined),
     field(
       "Scope",
@@ -226,7 +258,22 @@ export async function openServerForm(opts: ServerFormOptions): Promise<void> {
     const t = transportSelect.value;
     if (t === "stdio" && !entry.command) return "Command darf nicht leer sein.";
     if (t !== "stdio" && !entry.url) return "URL darf nicht leer sein.";
+    // Unersetzte Preset-Platzhalter (<PFAD>, <CONNECTION_STRING>, …) blockieren
+    // das Speichern – sonst würde ein unbrauchbarer Server angelegt.
+    const placeholders = [...(entry.args ?? []), entry.url ?? ""]
+      .flatMap((s) => s.match(/<[^>]+>/g) ?? []);
+    if (placeholders.length) {
+      const uniq = [...new Set(placeholders)];
+      return `Platzhalter noch ersetzen: ${uniq.join(", ")}`;
+    }
     return null;
+  };
+
+  /// Vom Preset als erforderlich markierte Secret-Keys, die leer geblieben sind.
+  const emptySecretKeys = (entry: ServerEntry): string[] => {
+    if (!secretKeys.length) return [];
+    const values = { ...(entry.env ?? {}), ...(entry.headers ?? {}) };
+    return secretKeys.filter((k) => !(values[k] ?? "").trim());
   };
 
   saveBtn.addEventListener("click", async () => {
@@ -247,6 +294,9 @@ export async function openServerForm(opts: ServerFormOptions): Promise<void> {
       if (isEdit) await updateServer(finalName, finalScope, entry, opts.server?.project_path ?? undefined);
       else await addServer(finalName, finalScope, entry, opts.projectPath);
       toast(isEdit ? "Server gespeichert" : "Server hinzugefügt");
+      // Nicht blockierend: leere Secret-Keys als Hinweis nachreichen.
+      const empty = emptySecretKeys(entry);
+      if (empty.length) toast(`Hinweis: leer gelassen – ${empty.join(", ")}`);
       modal.close();
       opts.onSaved();
     } catch (e) {

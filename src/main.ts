@@ -19,6 +19,7 @@ import type { View } from "./views/sidebar";
 import { openDetail } from "./views/serverDetail";
 import { openServerForm } from "./views/serverForm";
 import { openAssistant } from "./views/assistant";
+import { openServerPicker } from "./views/serverPicker";
 import { openSettings, applyTheme, applyStoredTheme } from "./views/settings";
 import { getSettings } from "./ipc";
 import { openConfirm } from "./confirm";
@@ -191,13 +192,7 @@ function addContext(): { projectPath?: string; defaultScope: Scope } {
 }
 
 function onAdd(): void {
-  const ctx = addContext();
-  void openServerForm({
-    mode: "add",
-    projectPath: ctx.projectPath,
-    defaultScope: ctx.defaultScope,
-    onSaved: () => void refresh(),
-  });
+  openServerPicker(() => void refresh(), addContext());
 }
 
 function onAssistant(): void {
