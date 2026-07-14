@@ -12,7 +12,8 @@ import {
   toggleUserServer,
 } from "./ipc";
 import type { MergedServer, ProjectInfo, Scope } from "./ipc";
-import { renderServerList } from "./views/serverList";
+import { renderServerList, defaultFilter, selectionKey } from "./views/serverList";
+import type { FilterState, BulkAction } from "./views/serverList";
 import { renderSidebar } from "./views/sidebar";
 import type { View } from "./views/sidebar";
 import { openDetail } from "./views/serverDetail";
@@ -35,6 +36,8 @@ interface State {
   error: string | null;
   lastRefresh: Date | null;
   sidebarVisible: boolean;
+  filter: FilterState;
+  selection: Set<string>;
 }
 
 const state: State = {
@@ -47,6 +50,8 @@ const state: State = {
   error: null,
   lastRefresh: null,
   sidebarVisible: true,
+  filter: defaultFilter(),
+  selection: new Set(),
 };
 
 let contentEl: HTMLElement;
@@ -84,6 +89,16 @@ async function loadProjects(): Promise<void> {
   renderSidebarEl();
 }
 
+// Auswahl-Schlüssel verwerfen, die nach einem Refresh keinem Server mehr entsprechen
+// (Server entfernt/umbenannt) – verhindert verwaiste Selektion.
+function pruneSelection(): void {
+  if (state.selection.size === 0) return;
+  const alive = new Set(state.servers.map(selectionKey));
+  for (const key of state.selection) {
+    if (!alive.has(key)) state.selection.delete(key);
+  }
+}
+
 // Sequenz-Zähler: verhindert, dass ein überholter refresh() mit veralteten Daten
 // die Ansicht überschreibt. Nur der jüngste Aufruf darf schreiben/rendern.
 let refreshSeq = 0;
@@ -100,6 +115,7 @@ async function refresh(): Promise<void> {
     const servers = await listServers(state.reveal, project, false);
     if (seq !== refreshSeq) return;
     state.servers = servers;
+    pruneSelection();
     renderContent();
   } catch (e) {
     if (seq !== refreshSeq) return;
@@ -114,6 +130,7 @@ async function refresh(): Promise<void> {
     const servers = await listServers(state.reveal, project, true);
     if (seq !== refreshSeq) return;
     state.servers = servers;
+    pruneSelection();
     state.lastRefresh = new Date();
   } catch (e) {
     if (seq !== refreshSeq) return;
@@ -156,6 +173,9 @@ function toggleSidebar(): void {
 
 function onSelectView(view: View): void {
   state.view = view;
+  // Filter und Auswahl gelten pro Ansicht – beim Wechsel zurücksetzen.
+  state.filter = defaultFilter();
+  state.selection.clear();
   renderSidebarEl();
   void refresh();
 }
@@ -264,20 +284,116 @@ function onLogin(server: MergedServer): void {
     });
 }
 
+/// Toggle-Routing (ohne Toast/Refresh) – von onToggle und den Bulk-Aktionen genutzt.
+/// Projekt-Scope über settings.local.json, User-Scope über Stash-and-restore.
+async function applyToggle(server: MergedServer, enabled: boolean): Promise<void> {
+  if (server.scope === "project") {
+    await toggleMcpjsonServer(server.name, enabled, server.project_path ?? undefined);
+  } else if (server.scope === "user") {
+    await toggleUserServer(server.name, enabled);
+  } else {
+    throw new Error(`Kein Aktivieren/Deaktivieren für Scope „${server.origin}"`);
+  }
+}
+
+function canToggle(server: MergedServer): boolean {
+  return server.scope === "user" || server.scope === "project";
+}
+
 async function onToggle(server: MergedServer, enabled: boolean): Promise<void> {
+  if (!canToggle(server)) return;
   try {
-    if (server.scope === "project") {
-      await toggleMcpjsonServer(server.name, enabled, server.project_path ?? undefined);
-    } else if (server.scope === "user") {
-      await toggleUserServer(server.name, enabled);
-    } else {
-      return;
-    }
+    await applyToggle(server, enabled);
     toast(enabled ? `${server.name} aktiviert` : `${server.name} deaktiviert`);
   } catch (e) {
     state.error = String(e);
   }
   await refresh();
+}
+
+interface BulkMeta {
+  title: string;
+  confirmLabel: string;
+  danger: boolean;
+  gerund: string; // „aktiviert" / „deaktiviert" / „entfernt"
+}
+
+const BULK_META: Record<BulkAction, BulkMeta> = {
+  enable: { title: "Server aktivieren", confirmLabel: "Aktivieren", danger: false, gerund: "aktiviert" },
+  disable: { title: "Server deaktivieren", confirmLabel: "Deaktivieren", danger: false, gerund: "deaktiviert" },
+  remove: { title: "Server entfernen", confirmLabel: "Entfernen", danger: true, gerund: "entfernt" },
+};
+
+/// Bulk-Aktion: Bestätigung mit Aufzählung, dann sequentielle Ausführung
+/// (Fehler pro Server gesammelt), genau ein refresh() und ein Abschluss-Toast.
+function onBulk(action: BulkAction, servers: MergedServer[]): void {
+  const meta = BULK_META[action];
+  const targetEnabled = action === "enable";
+
+  const actionable = (s: MergedServer): boolean =>
+    action === "remove"
+      ? s.editable && s.scope !== null
+      : canToggle(s) && s.enabled !== targetEnabled;
+
+  const planned = servers.filter(actionable);
+  const skipped = servers.filter((s) => !actionable(s)).map((s) => s.name);
+
+  if (planned.length === 0) {
+    toast(`Nichts zu tun – ${skipped.length} übersprungen`);
+    return;
+  }
+
+  const names = planned.map((s) => s.name);
+  const extra = h(
+    "div",
+    { class: "bulk-list" },
+    h("div", { class: "muted", text: `${planned.length} betroffen:` }),
+    ...names.map((n) => h("div", { class: "mono", text: n })),
+    skipped.length
+      ? h("div", { class: "field-hint", text: `${skipped.length} übersprungen: ${skipped.join(", ")}` })
+      : null,
+  );
+
+  let done = 0;
+  const failures: string[] = [];
+
+  openConfirm({
+    title: meta.title,
+    message:
+      action === "remove"
+        ? `${planned.length} Server werden über claude gelöscht. Das kann nicht rückgängig gemacht werden.`
+        : `${planned.length} Server werden ${meta.gerund}.`,
+    extra,
+    confirmLabel: meta.confirmLabel,
+    danger: meta.danger,
+    onConfirm: async (setStatus) => {
+      done = 0;
+      failures.length = 0;
+      for (let i = 0; i < planned.length; i++) {
+        const s = planned[i];
+        setStatus(`${i + 1}/${planned.length} … ${s.name}`);
+        try {
+          if (action === "remove") {
+            if (!s.scope) throw new Error("Externer Server kann nicht entfernt werden.");
+            await removeServer(s.name, s.scope, s.project_path ?? undefined);
+          } else {
+            await applyToggle(s, targetEnabled);
+          }
+          done++;
+        } catch (e) {
+          failures.push(`${s.name} (${String(e)})`);
+        }
+      }
+    },
+    onDone: () => {
+      const parts = [`${done} ${meta.gerund}`];
+      if (failures.length) parts.push(`${failures.length} fehlgeschlagen: ${failures.join("; ")}`);
+      if (skipped.length) parts.push(`${skipped.length} übersprungen`);
+      toast(parts.join(", "), failures.length ? "error" : "ok");
+      state.selection.clear();
+      void refresh();
+    },
+  });
 }
 
 function onDeleteProject(project: ProjectInfo): void {
@@ -320,6 +436,12 @@ function renderControls(): void {
 }
 
 function renderContent(): void {
+  // Fokus + Caret des Suchfelds über den Full-Rebuild retten (z. B. wenn ein
+  // Hintergrund-Refresh oder recheck/introspect mitten im Tippen rendert).
+  const active = document.activeElement;
+  const searchFocused = active instanceof HTMLInputElement && active.classList.contains("filter-search");
+  const caret = searchFocused ? active.selectionStart : null;
+
   clear(contentEl);
 
   const heading =
@@ -371,8 +493,21 @@ function renderContent(): void {
         onToggle: (s, enabled) => void onToggle(s, enabled),
       },
       visibleGroups(),
+      {
+        filter: state.filter,
+        selection: state.selection,
+        onBulk,
+      },
     ),
   );
+
+  if (searchFocused) {
+    const el = contentEl.querySelector<HTMLInputElement>(".filter-search");
+    if (el) {
+      el.focus();
+      if (caret != null) el.setSelectionRange(caret, caret);
+    }
+  }
 }
 
 async function main(): Promise<void> {

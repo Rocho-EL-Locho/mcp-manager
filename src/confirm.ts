@@ -7,7 +7,9 @@ export interface ConfirmOptions {
   extra?: Node;
   confirmLabel?: string;
   danger?: boolean;
-  onConfirm: () => Promise<void>;
+  /// Die eigentliche Aktion. `setStatus` aktualisiert die Inline-Statuszeile live
+  /// (z. B. Fortschritt „3/7 …" bei Bulk-Aktionen).
+  onConfirm: (setStatus: (msg: string) => void) => Promise<void>;
   onDone?: () => void;
 }
 
@@ -31,8 +33,11 @@ export function openConfirm(opts: ConfirmOptions): void {
     cancelBtn.disabled = true;
     status.className = "form-status";
     status.textContent = "wird ausgeführt…";
+    const setStatus = (msg: string) => {
+      status.textContent = msg;
+    };
     try {
-      await opts.onConfirm();
+      await opts.onConfirm(setStatus);
       modal.close();
       opts.onDone?.();
     } catch (e) {
