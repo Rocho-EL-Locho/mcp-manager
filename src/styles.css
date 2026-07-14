@@ -38,12 +38,90 @@
   --shadow: 0 10px 30px rgba(0, 0, 0, 0.42);
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35);
 
+  /* Weiche Hintergrund-Aufhellung oben (Body-Verlauf) */
+  --bg-glow: #24231f;
+
   --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
   --font-mono: ui-monospace, "JetBrains Mono", "SFMono-Regular", "Fira Code", Menlo, monospace;
 
   font-family: var(--font-ui);
   font-size: 14px;
   color-scheme: dark;
+}
+
+/* ---------- Themes ----------
+   Basis `:root` (oben) = Dunkel. Es matcht auch data-theme="dark" sowie "system"
+   auf dunklem OS und den Zustand VOR dem ersten JS (kein Attribut) auf dunklem OS.
+
+   Hell greift (a) explizit bei data-theme="light" und (b) auf hellem OS für alles,
+   was NICHT explizit auf Dunkel/Hell gesetzt ist – also "system" UND der Vor-JS-
+   Default. Dadurch folgt die Seite schon vor dem ersten Paint dem OS-Farbschema
+   (kein Dark-Flash), ohne ein von der CSP verbotenes Inline-Skript. Ein explizit
+   gewähltes Theme gewinnt dank höherer Spezifität immer gegen die OS-Präferenz. */
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --bg: #f4f2ee;
+  --surface: #ffffff;
+  --surface-2: #f1efea;
+  --surface-3: #e6e3dc;
+  --border: #e2ded6;
+  --border-strong: #cbc7bd;
+
+  --text: #23211d;
+  --muted: #5f5c54;
+  --faint: #8a877e;
+
+  --accent: #2f8676;
+  --accent-2: #256b5e;
+  --accent-soft: rgba(47, 134, 118, 0.14);
+  --accent-ink: #ffffff;
+
+  --ok: #4f8a35;
+  --ok-soft: rgba(79, 138, 53, 0.14);
+  --warn: #a9781c;
+  --warn-soft: rgba(169, 120, 28, 0.15);
+  --error: #c8483b;
+  --error-soft: rgba(200, 72, 59, 0.13);
+
+  --shadow: 0 10px 30px rgba(30, 28, 24, 0.14);
+  --shadow-sm: 0 1px 2px rgba(30, 28, 24, 0.1);
+  --bg-glow: #ffffff;
+}
+
+@media (prefers-color-scheme: light) {
+  /* „system" und der Vor-JS-Default (kein Attribut) auf hellem OS -> Hell.
+     Explizit Dunkel/Hell sind ausgenommen und regeln sich selbst. */
+  :root:not([data-theme="dark"]):not([data-theme="light"]) {
+    color-scheme: light;
+
+    --bg: #f4f2ee;
+    --surface: #ffffff;
+    --surface-2: #f1efea;
+    --surface-3: #e6e3dc;
+    --border: #e2ded6;
+    --border-strong: #cbc7bd;
+
+    --text: #23211d;
+    --muted: #5f5c54;
+    --faint: #8a877e;
+
+    --accent: #2f8676;
+    --accent-2: #256b5e;
+    --accent-soft: rgba(47, 134, 118, 0.14);
+    --accent-ink: #ffffff;
+
+    --ok: #4f8a35;
+    --ok-soft: rgba(79, 138, 53, 0.14);
+    --warn: #a9781c;
+    --warn-soft: rgba(169, 120, 28, 0.15);
+    --error: #c8483b;
+    --error-soft: rgba(200, 72, 59, 0.13);
+
+    --shadow: 0 10px 30px rgba(30, 28, 24, 0.14);
+    --shadow-sm: 0 1px 2px rgba(30, 28, 24, 0.1);
+    --bg-glow: #ffffff;
+  }
 }
 
 * {
@@ -58,7 +136,7 @@ body {
 body {
   margin: 0;
   /* sanfter neutraler Verlauf von oben statt flachem Digital-Schwarz */
-  background: radial-gradient(130% 90% at 50% -20%, #24231f 0%, var(--bg) 60%);
+  background: radial-gradient(130% 90% at 50% -20%, var(--bg-glow) 0%, var(--bg) 60%);
   background-attachment: fixed;
   color: var(--text);
   -webkit-font-smoothing: antialiased;
@@ -367,8 +445,8 @@ body {
   font-weight: 600;
 }
 .btn-primary:hover:not(:disabled) {
-  background: #6cc3f0;
-  border-color: #6cc3f0;
+  background: var(--accent-2);
+  border-color: var(--accent-2);
 }
 
 .btn-danger {
@@ -535,7 +613,8 @@ body {
 
 .banner-error {
   border-color: var(--error);
-  color: #ffb7bd;
+  /* theme-abhängig: heller Fehlerton auf dunklem, dunkler auf hellem Grund */
+  color: var(--error);
   background: var(--error-soft);
 }
 
@@ -866,7 +945,9 @@ select.inp {
   -webkit-appearance: none;
   background-color: var(--bg);
   color: var(--text);
-  background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12"><path d="M2 4l4 4 4-4" fill="none" stroke="%2357ab9b" stroke-width="1.6"/></svg>');
+  /* Neutrales Grau (Ton von --faint, in Hell wie Dunkel nahezu identisch) statt
+     hartcodiertem Akzent-Teal – background-image kann keine CSS-Variable nutzen. */
+  background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12"><path d="M2 4l4 4 4-4" fill="none" stroke="%2382807a" stroke-width="1.6"/></svg>');
   background-repeat: no-repeat;
   background-position: right 0.6rem center;
   padding-right: 1.9rem;
@@ -878,7 +959,9 @@ select.inp option {
   color: var(--text);
 }
 
-select.inp:disabled {
+/* Deaktivierte Felder (auch Zukunfts-Features im Einstellungs-Dialog) klar als
+   „nicht editierbar" kennzeichnen – gilt für input/textarea/select gleichermaßen. */
+.inp:disabled {
   color: var(--muted);
   cursor: default;
   opacity: 0.7;
@@ -1056,6 +1139,15 @@ select.inp:disabled {
   outline-offset: 2px;
 }
 
+/* Deaktivierter Schalter (Zukunfts-Features): ausgegraut, nicht klickbar. */
+.switch-input:disabled + .slider {
+  opacity: 0.45;
+  cursor: default;
+}
+.switch:has(.switch-input:disabled) {
+  cursor: default;
+}
+
 /* ---------- Scope-Wechsel im Detail ---------- */
 .detail-scope {
   margin-top: 1.2rem;
@@ -1120,6 +1212,38 @@ select.inp:disabled {
   font-family: var(--font-mono);
   font-size: 0.72rem;
   color: var(--muted);
+}
+
+/* ---------- Einstellungen ---------- */
+.settings-group {
+  margin-bottom: 1.4rem;
+}
+.settings-group:last-of-type {
+  margin-bottom: 0;
+}
+
+.settings-group-title {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin: 0 0 0.7rem;
+  padding-bottom: 0.35rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.settings-path-row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+.settings-path-row .inp {
+  flex: 1;
+}
+
+/* Kompaktere Zahlenfelder als volle Breite */
+.settings-form input[type="number"] {
+  width: 8rem;
 }
 
 @media (prefers-reduced-motion: reduce) {

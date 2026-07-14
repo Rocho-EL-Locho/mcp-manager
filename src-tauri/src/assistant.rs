@@ -106,11 +106,15 @@ fn unwrap_result_text(stdout: &str) -> String {
     stdout.to_string()
 }
 
-pub fn run_assistant(url: &str, extra_context: Option<&str>) -> Result<AssistantResult, AppError> {
+pub fn run_assistant(
+    url: &str,
+    extra_context: Option<&str>,
+    claude_path: Option<&str>,
+) -> Result<AssistantResult, AppError> {
     if url.trim().is_empty() {
         return Err(AppError::Io("Bitte einen Link angeben.".into()));
     }
-    let claude = resolve_claude().ok_or(AppError::ClaudeNotFound)?;
+    let claude = resolve_claude(claude_path).ok_or(AppError::ClaudeNotFound)?;
     let prompt = build_prompt(url, extra_context);
 
     // -p = Print-Flag (boolean), Prompt ist Positional; --allowedTools ist

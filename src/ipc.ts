@@ -108,6 +108,25 @@ export interface ProjectInfo {
   is_home: boolean;
 }
 
+export type Theme = "system" | "light" | "dark";
+
+/** Persistente App-Einstellungen. Feldnamen = snake_case (serde-Serialisierung). */
+export interface AppSettings {
+  /** Pfad zur claude-CLI; null = automatische Auflösung. */
+  claude_path: string | null;
+  list_timeout_secs: number;
+  mut_timeout_secs: number;
+  /** Auto-Refresh-Intervall in Minuten (0 = aus) — Konsument: Feature 09. */
+  auto_refresh_minutes: number;
+  /** Benachrichtigungen — Konsument: Feature 09. */
+  notifications: boolean;
+  /** Aufbewahrte Snapshots — Konsument: Feature 05. */
+  snapshot_retention: number;
+  /** UI-Sprache; null = System — Konsument: Feature 21. */
+  language: string | null;
+  theme: Theme;
+}
+
 export async function checkClaude(): Promise<ClaudeInfo> {
   return invoke<ClaudeInfo>("check_claude");
 }
@@ -261,6 +280,15 @@ export async function runClaudeAssistant(
     url,
     extraContext: extraContext ?? null,
   });
+}
+
+export async function getSettings(): Promise<AppSettings> {
+  return invoke<AppSettings>("get_settings");
+}
+
+/// Validiert + persistiert die Einstellungen und liefert die normalisierte Fassung.
+export async function setSettings(settings: AppSettings): Promise<AppSettings> {
+  return invoke<AppSettings>("set_settings", { settings });
 }
 
 export async function setScope(
