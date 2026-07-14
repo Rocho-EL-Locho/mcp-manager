@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 
 use tauri::State;
@@ -22,10 +22,9 @@ use crate::models::{
 };
 use crate::parse::{failure_detail, parse_list, status_from_text};
 use crate::preflight::RuntimePreflight;
+use crate::settings::AppSettings;
 
-const LIST_TIMEOUT: Duration = Duration::from_secs(45);
 const GET_TIMEOUT: Duration = Duration::from_secs(20);
-const MUT_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(180);
 /// Zeitbudget für den Introspektions-Handshake. Großzügig, weil der erste
 /// `npx`/`uvx`-Start (Download/Cold-Start) spürbar dauern kann.
@@ -46,10 +45,32 @@ type StatusCache = Mutex<HashMap<String, HashMap<String, CachedItem>>>;
 /// Wird nur auf ausdrückliche Nutzer-Aktion befüllt (startet den Server-Prozess).
 type IntrospectionCache = Mutex<HashMap<String, Introspection>>;
 
-#[derive(Default)]
 pub struct AppState {
     status_cache: StatusCache,
     introspection_cache: IntrospectionCache,
+    /// Persistente App-Einstellungen, beim Start geladen und im Speicher gecacht.
+    settings: RwLock<AppSettings>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            status_cache: Mutex::new(HashMap::new()),
+            introspection_cache: Mutex::new(HashMap::new()),
+            // Einstellungen beim Start laden (fehlend/korrupt -> Defaults, nie Fehler).
+            settings: RwLock::new(crate::settings::load()),
+        }
+    }
+}
+
+impl AppState {
+    /// Kopie der aktuellen Einstellungen (Lese-Snapshot; Guard wird sofort frei).
+    fn settings(&self) -> AppSettings {
+        self.settings
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
 }
 
 /// Stabiler Cache-Schlüssel für die Introspektion eines Servers.
@@ -60,8 +81,9 @@ fn introspection_key(scope: Scope, name: &str, project_path: &Option<String>) ->
 
 /// Prüft beim Start, ob die claude-CLI verfügbar ist, und liefert ihre Version.
 #[tauri::command]
-pub async fn check_claude() -> Result<ClaudeInfo, AppError> {
-    let Some(path) = resolve_claude() else {
+pub async fn check_claude(state: State<'_, AppState>) -> Result<ClaudeInfo, AppError> {
+    let settings = state.settings();
+    let Some(path) = resolve_claude(settings.claude_path()) else {
         return Ok(ClaudeInfo {
             path: String::new(),
             version: String::new(),
@@ -127,7 +149,9 @@ pub async fn list_servers(
     reveal: bool,
     with_status: bool,
 ) -> Result<Vec<MergedServer>, AppError> {
-    let mut servers = gather_servers(&state.status_cache, project_path, reveal, with_status)?;
+    let settings = state.settings();
+    let mut servers =
+        gather_servers(&state.status_cache, &settings, project_path, reveal, with_status)?;
     // Zähler aus bereits vorhandenen Introspektions-Ergebnissen anreichern.
     let cache = state
         .introspection_cache
@@ -152,6 +176,7 @@ pub async fn list_servers(
 
 fn gather_servers(
     cache: &StatusCache,
+    settings: &AppSettings,
     project_path: Option<String>,
     reveal: bool,
     with_status: bool,
@@ -172,8 +197,8 @@ fn gather_servers(
     let mut status_map: HashMap<String, ServerStatus> = HashMap::new();
     let mut list_summaries: HashMap<String, String> = HashMap::new();
     if with_status {
-        if let Some(claude) = resolve_claude() {
-            if let Ok(out) = run_claude(&claude, &["mcp", "list"], Some(&dir), LIST_TIMEOUT) {
+        if let Some(claude) = resolve_claude(settings.claude_path()) {
+            if let Ok(out) = run_claude(&claude, &["mcp", "list"], Some(&dir), settings.list_timeout()) {
                 for item in parse_list(&out.stdout) {
                     list_summaries
                         .entry(item.name.clone())
@@ -360,11 +385,12 @@ fn scope_rank(scope: Option<Scope>) -> u8 {
 /// Einzelnen Server neu health-checken via `claude mcp get <name>`.
 #[tauri::command]
 pub async fn health_check(
+    state: State<'_, AppState>,
     name: String,
     project_path: Option<String>,
 ) -> Result<ServerStatus, AppError> {
     let dir = resolve_project_dir(project_path);
-    let Some(claude) = resolve_claude() else {
+    let Some(claude) = resolve_claude(state.settings().claude_path()) else {
         return Err(AppError::ClaudeNotFound);
     };
     let out = run_claude(&claude, &["mcp", "get", &name], Some(&dir), GET_TIMEOUT)?;
@@ -579,8 +605,13 @@ fn cwd_for(scope: Scope, project_path: &Option<String>) -> Option<PathBuf> {
 }
 
 /// Führt eine mutierende claude-Operation aus und mappt Nicht-Null-Exit auf CliFailed.
-fn run_mut(args: &[&str], cwd: Option<PathBuf>, timeout: Duration) -> Result<(), AppError> {
-    let claude = resolve_claude().ok_or(AppError::ClaudeNotFound)?;
+fn run_mut(
+    claude_path: Option<&str>,
+    args: &[&str],
+    cwd: Option<PathBuf>,
+    timeout: Duration,
+) -> Result<(), AppError> {
+    let claude = resolve_claude(claude_path).ok_or(AppError::ClaudeNotFound)?;
     let out = run_claude(&claude, args, cwd.as_deref(), timeout)?;
     if out.success() {
         Ok(())
@@ -602,15 +633,17 @@ fn run_mut(args: &[&str], cwd: Option<PathBuf>, timeout: Duration) -> Result<(),
 /// Fügt via `claude mcp add-json` einen Server hinzu (upsert nicht garantiert).
 #[tauri::command]
 pub async fn add_server(
+    state: State<'_, AppState>,
     name: String,
     scope: Scope,
     project_path: Option<String>,
     entry: ServerEntry,
 ) -> Result<(), AppError> {
-    add_server_impl(name, scope, project_path, entry)
+    add_server_impl(&state.settings(), name, scope, project_path, entry)
 }
 
 fn add_server_impl(
+    settings: &AppSettings,
     name: String,
     scope: Scope,
     project_path: Option<String>,
@@ -619,9 +652,10 @@ fn add_server_impl(
     let json = serde_json::to_string(&entry).map_err(|e| AppError::Parse(e.to_string()))?;
     let cwd = cwd_for(scope, &project_path);
     run_mut(
+        settings.claude_path(),
         &["mcp", "add-json", "-s", scope.cli_value(), &name, &json],
         cwd,
-        MUT_TIMEOUT,
+        settings.mut_timeout(),
     )
 }
 
@@ -629,15 +663,17 @@ fn add_server_impl(
 /// Schlägt das Neu-Anlegen fehl, wird der alte Stand zurückgerollt.
 #[tauri::command]
 pub async fn update_server(
+    state: State<'_, AppState>,
     name: String,
     scope: Scope,
     project_path: Option<String>,
     entry: ServerEntry,
 ) -> Result<(), AppError> {
-    update_server_impl(name, scope, project_path, entry)
+    update_server_impl(&state.settings(), name, scope, project_path, entry)
 }
 
 fn update_server_impl(
+    settings: &AppSettings,
     name: String,
     scope: Scope,
     project_path: Option<String>,
@@ -650,20 +686,24 @@ fn update_server_impl(
         .map(|d| d.entry);
 
     let cwd = cwd_for(scope, &project_path);
+    let timeout = settings.mut_timeout();
+    let claude_path = settings.claude_path();
     let new_json = serde_json::to_string(&entry).map_err(|e| AppError::Parse(e.to_string()))?;
 
     // Alten Eintrag entfernen (falls vorhanden).
     let _ = run_mut(
+        claude_path,
         &["mcp", "remove", "-s", scope.cli_value(), &name],
         cwd.clone(),
-        MUT_TIMEOUT,
+        timeout,
     );
 
     // Neuen Eintrag anlegen.
     match run_mut(
+        claude_path,
         &["mcp", "add-json", "-s", scope.cli_value(), &name, &new_json],
         cwd.clone(),
-        MUT_TIMEOUT,
+        timeout,
     ) {
         Ok(()) => Ok(()),
         Err(err) => {
@@ -671,9 +711,10 @@ fn update_server_impl(
             if let Some(old_entry) = old {
                 if let Ok(old_json) = serde_json::to_string(&old_entry) {
                     let _ = run_mut(
+                        claude_path,
                         &["mcp", "add-json", "-s", scope.cli_value(), &name, &old_json],
                         cwd,
-                        MUT_TIMEOUT,
+                        timeout,
                     );
                 }
             }
@@ -685,43 +726,52 @@ fn update_server_impl(
 /// Entfernt einen Server via `claude mcp remove`.
 #[tauri::command]
 pub async fn remove_server(
+    state: State<'_, AppState>,
     name: String,
     scope: Scope,
     project_path: Option<String>,
 ) -> Result<(), AppError> {
-    remove_server_impl(name, scope, project_path)
+    remove_server_impl(&state.settings(), name, scope, project_path)
 }
 
 fn remove_server_impl(
+    settings: &AppSettings,
     name: String,
     scope: Scope,
     project_path: Option<String>,
 ) -> Result<(), AppError> {
     let cwd = cwd_for(scope, &project_path);
     run_mut(
+        settings.claude_path(),
         &["mcp", "remove", "-s", scope.cli_value(), &name],
         cwd,
-        MUT_TIMEOUT,
+        settings.mut_timeout(),
     )
 }
 
 /// OAuth-Anmeldung für HTTP/SSE-Server bzw. Connectoren. Öffnet ggf. den Browser.
 #[tauri::command]
-pub async fn login_server(name: String) -> Result<(), AppError> {
-    run_mut(&["mcp", "login", &name], None, LOGIN_TIMEOUT)
+pub async fn login_server(state: State<'_, AppState>, name: String) -> Result<(), AppError> {
+    // Login-Timeout bleibt großzügig (Browser-Flow) und ist bewusst nicht konfigurierbar.
+    run_mut(state.settings().claude_path(), &["mcp", "login", &name], None, LOGIN_TIMEOUT)
 }
 
 /// Gespeicherte OAuth-Credentials eines Servers löschen.
 #[tauri::command]
-pub async fn logout_server(name: String) -> Result<(), AppError> {
-    run_mut(&["mcp", "logout", &name], None, MUT_TIMEOUT)
+pub async fn logout_server(state: State<'_, AppState>, name: String) -> Result<(), AppError> {
+    let settings = state.settings();
+    run_mut(settings.claude_path(), &["mcp", "logout", &name], None, settings.mut_timeout())
 }
 
 /// Setzt Freigabe-/Ablehnungs-Entscheidungen für .mcp.json-Server im Projekt zurück.
 #[tauri::command]
-pub async fn reset_project_choices(project_path: Option<String>) -> Result<(), AppError> {
+pub async fn reset_project_choices(
+    state: State<'_, AppState>,
+    project_path: Option<String>,
+) -> Result<(), AppError> {
     let cwd = Some(resolve_project_dir(project_path));
-    run_mut(&["mcp", "reset-project-choices"], cwd, MUT_TIMEOUT)
+    let settings = state.settings();
+    run_mut(settings.claude_path(), &["mcp", "reset-project-choices"], cwd, settings.mut_timeout())
 }
 
 /// Aktiviert/deaktiviert einen .mcp.json-Server (project scope) über die
@@ -744,14 +794,16 @@ pub fn toggle_mcpjson_server(
 /// Aktiviert/deaktiviert einen user-scope Server per Stash-and-restore.
 #[tauri::command]
 pub async fn toggle_user_server(
+    state: State<'_, AppState>,
     name: String,
     enabled: bool,
     entry: Option<ServerEntry>,
 ) -> Result<(), AppError> {
-    toggle_user_server_impl(name, enabled, entry)
+    toggle_user_server_impl(&state.settings(), name, enabled, entry)
 }
 
 fn toggle_user_server_impl(
+    settings: &AppSettings,
     name: String,
     enabled: bool,
     entry: Option<ServerEntry>,
@@ -761,9 +813,10 @@ fn toggle_user_server_impl(
         let item = crate::stash::peek(&name).ok_or(AppError::StashMissing)?;
         let json = serde_json::to_string(&item.entry).map_err(|e| AppError::Parse(e.to_string()))?;
         run_mut(
+            settings.claude_path(),
             &["mcp", "add-json", "-s", "user", &name, &json],
             None,
-            MUT_TIMEOUT,
+            settings.mut_timeout(),
         )?;
         crate::stash::remove(&name)?; // erst nach Erfolg
         Ok(())
@@ -777,7 +830,12 @@ fn toggle_user_server_impl(
             .or(entry)
             .ok_or_else(|| AppError::Io("Server-Definition nicht gefunden".into()))?;
         crate::stash::upsert(&name, current)?;
-        run_mut(&["mcp", "remove", "-s", "user", &name], None, MUT_TIMEOUT)?;
+        run_mut(
+            settings.claude_path(),
+            &["mcp", "remove", "-s", "user", &name],
+            None,
+            settings.mut_timeout(),
+        )?;
         Ok(())
     }
 }
@@ -786,16 +844,18 @@ fn toggle_user_server_impl(
 /// Ziel-Scope, danach Entfernen aus dem Quell-Scope (nie umgekehrt).
 #[tauri::command]
 pub async fn set_scope(
+    state: State<'_, AppState>,
     name: String,
     from_scope: Scope,
     to_scope: Scope,
     from_project: Option<String>,
     to_project: Option<String>,
 ) -> Result<(), AppError> {
-    set_scope_impl(name, from_scope, to_scope, from_project, to_project)
+    set_scope_impl(&state.settings(), name, from_scope, to_scope, from_project, to_project)
 }
 
 fn set_scope_impl(
+    settings: &AppSettings,
     name: String,
     from_scope: Scope,
     to_scope: Scope,
@@ -808,6 +868,8 @@ fn set_scope_impl(
 
     let from_dir = resolve_project_dir(from_project.clone());
     let to_dir = resolve_project_dir(to_project.clone());
+    let timeout = settings.mut_timeout();
+    let claude_path = settings.claude_path();
 
     let entry = collect_definitions(&from_dir)
         .into_iter()
@@ -818,9 +880,10 @@ fn set_scope_impl(
 
     // 1. Im Ziel-Scope anlegen.
     run_mut(
+        claude_path,
         &["mcp", "add-json", "-s", to_scope.cli_value(), &name, &json],
         cwd_for(to_scope, &to_project),
-        MUT_TIMEOUT,
+        timeout,
     )?;
 
     // 2. Erfolg verifizieren.
@@ -835,9 +898,10 @@ fn set_scope_impl(
 
     // 3. Erst jetzt aus dem Quell-Scope entfernen.
     if let Err(e) = run_mut(
+        claude_path,
         &["mcp", "remove", "-s", from_scope.cli_value(), &name],
         cwd_for(from_scope, &from_project),
-        MUT_TIMEOUT,
+        timeout,
     ) {
         return Err(AppError::Io(format!(
             "In Ziel-Scope kopiert, aber alte Kopie ({}) konnte nicht entfernt werden: {}",
@@ -912,22 +976,69 @@ pub fn delete_project(path: String) -> Result<(), AppError> {
 /// erzeugt. Schreibt nichts – der Vorschlag geht ans Formular.
 #[tauri::command]
 pub async fn run_claude_assistant(
+    state: State<'_, AppState>,
     url: String,
     extra_context: Option<String>,
 ) -> Result<crate::assistant::AssistantResult, AppError> {
-    crate::assistant::run_assistant(&url, extra_context.as_deref())
+    crate::assistant::run_assistant(
+        &url,
+        extra_context.as_deref(),
+        state.settings().claude_path(),
+    )
+}
+
+/// Liefert die aktuellen App-Einstellungen (aus dem Speicher-Cache).
+#[tauri::command]
+pub fn get_settings(state: State<'_, AppState>) -> AppSettings {
+    state.settings()
+}
+
+/// Validiert und persistiert neue Einstellungen, aktualisiert den Cache und
+/// gibt die (normalisierten) Einstellungen zurück.
+#[tauri::command]
+pub fn set_settings(
+    state: State<'_, AppState>,
+    settings: AppSettings,
+) -> Result<AppSettings, AppError> {
+    let settings = crate::settings::normalize(settings);
+    crate::settings::validate(&settings)?;
+    crate::settings::save(&settings)?;
+    *state.settings.write().unwrap_or_else(|e| e.into_inner()) = settings.clone();
+    Ok(settings)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Die Commands sind jetzt async; die Tests rufen die synchronen `_impl`-
-    // Funktionen auf. Diese Aliase überschatten die (async) Glob-Importe.
-    use super::{
-        add_server_impl as add_server, remove_server_impl as remove_server,
-        set_scope_impl as set_scope, toggle_user_server_impl as toggle_user_server,
-        update_server_impl as update_server,
-    };
+
+    // Die Commands sind jetzt async und brauchen einen Settings-Snapshot; die
+    // Tests rufen die synchronen `_impl`-Funktionen mit Default-Einstellungen auf.
+    // Diese Hüllen überschatten die (async) Glob-Importe und halten die vielen
+    // Aufrufstellen unverändert.
+    fn cfg() -> AppSettings {
+        AppSettings::default()
+    }
+    fn add_server(name: String, scope: Scope, pp: Option<String>, entry: ServerEntry) -> Result<(), AppError> {
+        add_server_impl(&cfg(), name, scope, pp, entry)
+    }
+    fn remove_server(name: String, scope: Scope, pp: Option<String>) -> Result<(), AppError> {
+        remove_server_impl(&cfg(), name, scope, pp)
+    }
+    fn update_server(name: String, scope: Scope, pp: Option<String>, entry: ServerEntry) -> Result<(), AppError> {
+        update_server_impl(&cfg(), name, scope, pp, entry)
+    }
+    fn toggle_user_server(name: String, enabled: bool, entry: Option<ServerEntry>) -> Result<(), AppError> {
+        toggle_user_server_impl(&cfg(), name, enabled, entry)
+    }
+    fn set_scope(
+        name: String,
+        from_scope: Scope,
+        to_scope: Scope,
+        from_project: Option<String>,
+        to_project: Option<String>,
+    ) -> Result<(), AppError> {
+        set_scope_impl(&cfg(), name, from_scope, to_scope, from_project, to_project)
+    }
 
     /// Opt-in-Integrationstest: ruft echtes `claude mcp list` auf (health-checkt
     /// alle Server, ~langsam) und prüft, dass Merge, Maskierung und Extern-
@@ -936,7 +1047,7 @@ mod tests {
     #[ignore]
     fn list_servers_end_to_end() {
         let servers =
-            gather_servers(&Mutex::new(HashMap::new()), None, false, true).expect("list_servers");
+            gather_servers(&Mutex::new(HashMap::new()), &cfg(), None, false, true).expect("list_servers");
         for s in &servers {
             let env_preview = s
                 .entry
@@ -1055,7 +1166,7 @@ mod tests {
         assert!(crate::stash::peek(&name).is_some(), "im stash");
 
         let servers =
-            gather_servers(&Mutex::new(HashMap::new()), None, false, true).expect("list");
+            gather_servers(&Mutex::new(HashMap::new()), &cfg(), None, false, true).expect("list");
         let found = servers
             .iter()
             .find(|s| s.name == name && s.scope == Some(Scope::User));
@@ -1112,6 +1223,7 @@ mod tests {
         let res = crate::assistant::run_assistant(
             "https://www.npmjs.com/package/@modelcontextprotocol/server-filesystem",
             Some("stdio server, started via npx"),
+            None,
         )
         .expect("assistant call");
         eprintln!("name={:?}", res.name);

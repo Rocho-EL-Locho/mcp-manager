@@ -26,7 +26,9 @@ pub struct StashItem {
     pub disabled_at: u64,
 }
 
-fn config_dir() -> PathBuf {
+/// Nutzer-privates Config-Verzeichnis dieser App ($XDG_CONFIG_HOME/mcp-manager
+/// bzw. ~/.config/mcp-manager). Gemeinsame Ablage für Stash und `settings.rs`.
+pub(crate) fn config_dir() -> PathBuf {
     if let Some(x) = std::env::var_os("XDG_CONFIG_HOME") {
         PathBuf::from(x).join("mcp-manager")
     } else {

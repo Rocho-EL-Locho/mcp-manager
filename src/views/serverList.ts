@@ -1,5 +1,6 @@
 import { h } from "../dom";
 import { icon } from "../icons";
+import { switchControl } from "../switch";
 import type { MergedServer, ServerStatus, Scope } from "../ipc";
 
 export interface ListHandlers {
@@ -9,14 +10,6 @@ export interface ListHandlers {
   onRemove: (server: MergedServer) => void;
   onLogin: (server: MergedServer) => void;
   onToggle: (server: MergedServer, enabled: boolean) => void;
-}
-
-/// Ein/Aus-Schalter (nur für user- und project-Scope sinnvoll).
-function switchControl(on: boolean, onChange: (v: boolean) => void): HTMLElement {
-  const input = h("input", { type: "checkbox", class: "switch-input" }) as HTMLInputElement;
-  input.checked = on;
-  input.addEventListener("change", () => onChange(input.checked));
-  return h("label", { class: "switch", title: on ? "aktiv" : "deaktiviert" }, input, h("span", { class: "slider" }));
 }
 
 interface StatusMeta {
@@ -159,7 +152,7 @@ function serverCard(server: MergedServer, handlers: ListHandlers): HTMLElement {
 
   const canToggle = server.scope === "user" || server.scope === "project";
   const toggle = canToggle
-    ? switchControl(server.enabled, (enabled) => handlers.onToggle(server, enabled))
+    ? switchControl({ on: server.enabled, onChange: (enabled) => handlers.onToggle(server, enabled) })
     : null;
 
   const actions = h(

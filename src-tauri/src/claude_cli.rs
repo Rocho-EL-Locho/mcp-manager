@@ -38,11 +38,22 @@ pub fn home_dir() -> Option<PathBuf> {
 
 /// Ermittelt den absoluten Pfad zur `claude`-CLI.
 ///
-/// Reihenfolge: expliziter Override > `which` > gängige Installationspfade.
-/// Der absolute Pfad ist wichtig, weil die App aus einem Desktop-Eintrag ohne
-/// vollständiges Shell-PATH gestartet werden kann.
-pub fn resolve_claude() -> Option<PathBuf> {
+/// Reihenfolge: Env-Var (`MCP_MANAGER_CLAUDE_PATH`, stärkster Override, wichtig
+/// für Tests/Scripting) > `configured` (Einstellung) > `which` > gängige
+/// Installationspfade. Der absolute Pfad ist wichtig, weil die App aus einem
+/// Desktop-Eintrag ohne vollständiges Shell-PATH gestartet werden kann.
+pub fn resolve_claude(configured: Option<&str>) -> Option<PathBuf> {
     if let Ok(p) = std::env::var("MCP_MANAGER_CLAUDE_PATH") {
+        let pb = PathBuf::from(p);
+        if pb.is_file() {
+            return Some(pb);
+        }
+    }
+
+    // Konfigurierter Pfad aus den Einstellungen. Ist er gesetzt, aber (z. B. nach
+    // Löschen des Binaries) ungültig, fällt die Kette bewusst auf die automatische
+    // Auflösung zurück, statt hart zu scheitern.
+    if let Some(p) = configured.map(str::trim).filter(|p| !p.is_empty()) {
         let pb = PathBuf::from(p);
         if pb.is_file() {
             return Some(pb);

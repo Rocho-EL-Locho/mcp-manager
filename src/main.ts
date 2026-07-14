@@ -18,6 +18,8 @@ import type { View } from "./views/sidebar";
 import { openDetail } from "./views/serverDetail";
 import { openServerForm } from "./views/serverForm";
 import { openAssistant } from "./views/assistant";
+import { openSettings, applyTheme, applyStoredTheme } from "./views/settings";
+import { getSettings } from "./ipc";
 import { openConfirm } from "./confirm";
 import { cleanupHints } from "./cleanup";
 import { toast } from "./toast";
@@ -57,6 +59,7 @@ let revealIcon: HTMLElement;
 let revealLabel: HTMLElement;
 let sidebarToggleBtn: HTMLButtonElement;
 let stampEl: HTMLElement;
+let claudeBadge: HTMLElement;
 
 function timeStamp(d: Date): string {
   return d.toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" });
@@ -179,6 +182,38 @@ function onAdd(): void {
 
 function onAssistant(): void {
   openAssistant(() => void refresh(), addContext());
+}
+
+/// Claude-Badge (Version/Pfad) neu prüfen – z. B. nach Pfadwechsel in den Einstellungen.
+function refreshClaudeBadge(): void {
+  claudeBadge.className = "badge";
+  claudeBadge.textContent = "claude: …";
+  claudeBadge.removeAttribute("title");
+  void checkClaude()
+    .then((info) => {
+      if (info.ok) {
+        claudeBadge.textContent = `claude ${info.version}`;
+        claudeBadge.classList.add("badge-ok");
+        claudeBadge.title = info.path;
+      } else {
+        claudeBadge.textContent = "claude nicht gefunden";
+        claudeBadge.classList.add("badge-error");
+      }
+    })
+    .catch(() => {
+      claudeBadge.textContent = "claude-Fehler";
+      claudeBadge.classList.add("badge-error");
+    });
+}
+
+function onSettings(): void {
+  void openSettings({
+    onSaved: () => {
+      // Pfad-/Timeout-Änderungen können Auflösung und Status betreffen.
+      refreshClaudeBadge();
+      void refresh();
+    },
+  });
 }
 
 function onRemove(server: MergedServer): void {
@@ -341,13 +376,18 @@ function renderContent(): void {
 }
 
 async function main(): Promise<void> {
+  // Zuletzt gemerktes Theme sofort anwenden (vor dem Rendern) – verhindert den
+  // Dark-Flash für Hell-Nutzer; das Backend liefert unten die maßgebliche Fassung.
+  applyStoredTheme();
+
   const app = document.querySelector<HTMLDivElement>("#app");
   if (!app) return;
 
-  const claudeBadge = h("span", { class: "badge", text: "claude: …" });
+  claudeBadge = h("span", { class: "badge", text: "claude: …" });
   sidebarToggleBtn = h("button", { class: "btn btn-icon", title: "Seitenleiste ein-/ausblenden", onclick: toggleSidebar }, icon("menu")) as HTMLButtonElement;
   const assistantBtn = h("button", { class: "btn", onclick: onAssistant }, icon("sparkles"), "per Link");
   const addBtn = h("button", { class: "btn btn-primary", onclick: onAdd }, icon("plus"), "Server");
+  const settingsBtn = h("button", { class: "btn btn-icon", title: "Einstellungen", onclick: onSettings }, icon("settings")) as HTMLButtonElement;
 
   refreshIcon = icon("refresh");
   refreshLabel = h("span", { text: "Aktualisieren" });
@@ -369,6 +409,7 @@ async function main(): Promise<void> {
     addBtn,
     revealBtn,
     refreshBtn,
+    settingsBtn,
     claudeBadge,
   );
 
@@ -380,21 +421,12 @@ async function main(): Promise<void> {
   app.append(topbar, layout);
   applySidebarVisibility();
 
-  void checkClaude()
-    .then((info) => {
-      if (info.ok) {
-        claudeBadge.textContent = `claude ${info.version}`;
-        claudeBadge.classList.add("badge-ok");
-        claudeBadge.title = info.path;
-      } else {
-        claudeBadge.textContent = "claude nicht gefunden";
-        claudeBadge.classList.add("badge-error");
-      }
-    })
-    .catch(() => {
-      claudeBadge.textContent = "claude-Fehler";
-      claudeBadge.classList.add("badge-error");
-    });
+  // Gespeichertes Theme früh anwenden (best effort; Fehler => System-Default).
+  void getSettings()
+    .then((s) => applyTheme(s.theme))
+    .catch(() => applyTheme("system"));
+
+  refreshClaudeBadge();
 
   await refresh();
 }
