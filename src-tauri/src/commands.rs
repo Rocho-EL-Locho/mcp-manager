@@ -740,13 +740,30 @@ fn remove_server_impl(
     scope: Scope,
     project_path: Option<String>,
 ) -> Result<(), AppError> {
+    // Deaktivierte user-scope Server liegen ausschließlich im Stash und nicht in
+    // ~/.claude.json – `claude mcp remove` würde sie nicht finden. Solche Einträge
+    // direkt aus dem Stash löschen. Steht der Server (kaputte Invariante) trotzdem
+    // auch aktiv in ~/.claude.json, NICHT kurzschließen, sondern normal entfernen.
+    if scope == Scope::User && crate::stash::peek(&name).is_some() {
+        let active = collect_definitions(&default_project_path())
+            .into_iter()
+            .any(|d| d.scope == Scope::User && d.name == name);
+        if !active {
+            return crate::stash::remove(&name);
+        }
+    }
     let cwd = cwd_for(scope, &project_path);
     run_mut(
         settings.claude_path(),
         &["mcp", "remove", "-s", scope.cli_value(), &name],
         cwd,
         settings.mut_timeout(),
-    )
+    )?;
+    // Verwaisten Stash-Eintrag mitentfernen (defensiv; no-op, wenn keiner existiert).
+    if scope == Scope::User {
+        let _ = crate::stash::remove(&name);
+    }
+    Ok(())
 }
 
 /// OAuth-Anmeldung für HTTP/SSE-Server bzw. Connectoren. Öffnet ggf. den Browser.
