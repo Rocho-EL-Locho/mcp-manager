@@ -18,7 +18,6 @@ import { renderSidebar } from "./views/sidebar";
 import type { View } from "./views/sidebar";
 import { openDetail } from "./views/serverDetail";
 import { openServerForm } from "./views/serverForm";
-import { openAssistant } from "./views/assistant";
 import { openServerPicker } from "./views/serverPicker";
 import { openSettings, applyTheme, applyStoredTheme } from "./views/settings";
 import { getSettings } from "./ipc";
@@ -193,10 +192,6 @@ function addContext(): { projectPath?: string; defaultScope: Scope } {
 
 function onAdd(): void {
   openServerPicker(() => void refresh(), addContext());
-}
-
-function onAssistant(): void {
-  openAssistant(() => void refresh(), addContext());
 }
 
 /// Claude-Badge (Version/Pfad) neu prüfen – z. B. nach Pfadwechsel in den Einstellungen.
@@ -515,7 +510,6 @@ async function main(): Promise<void> {
 
   claudeBadge = h("span", { class: "badge", text: "claude: …" });
   sidebarToggleBtn = h("button", { class: "btn btn-icon", title: "Seitenleiste ein-/ausblenden", onclick: toggleSidebar }, icon("menu")) as HTMLButtonElement;
-  const assistantBtn = h("button", { class: "btn", onclick: onAssistant }, icon("sparkles"), "per Link");
   const addBtn = h("button", { class: "btn btn-primary", onclick: onAdd }, icon("plus"), "Server");
   const settingsBtn = h("button", { class: "btn btn-icon", title: "Einstellungen", onclick: onSettings }, icon("settings")) as HTMLButtonElement;
 
@@ -535,7 +529,6 @@ async function main(): Promise<void> {
     sidebarToggleBtn,
     h("h1", { text: "MCP-Manager" }),
     stampEl,
-    assistantBtn,
     addBtn,
     revealBtn,
     refreshBtn,

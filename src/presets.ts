@@ -6,6 +6,7 @@
 // Klammern (<PFAD>, <CONNECTION_STRING>) und blockieren das Speichern, bis sie
 // ersetzt sind (Auswertung im Formular).
 import type { ServerEntry } from "./ipc";
+import { transportOfEntry } from "./transport";
 
 export interface ServerPreset {
   /** Stabile ID, zugleich Vorschlag für den Servernamen ("github", "filesystem", …). */
@@ -24,10 +25,7 @@ export interface ServerPreset {
 
 /// Transport eines Presets ableiten (für Badges im Auswahl-Schritt).
 export function presetTransport(p: ServerPreset): "stdio" | "http" | "sse" {
-  const t = p.entry.type;
-  if (t === "http" || t === "sse" || t === "stdio") return t;
-  if (p.entry.url) return /\/sse\/?$/i.test(p.entry.url) ? "sse" : "http";
-  return "stdio";
+  return transportOfEntry(p.entry) ?? "stdio";
 }
 
 /// Tiefe Kopie der Vorlage, damit das Formular den Katalog nie mutiert.
@@ -57,14 +55,14 @@ export const PRESETS: ServerPreset[] = [
   {
     id: "github",
     label: "GitHub",
-    description: "Repos, Issues und PRs über die GitHub-API. Braucht ein Personal Access Token.",
+    description:
+      "Repos, Issues und PRs über den gehosteten GitHub-MCP-Server. Authorization-Header: „Bearer <PAT>“ (oder leer lassen für OAuth).",
     docsUrl: "https://github.com/github/github-mcp-server",
     entry: {
-      command: "npx",
-      args: ["-y", "@modelcontextprotocol/server-github"],
-      env: { GITHUB_PERSONAL_ACCESS_TOKEN: "" },
+      type: "http",
+      url: "https://api.githubcopilot.com/mcp/",
+      headers: { Authorization: "" },
     },
-    secretKeys: ["GITHUB_PERSONAL_ACCESS_TOKEN"],
   },
   {
     id: "memory",
@@ -100,7 +98,7 @@ export const PRESETS: ServerPreset[] = [
     id: "postgres",
     label: "PostgreSQL",
     description: "Nur-Lese-Zugriff auf eine PostgreSQL-Datenbank (Schema & Queries).",
-    docsUrl: "https://github.com/modelcontextprotocol/servers/tree/main/src/postgres",
+    docsUrl: "https://github.com/modelcontextprotocol/servers-archived/tree/main/src/postgres",
     entry: {
       command: "npx",
       args: ["-y", "@modelcontextprotocol/server-postgres", "<CONNECTION_STRING>"],
@@ -120,7 +118,7 @@ export const PRESETS: ServerPreset[] = [
     id: "sentry",
     label: "Sentry",
     description: "Fehler und Issues aus Sentry abfragen (gehosteter HTTP-Server, OAuth).",
-    docsUrl: "https://docs.sentry.io/product/sentry-mcp/",
+    docsUrl: "https://github.com/getsentry/sentry-mcp",
     entry: {
       type: "http",
       url: "https://mcp.sentry.dev/mcp",

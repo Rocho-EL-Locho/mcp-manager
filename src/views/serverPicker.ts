@@ -12,12 +12,6 @@ export interface PickerContext {
   defaultScope?: Scope;
 }
 
-const TRANSPORT_LABEL: Record<"stdio" | "http" | "sse", string> = {
-  stdio: "stdio",
-  http: "http",
-  sse: "sse",
-};
-
 /// Auswahl-Schritt vor dem Server-Formular: bündelt Vorlagen, leeres Formular
 /// und den Link-Assistenten an einem Ort.
 export function openServerPicker(onSaved: () => void, ctx: PickerContext = {}): void {
@@ -92,7 +86,7 @@ export function openServerPicker(onSaved: () => void, ctx: PickerContext = {}): 
     card({
       title: p.label,
       desc: p.description,
-      badge: h("span", { class: "badge badge-scope", text: TRANSPORT_LABEL[presetTransport(p)] }),
+      badge: h("span", { class: "badge badge-scope", text: presetTransport(p) }),
       onClick: () => openPreset(p),
     }),
   );

@@ -259,12 +259,16 @@ export async function openServerForm(opts: ServerFormOptions): Promise<void> {
     if (t === "stdio" && !entry.command) return "Command darf nicht leer sein.";
     if (t !== "stdio" && !entry.url) return "URL darf nicht leer sein.";
     // Unersetzte Preset-Platzhalter (<PFAD>, <CONNECTION_STRING>, …) blockieren
-    // das Speichern – sonst würde ein unbrauchbarer Server angelegt.
-    const placeholders = [...(entry.args ?? []), entry.url ?? ""]
-      .flatMap((s) => s.match(/<[^>]+>/g) ?? []);
-    if (placeholders.length) {
-      const uniq = [...new Set(placeholders)];
-      return `Platzhalter noch ersetzen: ${uniq.join(", ")}`;
+    // das Speichern – sonst würde ein unbrauchbarer Server angelegt. Nur im
+    // Preset-Fall, damit ein echtes „<…>" in manuell/edit gepflegten Args
+    // nicht fälschlich blockiert wird.
+    if (opts.preset) {
+      const placeholders = [...(entry.args ?? []), entry.url ?? ""]
+        .flatMap((s) => s.match(/<[^>]+>/g) ?? []);
+      if (placeholders.length) {
+        const uniq = [...new Set(placeholders)];
+        return `Platzhalter noch ersetzen: ${uniq.join(", ")}`;
+      }
     }
     return null;
   };
