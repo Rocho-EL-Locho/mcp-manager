@@ -14,8 +14,11 @@ import {
   createBackup,
   restoreBackup,
   deleteBackup,
+  listConflicts,
+  renameServer,
 } from "./ipc";
-import type { MergedServer, ProjectInfo, Scope, BackupInfo } from "./ipc";
+import type { MergedServer, ProjectInfo, Scope, BackupInfo, ConflictInfo } from "./ipc";
+import { openConflictDialog, openConflictsOverview } from "./views/conflictDialog";
 import { renderServerList, defaultFilter, selectionKey } from "./views/serverList";
 import type { FilterState, BulkAction } from "./views/serverList";
 import { renderSidebar } from "./views/sidebar";
@@ -35,6 +38,7 @@ interface State {
   servers: MergedServer[];
   projects: ProjectInfo[];
   backups: BackupInfo[];
+  conflicts: ConflictInfo[];
   home: string;
   view: View;
   loading: boolean;
@@ -50,6 +54,7 @@ const state: State = {
   servers: [],
   projects: [],
   backups: [],
+  conflicts: [],
   home: "",
   view: { kind: "global" },
   loading: false,
@@ -136,6 +141,13 @@ async function refresh(): Promise<void> {
     if (seq !== refreshSeq) return;
     state.servers = servers;
     pruneSelection();
+    // Namenskonflikte parallel-günstig mitladen (kein Health-Check nötig).
+    try {
+      state.conflicts = await listConflicts(project);
+    } catch {
+      state.conflicts = [];
+    }
+    if (seq !== refreshSeq) return;
     renderContent();
   } catch (e) {
     if (seq !== refreshSeq) return;
@@ -451,6 +463,20 @@ const backupHandlers = {
   onChanged: () => void refresh(),
 };
 
+const conflictHandlers = {
+  remove: (name: string, scope: Scope, projectPath: string | undefined) =>
+    removeServer(name, scope, projectPath),
+  rename: (name: string, scope: Scope, projectPath: string | undefined, newName: string) =>
+    renameServer(name, scope, newName, projectPath),
+  onChanged: () => void refresh(),
+};
+
+/// Öffnet den Konflikt-Dialog für einen Server aus der Liste (Klick aufs Warn-Icon).
+function onConflict(server: MergedServer): void {
+  const conflict = state.conflicts.find((c) => c.name === server.name);
+  if (conflict) openConflictDialog(conflict, conflictHandlers);
+}
+
 function renderSidebarEl(): void {
   clear(sidebarEl);
   sidebarEl.append(
@@ -500,6 +526,25 @@ function renderContent(): void {
     contentEl.append(h("div", { class: "banner banner-error", text: state.error }));
   }
 
+  // Konflikt-Banner: bei ≥1 Namenskonflikt dezent oberhalb der Liste.
+  if (state.conflicts.length > 0) {
+    const n = state.conflicts.length;
+    const bannerText = n === 1 ? "1 Namenskonflikt" : `${n} Namenskonflikte`;
+    const banner = h(
+      "button",
+      {
+        class: "banner banner-warn conflict-banner",
+        onclick: () =>
+          n === 1
+            ? openConflictDialog(state.conflicts[0], conflictHandlers)
+            : openConflictsOverview(state.conflicts, conflictHandlers),
+      },
+      icon("alert"),
+      h("span", { text: `${bannerText} – Details anzeigen` }),
+    );
+    contentEl.append(banner);
+  }
+
   contentEl.append(
     renderServerList(
       state.servers,
@@ -537,6 +582,7 @@ function renderContent(): void {
         onRemove,
         onLogin,
         onToggle: (s, enabled) => void onToggle(s, enabled),
+        onConflict,
       },
       visibleGroups(),
       {

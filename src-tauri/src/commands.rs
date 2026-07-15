@@ -11,14 +11,14 @@ use tauri::State;
 use crate::claude_cli::{home_dir, resolve_claude, run_claude};
 use crate::config_read::{
     claude_json_path, collect_definitions, collect_disabled, default_project_path,
-    project_settings_local_path, read_json_value, settings_local_path,
+    project_settings_local_path, read_json_value, settings_local_path, ScopedEntry,
 };
 use crate::mask::{
     entry_has_secrets, mask_entry, mask_summary, redact_json, redact_secrets, summarize_entry,
 };
 use crate::models::{
-    AppError, ClaudeInfo, Introspection, MergedServer, ProjectInfo, Scope, ServerEntry,
-    ServerStatus,
+    AppError, ClaudeInfo, ConflictDefinition, ConflictInfo, Introspection, MergedServer,
+    ProjectInfo, Scope, ServerEntry, ServerStatus,
 };
 use crate::parse::{failure_detail, parse_list, status_from_text};
 use crate::preflight::RuntimePreflight;
@@ -379,6 +379,19 @@ fn scope_rank(scope: Option<Scope>) -> u8 {
         Some(Scope::Local) => 1,
         Some(Scope::Project) => 2,
         None => 3,
+    }
+}
+
+/// Präzedenz für den effektiven Scope bei Namenskonflikten (kleiner = gewinnt):
+/// local > project > user. Quelle: Claude-Code-Doku
+/// (https://code.claude.com/docs/en/mcp) – bei gleichem Namen nutzt Claude Code
+/// genau eine Definition (kein Merge), die des höchstpriorisierten Scopes.
+/// Achtung: NICHT `scope_rank` (das ist nur die Sortier-Reihenfolge der Liste).
+fn scope_precedence(scope: Scope) -> u8 {
+    match scope {
+        Scope::Local => 0,
+        Scope::Project => 1,
+        Scope::User => 2,
     }
 }
 
@@ -1100,6 +1113,154 @@ fn clone_server_impl(
     copy_definition(settings, &entry, &new_name, to_scope, &to_project)
 }
 
+/// Hash über die normalisierte Definition. `env`/`headers` sind `BTreeMap` →
+/// deterministische JSON-Serialisierung → stabiler Fingerprint (unabhängig von
+/// der Key-Reihenfolge). Kein Krypto nötig, nur Gleichheitsvergleich.
+fn definition_fingerprint(entry: &ServerEntry) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let json = serde_json::to_string(entry).unwrap_or_default();
+    let mut hasher = DefaultHasher::new();
+    json.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Findet Namenskonflikte: Server, deren Name in mehreren Scopes definiert ist.
+/// Bezieht deaktivierte user-scope Server aus dem Stash mit ein (sonst entsteht
+/// der Konflikt beim Reaktivieren überraschend). Liefert je Konflikt die
+/// Definitionen (maskiert), den effektiven Scope (Präzedenz local > project >
+/// user) und ob alle Definitionen inhaltsgleich sind.
+#[tauri::command]
+pub fn list_conflicts(project_path: Option<String>) -> Result<Vec<ConflictInfo>, AppError> {
+    let dir = resolve_project_dir(project_path);
+    let mut defs = collect_definitions(&dir);
+
+    // Stash (deaktivierte user-scope Server) ergänzen, sofern nicht schon aktiv.
+    let active_user: std::collections::HashSet<String> = defs
+        .iter()
+        .filter(|d| d.scope == Scope::User)
+        .map(|d| d.name.clone())
+        .collect();
+    for (name, item) in crate::stash::all().user {
+        if !active_user.contains(&name) {
+            defs.push(ScopedEntry {
+                scope: Scope::User,
+                name,
+                entry: item.entry,
+                project_path: None,
+            });
+        }
+    }
+
+    // Nach Name gruppieren (BTreeMap => stabile, alphabetische Reihenfolge).
+    let mut by_name: std::collections::BTreeMap<String, Vec<&ScopedEntry>> =
+        std::collections::BTreeMap::new();
+    for d in &defs {
+        by_name.entry(d.name.clone()).or_default().push(d);
+    }
+
+    let mut out = Vec::new();
+    for (name, group) in by_name {
+        if group.len() < 2 {
+            continue; // kein Konflikt
+        }
+        let definitions: Vec<ConflictDefinition> = group
+            .iter()
+            .map(|d| ConflictDefinition {
+                scope: d.scope,
+                project_path: d.project_path.clone(),
+                summary: mask_summary(&summarize_entry(&d.entry), false),
+                fingerprint: definition_fingerprint(&d.entry),
+            })
+            .collect();
+        let first_fp = definitions[0].fingerprint;
+        let identical = definitions.iter().all(|c| c.fingerprint == first_fp);
+        // Effektiver Scope = höchste Präzedenz (kleinster Wert).
+        let effective_scope = group
+            .iter()
+            .map(|d| d.scope)
+            .min_by_key(|s| scope_precedence(*s))
+            .unwrap_or(Scope::User);
+        out.push(ConflictInfo {
+            name,
+            definitions,
+            effective_scope,
+            identical,
+        });
+    }
+    Ok(out)
+}
+
+/// Benennt einen Server innerhalb desselben Scopes um: Kopie unter dem neuen
+/// Namen verifiziert anlegen, dann das Original entfernen (Muster wie
+/// `clone_server`/`set_scope`). Lehnt ab, wenn der Zielname im selben Scope
+/// bereits existiert.
+#[tauri::command]
+pub async fn rename_server(
+    state: State<'_, AppState>,
+    name: String,
+    scope: Scope,
+    project_path: Option<String>,
+    new_name: String,
+) -> Result<(), AppError> {
+    rename_server_impl(&state.settings(), name, scope, project_path, new_name)
+}
+
+fn rename_server_impl(
+    settings: &AppSettings,
+    name: String,
+    scope: Scope,
+    project_path: Option<String>,
+    new_name: String,
+) -> Result<(), AppError> {
+    let new_name = new_name.trim().to_string();
+    if new_name.is_empty() {
+        return Err(AppError::Io("Neuer Name darf nicht leer sein".into()));
+    }
+    if new_name == name {
+        return Ok(()); // No-op
+    }
+
+    let dir = resolve_project_dir(project_path.clone());
+    let defs = collect_definitions(&dir);
+
+    // Quell-Definition (Config, dann Stash für deaktivierte user-Server).
+    let entry = defs
+        .iter()
+        .find(|d| d.scope == scope && d.name == name)
+        .map(|d| d.entry.clone())
+        .or_else(|| {
+            if scope == Scope::User {
+                crate::stash::peek(&name).map(|item| item.entry)
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| AppError::Io("Quell-Definition nicht gefunden".into()))?;
+
+    // Zielname darf im selben Scope nicht existieren (inkl. Stash bei user).
+    let in_config = defs.iter().any(|d| d.scope == scope && d.name == new_name);
+    let in_stash = scope == Scope::User && crate::stash::peek(&new_name).is_some();
+    if in_config || in_stash {
+        return Err(AppError::Io(format!(
+            "Ein Server namens „{}“ existiert im Scope ({}) bereits",
+            new_name,
+            scope.cli_value()
+        )));
+    }
+
+    // Auto-Snapshot vor der Mutation (kein Rollback – siehe auto_snapshot).
+    auto_snapshot(
+        settings,
+        Some(format!("auto: rename_server {name} -> {new_name}")),
+    )?;
+
+    // Verifiziert unter neuem Namen anlegen, dann Original entfernen (Snapshot
+    // wurde bereits angelegt -> hier überspringen).
+    copy_definition(settings, &entry, &new_name, scope, &project_path)?;
+    remove_server_impl(settings, name, scope, project_path, false)
+}
+
 /// Listet alle Claude-Code-Projekte (Einträge unter `projects` in ~/.claude.json).
 #[tauri::command]
 pub fn list_projects() -> Result<Vec<ProjectInfo>, AppError> {
@@ -1403,6 +1564,97 @@ mod tests {
             let _ = crate::snapshot::delete(&m.id);
         }
         eprintln!("Auto-Snapshot OK ({} neu)", created.len());
+    }
+
+    #[test]
+    fn conflict_precedence_and_fingerprint() {
+        use std::collections::BTreeMap;
+
+        // Effektiver Scope: local > project > user (kleinste Präzedenz gewinnt).
+        let eff = |scopes: &[Scope]| -> Scope {
+            scopes
+                .iter()
+                .copied()
+                .min_by_key(|s| scope_precedence(*s))
+                .unwrap()
+        };
+        assert_eq!(eff(&[Scope::User, Scope::Project]), Scope::Project);
+        assert_eq!(eff(&[Scope::User, Scope::Local]), Scope::Local);
+        assert_eq!(eff(&[Scope::User, Scope::Local, Scope::Project]), Scope::Local);
+        assert_eq!(eff(&[Scope::Project, Scope::User, Scope::Local]), Scope::Local);
+
+        // Fingerprint ist unabhängig von der env-Key-Reihenfolge (BTreeMap sortiert).
+        let mut e1 = ServerEntry {
+            command: Some("srv".into()),
+            ..Default::default()
+        };
+        let mut env_a = BTreeMap::new();
+        env_a.insert("A".to_string(), "1".to_string());
+        env_a.insert("B".to_string(), "2".to_string());
+        e1.env = Some(env_a);
+
+        let mut e2 = ServerEntry {
+            command: Some("srv".into()),
+            ..Default::default()
+        };
+        let mut env_b = BTreeMap::new();
+        env_b.insert("B".to_string(), "2".to_string());
+        env_b.insert("A".to_string(), "1".to_string());
+        e2.env = Some(env_b);
+
+        assert_eq!(
+            definition_fingerprint(&e1),
+            definition_fingerprint(&e2),
+            "gleiche Definition (andere Insert-Reihenfolge) -> gleicher Fingerprint"
+        );
+
+        let e3 = ServerEntry {
+            command: Some("anders".into()),
+            ..Default::default()
+        };
+        assert_ne!(
+            definition_fingerprint(&e1),
+            definition_fingerprint(&e3),
+            "abweichende Definition -> anderer Fingerprint"
+        );
+    }
+
+    /// Opt-in: legt denselben Server in user- und local-Scope an, prüft, dass
+    /// `list_conflicts` ihn findet (effective_scope=Local, identical=true), und
+    /// räumt wieder auf. Nur mit `-- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn list_conflicts_finds_cross_scope_duplicate() {
+        let tmp = std::path::PathBuf::from("/tmp/mcpmgr-conflicttest");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let proj = tmp.to_string_lossy().to_string();
+        let name = "mcpmgr-conflictsrv".to_string();
+
+        let _ = remove_server(name.clone(), Scope::User, None);
+        let _ = remove_server(name.clone(), Scope::Local, Some(proj.clone()));
+
+        let e = ServerEntry {
+            transport: Some("stdio".into()),
+            command: Some("echo".into()),
+            args: Some(vec!["x".into()]),
+            ..Default::default()
+        };
+        add_server(name.clone(), Scope::User, None, e.clone()).expect("add user");
+        add_server(name.clone(), Scope::Local, Some(proj.clone()), e).expect("add local");
+
+        let conflicts = list_conflicts(Some(proj.clone())).expect("list_conflicts");
+        let c = conflicts
+            .iter()
+            .find(|c| c.name == name)
+            .expect("Konflikt gefunden");
+        assert!(c.definitions.len() >= 2, "mindestens zwei Definitionen");
+        assert_eq!(c.effective_scope, Scope::Local, "local gewinnt");
+        assert!(c.identical, "gleiche Definition -> identical");
+
+        // Aufräumen.
+        let _ = remove_server(name.clone(), Scope::User, None);
+        let _ = remove_server(name.clone(), Scope::Local, Some(proj));
+        eprintln!("list_conflicts OK");
     }
 
     /// Opt-in: mcpjson-Toggle schreibt korrekt in settings.local.json.
