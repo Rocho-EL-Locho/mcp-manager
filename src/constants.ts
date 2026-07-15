@@ -16,3 +16,8 @@ export const TIMEOUT_MAX = 600;
  *  geklemmt, weil `auto_refresh_minutes` als u32 serialisiert wird und ein
  *  Überlauf sonst nur einen kryptischen Deserialisierungsfehler erzeugte. */
 export const AUTO_REFRESH_MAX = 10080;
+
+/** Grenzen der Snapshot-Aufbewahrung – Anzeige. Maßgeblich ist das Backend
+ *  (`settings.rs::validate`, `RETENTION_MIN`/`RETENTION_MAX`). */
+export const RETENTION_MIN = 1;
+export const RETENTION_MAX = 500;

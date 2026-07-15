@@ -208,6 +208,17 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_out_of_range_retention() {
+        let mut s = AppSettings::default();
+        s.snapshot_retention = RETENTION_MIN - 1; // 0
+        assert!(validate(&s).is_err());
+        s.snapshot_retention = RETENTION_MAX + 1;
+        assert!(validate(&s).is_err());
+        s.snapshot_retention = RETENTION_MIN;
+        assert!(validate(&s).is_ok());
+    }
+
+    #[test]
     fn validate_accepts_defaults() {
         assert!(validate(&AppSettings::default()).is_ok());
     }

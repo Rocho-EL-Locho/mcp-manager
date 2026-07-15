@@ -5,7 +5,7 @@ import { openModal } from "../modal";
 import { field } from "./serverForm";
 import { switchControl } from "../switch";
 import { toast } from "../toast";
-import { TIMEOUT_MIN, TIMEOUT_MAX, AUTO_REFRESH_MAX } from "../constants";
+import { TIMEOUT_MIN, TIMEOUT_MAX, AUTO_REFRESH_MAX, RETENTION_MIN, RETENTION_MAX } from "../constants";
 
 export interface SettingsOptions {
   /// Wird nach erfolgreichem Speichern aufgerufen (z. B. Claude-Badge neu prüfen).
@@ -107,14 +107,17 @@ export async function openSettings(opts: SettingsOptions): Promise<void> {
   // --- Verhalten ---
   const autoRefresh = numberInput(settings.auto_refresh_minutes, 0, AUTO_REFRESH_MAX);
   const notif = switchControl({ on: settings.notifications, disabled: true, title: "noch nicht verfügbar" });
-  const retention = numberInput(settings.snapshot_retention, 1);
-  retention.disabled = true;
+  const retention = numberInput(settings.snapshot_retention, RETENTION_MIN, RETENTION_MAX);
 
   const behaviorGroup = group(
     "Verhalten",
     field("Auto-Refresh (Minuten, 0 = aus)", autoRefresh, "Wird mit Health-Monitoring (Feature 09) aktiv."),
     field("Benachrichtigungen", notif, "Verfügbar mit Health-Monitoring (Feature 09)."),
-    field("Snapshot-Aufbewahrung", retention, "Verfügbar mit Backups & Snapshots (Feature 05)."),
+    field(
+      "Snapshot-Aufbewahrung",
+      retention,
+      `Anzahl automatisch aufbewahrter Snapshots (${RETENTION_MIN}–${RETENTION_MAX}). Manuelle bleiben immer erhalten.`,
+    ),
   );
 
   // --- Darstellung ---
@@ -168,6 +171,8 @@ export async function openSettings(opts: SettingsOptions): Promise<void> {
     if (typeof listV === "string") return fail(listV);
     const mutV = asPositiveInt(mutTimeout, "Änderungs-Timeout");
     if (typeof mutV === "string") return fail(mutV);
+    const retentionV = asPositiveInt(retention, "Snapshot-Aufbewahrung");
+    if (typeof retentionV === "string") return fail(retentionV);
     // Auf [0, AUTO_REFRESH_MAX] klemmen (u32-Überlauf vermeiden; Backend prüft
     // dieses Feld nicht).
     const refreshN = Math.min(AUTO_REFRESH_MAX, Math.max(0, Math.trunc(Number(autoRefresh.value) || 0)));
@@ -178,6 +183,7 @@ export async function openSettings(opts: SettingsOptions): Promise<void> {
       list_timeout_secs: listV,
       mut_timeout_secs: mutV,
       auto_refresh_minutes: refreshN,
+      snapshot_retention: retentionV,
       theme: themeSelect.value as Theme,
     };
 
