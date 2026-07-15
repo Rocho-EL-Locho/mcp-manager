@@ -10,12 +10,17 @@ import {
   loginServer,
   toggleMcpjsonServer,
   toggleUserServer,
+  listBackups,
+  createBackup,
+  restoreBackup,
+  deleteBackup,
 } from "./ipc";
-import type { MergedServer, ProjectInfo, Scope } from "./ipc";
+import type { MergedServer, ProjectInfo, Scope, BackupInfo } from "./ipc";
 import { renderServerList, defaultFilter, selectionKey } from "./views/serverList";
 import type { FilterState, BulkAction } from "./views/serverList";
 import { renderSidebar } from "./views/sidebar";
 import type { View } from "./views/sidebar";
+import { renderBackups } from "./views/backups";
 import { openDetail } from "./views/serverDetail";
 import { openServerForm } from "./views/serverForm";
 import { openServerPicker } from "./views/serverPicker";
@@ -29,6 +34,7 @@ import { icon, setIcon } from "./icons";
 interface State {
   servers: MergedServer[];
   projects: ProjectInfo[];
+  backups: BackupInfo[];
   home: string;
   view: View;
   loading: boolean;
@@ -43,6 +49,7 @@ interface State {
 const state: State = {
   servers: [],
   projects: [],
+  backups: [],
   home: "",
   view: { kind: "global" },
   loading: false,
@@ -108,6 +115,19 @@ async function refresh(): Promise<void> {
   state.error = null;
   await loadProjects();
   if (seq !== refreshSeq) return;
+
+  // Backups-Ansicht: eigener, health-check-freier Ladepfad.
+  if (state.view.kind === "backups") {
+    try {
+      state.backups = await listBackups();
+    } catch (e) {
+      state.error = String(e);
+    }
+    if (seq !== refreshSeq) return;
+    renderContent();
+    return;
+  }
+
   const project = currentProjectPath();
 
   // Phase 1: schnelle Liste (Status aus Cache, kein Health-Check) -> sofort da.
@@ -276,11 +296,16 @@ function onLogin(server: MergedServer): void {
 
 /// Toggle-Routing (ohne Toast/Refresh) – von onToggle und den Bulk-Aktionen genutzt.
 /// Projekt-Scope über settings.local.json, User-Scope über Stash-and-restore.
-async function applyToggle(server: MergedServer, enabled: boolean): Promise<void> {
+async function applyToggle(
+  server: MergedServer,
+  enabled: boolean,
+  skipSnapshot = false,
+): Promise<void> {
   if (server.scope === "project") {
+    // Projekt-Scope schreibt nur in settings.local.json -> kein Snapshot.
     await toggleMcpjsonServer(server.name, enabled, server.project_path ?? undefined);
   } else if (server.scope === "user") {
-    await toggleUserServer(server.name, enabled);
+    await toggleUserServer(server.name, enabled, skipSnapshot);
   } else {
     throw new Error(`Kein Aktivieren/Deaktivieren für Scope „${server.origin}"`);
   }
@@ -351,7 +376,7 @@ function onBulk(action: BulkAction, servers: MergedServer[]): void {
     title: meta.title,
     message:
       action === "remove"
-        ? `${planned.length} Server werden über claude gelöscht. Das kann nicht rückgängig gemacht werden.`
+        ? `${planned.length} Server werden über claude gelöscht. Zuvor wird automatisch ein Snapshot angelegt (über „Backups" wiederherstellbar).`
         : `${planned.length} Server werden ${meta.gerund}.`,
     extra,
     confirmLabel: meta.confirmLabel,
@@ -359,15 +384,29 @@ function onBulk(action: BulkAction, servers: MergedServer[]): void {
     onConfirm: async (setStatus) => {
       done = 0;
       failures.length = 0;
+      // Destruktive Bulk-Aktionen (Entfernen/Deaktivieren) einmalig vorab
+      // sichern statt pro Server – sonst würde jeder Einzelschritt einen
+      // Snapshot anlegen und die Retention mit Kopien derselben Aktion fluten.
+      // Aktivieren ist nicht destruktiv und braucht keine Sicherung.
+      const bulkSnapshot = action !== "enable";
+      if (bulkSnapshot) {
+        setStatus("Sicherung wird erstellt…");
+        // auto=true: unterliegt der Retention (kein unbegrenztes Anwachsen) und
+        // wird korrekt als automatische Sicherung getaggt.
+        await createBackup(
+          `auto: Bulk-${meta.confirmLabel} (${planned.length} Server)`,
+          true,
+        );
+      }
       for (let i = 0; i < planned.length; i++) {
         const s = planned[i];
         setStatus(`${i + 1}/${planned.length} … ${s.name}`);
         try {
           if (action === "remove") {
             if (!s.scope) throw new Error("Externer Server kann nicht entfernt werden.");
-            await removeServer(s.name, s.scope, s.project_path ?? undefined);
+            await removeServer(s.name, s.scope, s.project_path ?? undefined, bulkSnapshot);
           } else {
-            await applyToggle(s, targetEnabled);
+            await applyToggle(s, targetEnabled, bulkSnapshot);
           }
           done++;
         } catch (e) {
@@ -405,6 +444,13 @@ function onDeleteProject(project: ProjectInfo): void {
   });
 }
 
+const backupHandlers = {
+  create: (note: string | undefined) => createBackup(note).then(() => undefined),
+  restore: (id: string, onlyPaths: string[] | undefined) => restoreBackup(id, onlyPaths),
+  remove: (id: string) => deleteBackup(id),
+  onChanged: () => void refresh(),
+};
+
 function renderSidebarEl(): void {
   clear(sidebarEl);
   sidebarEl.append(
@@ -433,6 +479,16 @@ function renderContent(): void {
   const caret = searchFocused ? active.selectionStart : null;
 
   clear(contentEl);
+
+  // Backups-Ansicht: eigene View statt der Server-Liste.
+  if (state.view.kind === "backups") {
+    contentEl.append(h("div", { class: "view-head" }, h("span", { text: "Backups & Snapshots" })));
+    if (state.error) {
+      contentEl.append(h("div", { class: "banner banner-error", text: state.error }));
+    }
+    contentEl.append(renderBackups(state.backups, state.home, backupHandlers));
+    return;
+  }
 
   const heading =
     state.view.kind === "project"

@@ -723,15 +723,42 @@ fn update_server_impl(
     }
 }
 
-/// Entfernt einen Server via `claude mcp remove`.
+/// Legt einen Auto-Snapshot an, sofern `note` gesetzt ist (`None` überspringt –
+/// z. B. wenn der Aufrufer für eine Bulk-Aktion bereits einen gemeinsamen
+/// Snapshot angelegt hat). Schlägt die Sicherung fehl, bricht die aufrufende
+/// destruktive Aktion ab (lieber nicht ändern als ungesichert ändern).
+///
+/// Bewusst OHNE Rollback: der Aufrufer legt den Snapshot erst NACH allen
+/// billigen Vorbedingungsprüfungen an (kein Waisen-Snapshot bei „nicht
+/// gefunden") und unmittelbar VOR der ersten Mutation. Einen einmal angelegten
+/// Snapshot wieder zu löschen wäre gefährlich: Schlägt eine mehrstufige Aktion
+/// nach einer Teil-Mutation fehl (z. B. set_scope: im Ziel angelegt, aus der
+/// Quelle-Entfernen scheitert), ist genau dieser Snapshot die einzige
+/// Wiederherstellungsmöglichkeit.
+fn auto_snapshot(settings: &AppSettings, note: Option<String>) -> Result<(), AppError> {
+    if let Some(n) = note {
+        crate::snapshot::create(Some(n), true, settings.snapshot_retention)?;
+    }
+    Ok(())
+}
+
+/// Entfernt einen Server via `claude mcp remove`. `skip_snapshot` unterdrückt den
+/// automatischen Snapshot (Bulk-Aktionen sichern einmalig vorab).
 #[tauri::command]
 pub async fn remove_server(
     state: State<'_, AppState>,
     name: String,
     scope: Scope,
     project_path: Option<String>,
+    skip_snapshot: Option<bool>,
 ) -> Result<(), AppError> {
-    remove_server_impl(&state.settings(), name, scope, project_path)
+    remove_server_impl(
+        &state.settings(),
+        name,
+        scope,
+        project_path,
+        !skip_snapshot.unwrap_or(false),
+    )
 }
 
 fn remove_server_impl(
@@ -739,19 +766,25 @@ fn remove_server_impl(
     name: String,
     scope: Scope,
     project_path: Option<String>,
+    snapshot: bool,
 ) -> Result<(), AppError> {
-    // Deaktivierte user-scope Server liegen ausschließlich im Stash und nicht in
-    // ~/.claude.json – `claude mcp remove` würde sie nicht finden. Solche Einträge
-    // direkt aus dem Stash löschen. Steht der Server (kaputte Invariante) trotzdem
-    // auch aktiv in ~/.claude.json, NICHT kurzschließen, sondern normal entfernen.
+    // Deaktivierte user-scope Server liegen ausschließlich im Stash und nicht
+    // in ~/.claude.json – `claude mcp remove` würde sie nicht finden. Solche
+    // Einträge direkt aus dem Stash löschen. Steht der Server (kaputte
+    // Invariante) trotzdem auch aktiv in ~/.claude.json, NICHT kurzschließen.
     if scope == Scope::User && crate::stash::peek(&name).is_some() {
         let active = collect_definitions(&default_project_path())
             .into_iter()
             .any(|d| d.scope == Scope::User && d.name == name);
         if !active {
+            // Reine Stash-Mutation -> vorher sichern, dann entfernen.
+            auto_snapshot(settings, snapshot.then(|| format!("auto: remove_server {name}")))?;
             return crate::stash::remove(&name);
         }
     }
+    // Auto-Snapshot unmittelbar vor der Mutation (schlägt er fehl, wird nichts
+    // entfernt). Kein nachträgliches Löschen – siehe auto_snapshot.
+    auto_snapshot(settings, snapshot.then(|| format!("auto: remove_server {name}")))?;
     let cwd = cwd_for(scope, &project_path);
     run_mut(
         settings.claude_path(),
@@ -759,7 +792,7 @@ fn remove_server_impl(
         cwd,
         settings.mut_timeout(),
     )?;
-    // Verwaisten Stash-Eintrag mitentfernen (defensiv; no-op, wenn keiner existiert).
+    // Verwaisten Stash-Eintrag mitentfernen (defensiv; no-op ohne Eintrag).
     if scope == Scope::User {
         let _ = crate::stash::remove(&name);
     }
@@ -815,8 +848,15 @@ pub async fn toggle_user_server(
     name: String,
     enabled: bool,
     entry: Option<ServerEntry>,
+    skip_snapshot: Option<bool>,
 ) -> Result<(), AppError> {
-    toggle_user_server_impl(&state.settings(), name, enabled, entry)
+    toggle_user_server_impl(
+        &state.settings(),
+        name,
+        enabled,
+        entry,
+        !skip_snapshot.unwrap_or(false),
+    )
 }
 
 fn toggle_user_server_impl(
@@ -824,6 +864,7 @@ fn toggle_user_server_impl(
     name: String,
     enabled: bool,
     entry: Option<ServerEntry>,
+    snapshot: bool,
 ) -> Result<(), AppError> {
     if enabled {
         // Reaktivieren: Definition aus dem Stash zurückspielen.
@@ -838,7 +879,9 @@ fn toggle_user_server_impl(
         crate::stash::remove(&name)?; // erst nach Erfolg
         Ok(())
     } else {
-        // Deaktivieren: aktuelle Definition sichern, DANN entfernen.
+        // Deaktivieren: erst die Definition ermitteln (Vorbedingung – erzeugt
+        // noch keinen Snapshot, falls nicht gefunden), dann sichern, dann
+        // mutieren. Kein Rollback: ab stash::upsert wurde bereits geschrieben.
         let dir = default_project_path();
         let current = collect_definitions(&dir)
             .into_iter()
@@ -846,6 +889,7 @@ fn toggle_user_server_impl(
             .map(|d| d.entry)
             .or(entry)
             .ok_or_else(|| AppError::Io("Server-Definition nicht gefunden".into()))?;
+        auto_snapshot(settings, snapshot.then(|| format!("auto: disable {name}")))?;
         crate::stash::upsert(&name, current)?;
         run_mut(
             settings.claude_path(),
@@ -921,13 +965,21 @@ fn set_scope_impl(
     let timeout = settings.mut_timeout();
     let claude_path = settings.claude_path();
 
+    // Vorbedingung zuerst (erzeugt noch keinen Snapshot, falls die Quelle fehlt).
     let entry = collect_definitions(&from_dir)
         .into_iter()
         .find(|d| d.scope == from_scope && d.name == name)
         .map(|d| d.entry)
         .ok_or_else(|| AppError::Io("Quell-Definition nicht gefunden".into()))?;
 
-    // 1.+2. Verifiziert im Ziel-Scope anlegen (Quelle bleibt bei Fehler unangetastet).
+    // Auto-Snapshot unmittelbar vor der ersten Mutation. NICHT nachträglich
+    // löschen: schlägt Schritt 3 (Entfernen aus der Quelle) nach erfolgreichem
+    // Anlegen im Ziel fehl, ist der Server dupliziert – dann ist genau dieser
+    // Snapshot die einzige Möglichkeit, den sauberen Vorher-Zustand
+    // wiederherzustellen.
+    auto_snapshot(settings, Some(format!("auto: set_scope {name}")))?;
+
+    // 1.+2. Verifiziert im Ziel-Scope anlegen (Quelle bleibt bei Fehler unberührt).
     copy_definition(settings, &entry, &name, to_scope, &to_project)?;
 
     // 3. Erst jetzt aus dem Quell-Scope entfernen.
@@ -943,7 +995,6 @@ fn set_scope_impl(
             e
         )));
     }
-
     Ok(())
 }
 
@@ -1086,9 +1137,16 @@ pub fn list_projects() -> Result<Vec<ProjectInfo>, AppError> {
 /// Server und Verlauf). Direkter, atomarer Edit mit vorheriger Sicherung –
 /// es gibt keinen CLI-Befehl dafür.
 #[tauri::command]
-pub fn delete_project(path: String) -> Result<(), AppError> {
+pub fn delete_project(state: State<'_, AppState>, path: String) -> Result<(), AppError> {
+    delete_project_impl(&state.settings(), path)
+}
+
+fn delete_project_impl(settings: &AppSettings, path: String) -> Result<(), AppError> {
+    // Erst in-memory prüfen und entfernen (noch keine Platte berührt): so wird
+    // bei „Projekt nicht gefunden" kein Waisen-Snapshot angelegt.
     let cj = claude_json_path();
-    let mut root = read_json_value(&cj).ok_or_else(|| AppError::Io("~/.claude.json nicht lesbar".into()))?;
+    let mut root =
+        read_json_value(&cj).ok_or_else(|| AppError::Io("~/.claude.json nicht lesbar".into()))?;
     let obj = root
         .as_object_mut()
         .ok_or_else(|| AppError::Parse("unerwartetes Format in ~/.claude.json".into()))?;
@@ -1100,11 +1158,12 @@ pub fn delete_project(path: String) -> Result<(), AppError> {
     if !removed {
         return Err(AppError::Io("Projekt nicht gefunden".into()));
     }
-    // Sicherung ist verpflichtend: scheitert sie, wird NICHT geschrieben.
-    // (Die Race gegen ein laufendes Claude Code bleibt inhärent – ein Lock ist
-    // hier nicht möglich.)
-    let bak = cj.with_file_name(".claude.json.mcpmgr.bak");
-    std::fs::copy(&cj, &bak).map_err(|e| AppError::Io(format!("Backup fehlgeschlagen: {e}")))?;
+
+    // Verpflichtender Auto-Snapshot als Sicherung unmittelbar vor dem Schreiben
+    // (löst das frühere einzelne .claude.json.mcpmgr.bak ab, da der Snapshot
+    // vollständig und selbst wiederherstellbar ist); schlägt er fehl, wird NICHT
+    // geschrieben. Die Race gegen ein laufendes Claude Code bleibt inhärent.
+    auto_snapshot(settings, Some(format!("auto: delete_project {path}")))?;
     crate::toggles::atomic_write_json(&cj, &root)
 }
 
@@ -1143,6 +1202,42 @@ pub fn set_settings(
     Ok(settings)
 }
 
+/// Erstellt einen Snapshot der aktuellen MCP-Konfiguration. `auto=false`
+/// (Default) = manueller Snapshot (bleibt erhalten); `auto=true` = automatische
+/// Sicherung (unterliegt der Retention) – z. B. der eine Sammel-Snapshot vor
+/// einer Bulk-Aktion.
+#[tauri::command]
+pub fn create_snapshot(
+    state: State<'_, AppState>,
+    note: Option<String>,
+    auto: Option<bool>,
+) -> Result<crate::snapshot::SnapshotManifest, AppError> {
+    crate::snapshot::create(note, auto.unwrap_or(false), state.settings().snapshot_retention)
+}
+
+/// Listet alle vorhandenen Snapshots, neueste zuerst.
+#[tauri::command]
+pub fn list_snapshots() -> Result<Vec<crate::snapshot::SnapshotManifest>, AppError> {
+    crate::snapshot::list()
+}
+
+/// Stellt einen Snapshot wieder her (optional nur ausgewählte Dateien). Legt
+/// vorher selbst einen Auto-Snapshot des Ist-Zustands an.
+#[tauri::command]
+pub fn restore_snapshot(
+    state: State<'_, AppState>,
+    id: String,
+    only_paths: Option<Vec<String>>,
+) -> Result<(), AppError> {
+    crate::snapshot::restore(&id, only_paths, state.settings().snapshot_retention)
+}
+
+/// Löscht einen Snapshot.
+#[tauri::command]
+pub fn delete_snapshot(id: String) -> Result<(), AppError> {
+    crate::snapshot::delete(&id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1158,13 +1253,13 @@ mod tests {
         add_server_impl(&cfg(), name, scope, pp, entry)
     }
     fn remove_server(name: String, scope: Scope, pp: Option<String>) -> Result<(), AppError> {
-        remove_server_impl(&cfg(), name, scope, pp)
+        remove_server_impl(&cfg(), name, scope, pp, true)
     }
     fn update_server(name: String, scope: Scope, pp: Option<String>, entry: ServerEntry) -> Result<(), AppError> {
         update_server_impl(&cfg(), name, scope, pp, entry)
     }
     fn toggle_user_server(name: String, enabled: bool, entry: Option<ServerEntry>) -> Result<(), AppError> {
-        toggle_user_server_impl(&cfg(), name, enabled, entry)
+        toggle_user_server_impl(&cfg(), name, enabled, entry, true)
     }
     fn set_scope(
         name: String,
@@ -1174,6 +1269,9 @@ mod tests {
         to_project: Option<String>,
     ) -> Result<(), AppError> {
         set_scope_impl(&cfg(), name, from_scope, to_scope, from_project, to_project)
+    }
+    fn delete_project(path: String) -> Result<(), AppError> {
+        delete_project_impl(&cfg(), path)
     }
     #[allow(clippy::too_many_arguments)]
     fn clone_server(
@@ -1264,6 +1362,47 @@ mod tests {
         remove_server(name.clone(), Scope::User, None).expect("remove");
         assert!(present().is_none(), "nach remove weg");
         eprintln!("Roundtrip OK (add/update/remove)");
+    }
+
+    /// Opt-in: remove_server legt automatisch einen Snapshot an. Nutzt einen
+    /// Wegwerf-Server und räumt die dabei erzeugten Snapshots wieder auf.
+    /// Nur mit `-- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn remove_server_creates_auto_snapshot() {
+        let name = "mcpmgr-snaptest".to_string();
+        let _ = remove_server(name.clone(), Scope::User, None);
+
+        let before: Vec<String> = crate::snapshot::list()
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+
+        let e = ServerEntry {
+            transport: Some("stdio".into()),
+            command: Some("echo".into()),
+            args: Some(vec!["x".into()]),
+            ..Default::default()
+        };
+        add_server(name.clone(), Scope::User, None, e).expect("add");
+        remove_server(name.clone(), Scope::User, None).expect("remove");
+
+        let created: Vec<_> = crate::snapshot::list()
+            .unwrap()
+            .into_iter()
+            .filter(|m| !before.contains(&m.id))
+            .collect();
+        assert!(
+            created.iter().any(|m| m.auto),
+            "remove_server sollte einen Auto-Snapshot erzeugen"
+        );
+
+        // Aufräumen.
+        for m in &created {
+            let _ = crate::snapshot::delete(&m.id);
+        }
+        eprintln!("Auto-Snapshot OK ({} neu)", created.len());
     }
 
     /// Opt-in: mcpjson-Toggle schreibt korrekt in settings.local.json.
