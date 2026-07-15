@@ -25,6 +25,7 @@ pub fn run() {
             commands::reveal_server_entry,
             commands::introspect_server,
             commands::peek_introspection,
+            commands::playground_call,
             commands::preflight_server,
             commands::add_server,
             commands::update_server,

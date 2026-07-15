@@ -1052,6 +1052,16 @@ body {
   border-top: 1px solid var(--border);
 }
 
+.caps-item-head {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  justify-content: space-between;
+}
+.caps-item-head .btn {
+  flex: none;
+}
+
 .caps-item-name {
   font-size: 0.82rem;
   overflow-wrap: anywhere;
@@ -1095,6 +1105,78 @@ body {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   max-height: 16rem;
+  overflow: auto;
+  user-select: text;
+}
+
+/* ---------- Tool-Playground ---------- */
+.pg {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+.pg-args {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+.pg-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+.pg-json {
+  width: 100%;
+  resize: vertical;
+}
+.pg-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+.pg-result {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.pg-result:empty {
+  display: none;
+}
+.pg-result-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.pg-text {
+  margin: 0;
+  padding: 0.55rem 0.7rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 0.78rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 22rem;
+  overflow: auto;
+  user-select: text;
+}
+.pg-raw > summary {
+  cursor: pointer;
+  font-size: 0.8rem;
+  color: var(--muted);
+  user-select: none;
+}
+.pg-raw > pre {
+  margin: 0.35rem 0 0;
+  padding: 0.55rem 0.7rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 0.76rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 22rem;
   overflow: auto;
   user-select: text;
 }
