@@ -129,6 +129,50 @@ pub struct Introspection {
     pub introspected_at: u64,
 }
 
+/// Eine testweise Operation des Tool-Playgrounds (kommt vom Frontend).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PlaygroundRequest {
+    /// `tools/call`
+    CallTool {
+        name: String,
+        arguments: serde_json::Value,
+    },
+    /// `resources/read`
+    ReadResource { uri: String },
+    /// `prompts/get`
+    GetPrompt {
+        name: String,
+        #[serde(default)]
+        arguments: Option<BTreeMap<String, String>>,
+    },
+}
+
+/// Ergebnis eines Playground-Aufrufs. Gibt – wie `Introspection` – IMMER ein
+/// Objekt zurück; Fehler stehen in `error` (Transport/RPC) bzw. `is_error`
+/// (Tool meldet inhaltlichen Fehler via `isError: true`).
+#[derive(Debug, Clone, Serialize)]
+pub struct PlaygroundResult {
+    /// Transport/Handshake/RPC ok? (false => `error` gesetzt)
+    pub ok: bool,
+    /// Tool-seitiger Fehler (`result.isError == true`) – kein Transportfehler.
+    #[serde(rename = "isError")]
+    pub is_error: bool,
+    /// Ergebnis-`result` (redigiert, Blobs zusammengefasst). None bei Fehler.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    /// Transport-/RPC-Fehlermeldung (redigiert). None bei Erfolg.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub notes: Vec<String>,
+    /// Redigierter stderr-Auszug (nur stdio). None wenn leer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logs: Option<String>,
+    /// Gesamtdauer (ms) des Aufrufs (Start bis Antwort).
+    #[serde(rename = "durationMs", skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+}
+
 /// Was das Frontend tatsächlich rendert: Definition (aus JSON) + Status (aus CLI).
 #[derive(Debug, Clone, Serialize)]
 pub struct MergedServer {

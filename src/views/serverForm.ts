@@ -19,12 +19,12 @@ export interface ServerFormOptions {
   onSaved: () => void;
 }
 
-interface KvEditor {
+export interface KvEditor {
   el: HTMLElement;
   getValues: () => Record<string, string>;
 }
 
-function kvEditor(initial?: Record<string, string>, secretKeys?: string[]): KvEditor {
+export function kvEditor(initial?: Record<string, string>, secretKeys?: string[]): KvEditor {
   const rows = h("div", { class: "kv-editor" });
   const secrets = new Set(secretKeys ?? []);
 

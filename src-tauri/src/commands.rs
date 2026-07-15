@@ -18,7 +18,7 @@ use crate::mask::{
 };
 use crate::models::{
     AppError, ClaudeInfo, ConflictDefinition, ConflictInfo, Introspection, MergedServer,
-    ProjectInfo, Scope, ServerEntry, ServerStatus,
+    PlaygroundRequest, PlaygroundResult, ProjectInfo, Scope, ServerEntry, ServerStatus,
 };
 use crate::parse::{failure_detail, parse_list, status_from_text};
 use crate::preflight::RuntimePreflight;
@@ -29,6 +29,9 @@ const LOGIN_TIMEOUT: Duration = Duration::from_secs(180);
 /// Zeitbudget für den Introspektions-Handshake. Großzügig, weil der erste
 /// `npx`/`uvx`-Start (Download/Cold-Start) spürbar dauern kann.
 const INTROSPECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// Zeitbudget für einen Playground-Aufruf (Handshake + ein Request). Länger als
+/// INTROSPECT_TIMEOUT, da ein `tools/call` echte Arbeit verrichten darf.
+const PLAYGROUND_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Zuletzt bekannter Status + Kurzbeschreibung eines Servers (für den Cache).
 #[derive(Clone)]
@@ -90,6 +93,27 @@ fn transport_of(entry: &ServerEntry) -> &'static str {
         return "http";
     }
     "stdio"
+}
+
+/// Löst die **unmaskierte** Definition eines Servers auf (Config, dann Stash für
+/// deaktivierte user-Server). Der Handshake/Playground braucht die echten
+/// env/args/headers. Fehlt sie, `AppError`.
+fn resolve_entry(
+    scope: Scope,
+    name: &str,
+    project_path: &Option<String>,
+) -> Result<ServerEntry, AppError> {
+    let dir = resolve_project_dir(project_path.clone());
+    collect_definitions(&dir)
+        .into_iter()
+        .find(|d| d.scope == scope && d.name == name)
+        .map(|d| d.entry)
+        .or_else(|| {
+            (scope == Scope::User)
+                .then(|| crate::stash::peek(name).map(|i| i.entry))
+                .flatten()
+        })
+        .ok_or_else(|| AppError::Io("Server-Definition nicht gefunden".into()))
 }
 
 /// Stabiler Cache-Schlüssel für die Introspektion eines Servers.
@@ -484,19 +508,8 @@ pub async fn introspect_server(
         }
     }
 
-    // Unmaskierte Definition auflösen (wie reveal_server_entry): der Handshake
-    // braucht die echten env/args, um den Prozess zu starten.
-    let dir = resolve_project_dir(project_path.clone());
-    let entry = collect_definitions(&dir)
-        .into_iter()
-        .find(|d| d.scope == scope && d.name == name)
-        .map(|d| d.entry)
-        .or_else(|| {
-            (scope == Scope::User)
-                .then(|| crate::stash::peek(&name).map(|i| i.entry))
-                .flatten()
-        })
-        .ok_or_else(|| AppError::Io("Server-Definition nicht gefunden".into()))?;
+    // Unmaskierte Definition auflösen: der Handshake braucht die echten env/args.
+    let entry = resolve_entry(scope, &name, &project_path)?;
 
     // Beide Zweige geben immer eine Introspection zurück; Start-/Handshake-Fehler
     // stehen in `error`/`logs` (statt als Err), damit die Detail-Ansicht sie zeigt.
@@ -514,6 +527,73 @@ pub async fn introspect_server(
         .insert(key, introspection.clone());
 
     Ok(introspection)
+}
+
+/// Führt eine testweise Playground-Operation aus (`tools/call`, `resources/read`,
+/// `prompts/get`). One-shot: Server frisch starten, Handshake, EIN Request,
+/// beenden. **Kein Cache** – jeder Aufruf wird ausgeführt.
+#[tauri::command]
+pub fn playground_call(
+    name: String,
+    scope: Scope,
+    project_path: Option<String>,
+    request: PlaygroundRequest,
+) -> Result<PlaygroundResult, AppError> {
+    let entry = resolve_entry(scope, &name, &project_path)?;
+    let mut result = match transport_of(&entry) {
+        "stdio" => crate::introspect::playground_stdio(&entry, &request, PLAYGROUND_TIMEOUT),
+        _ => crate::introspect::playground_http(&entry, &request, PLAYGROUND_TIMEOUT),
+    };
+    mask_playground(&mut result);
+    Ok(result)
+}
+
+/// Redigiert ein Playground-Ergebnis vor Verlassen des Backends: Ergebnis-JSON
+/// (String-Blätter) via `redact_json`, große Blob-/Bild-Inhalte werden
+/// zusammengefasst; Fehler/Logs/Notizen via `redact_secrets`.
+fn mask_playground(r: &mut PlaygroundResult) {
+    if let Some(v) = r.result.take() {
+        r.result = Some(redact_json(&summarize_blobs(v)));
+    }
+    if let Some(e) = &r.error {
+        r.error = Some(redact_secrets(e));
+    }
+    if let Some(l) = &r.logs {
+        r.logs = Some(redact_secrets(l));
+    }
+    for n in &mut r.notes {
+        *n = redact_secrets(n);
+    }
+}
+
+/// Ersetzt große Binärinhalte (base64) durch eine kurze Zusammenfassung, damit
+/// das UI nicht mit Megabyte-Blobs geflutet wird und `redact_json` nicht sinnlos
+/// über riesige Datenstrings läuft. Betrifft MCP-`content`-Items vom Typ
+/// `image`/`audio` (Feld `data`) sowie Resource-`blob`-Felder.
+fn summarize_blobs(value: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::Object(mut map) => {
+            let is_binary = matches!(
+                map.get("type").and_then(|t| t.as_str()),
+                Some("image") | Some("audio")
+            );
+            // `data` (image/audio) bzw. `blob` (resources/read) zusammenfassen.
+            for key in ["data", "blob"] {
+                let relevant = key == "blob" || is_binary;
+                if relevant {
+                    if let Some(Value::String(s)) = map.get(key) {
+                        let kb = (s.len() as f64 / 1024.0).round() as u64;
+                        let summary = format!("<Binärdaten, ~{kb} KB (nicht angezeigt)>");
+                        map.insert(key.to_string(), Value::String(summary));
+                    }
+                }
+            }
+            Value::Object(map.into_iter().map(|(k, v)| (k, summarize_blobs(v))).collect())
+        }
+        Value::Array(arr) => Value::Array(arr.into_iter().map(summarize_blobs).collect()),
+        other => other,
+    }
 }
 
 /// Liefert das bereits gecachte Introspektions-Ergebnis eines Servers – **ohne**
@@ -1591,6 +1671,27 @@ mod tests {
             let _ = crate::snapshot::delete(&m.id);
         }
         eprintln!("Auto-Snapshot OK ({} neu)", created.len());
+    }
+
+    #[test]
+    fn summarize_blobs_replaces_binary_keeps_text() {
+        use serde_json::json;
+        let input = json!({
+            "content": [
+                { "type": "text", "text": "hallo" },
+                { "type": "image", "data": "AAAABBBBCCCC", "mimeType": "image/png" }
+            ],
+            "contents": [ { "uri": "file://x", "blob": "ZZZZZZZZ" } ]
+        });
+        let out = summarize_blobs(input);
+        // Text bleibt erhalten.
+        assert_eq!(out["content"][0]["text"], json!("hallo"));
+        // Bild-`data` und Resource-`blob` sind zusammengefasst (kein Roh-base64).
+        let img = out["content"][1]["data"].as_str().unwrap();
+        assert!(img.starts_with("<Binärdaten"), "data nicht zusammengefasst: {img}");
+        assert_eq!(out["content"][1]["mimeType"], json!("image/png"));
+        let blob = out["contents"][0]["blob"].as_str().unwrap();
+        assert!(blob.starts_with("<Binärdaten"), "blob nicht zusammengefasst: {blob}");
     }
 
     #[test]

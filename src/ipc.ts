@@ -214,6 +214,66 @@ export async function peekIntrospection(
   });
 }
 
+/** Ergebnis eines Playground-Aufrufs (Spiegel von Rust `PlaygroundResult`). */
+export interface PlaygroundResult {
+  ok: boolean;
+  isError: boolean;
+  result?: unknown;
+  error?: string;
+  notes: string[];
+  logs?: string;
+  durationMs?: number;
+}
+
+/** Playground-Operation (serde tag "kind", snake_case). */
+export type PlaygroundRequest =
+  | { kind: "call_tool"; name: string; arguments: unknown }
+  | { kind: "read_resource"; uri: string }
+  | { kind: "get_prompt"; name: string; arguments: Record<string, string> };
+
+async function playgroundCall(
+  name: string,
+  scope: Scope,
+  projectPath: string | undefined,
+  request: PlaygroundRequest,
+): Promise<PlaygroundResult> {
+  return invoke<PlaygroundResult>("playground_call", {
+    name,
+    scope,
+    projectPath: projectPath ?? null,
+    request,
+  });
+}
+
+export function callTool(
+  name: string,
+  scope: Scope,
+  projectPath: string | undefined,
+  toolName: string,
+  args: unknown,
+): Promise<PlaygroundResult> {
+  return playgroundCall(name, scope, projectPath, { kind: "call_tool", name: toolName, arguments: args });
+}
+
+export function readResource(
+  name: string,
+  scope: Scope,
+  projectPath: string | undefined,
+  uri: string,
+): Promise<PlaygroundResult> {
+  return playgroundCall(name, scope, projectPath, { kind: "read_resource", uri });
+}
+
+export function getPrompt(
+  name: string,
+  scope: Scope,
+  projectPath: string | undefined,
+  promptName: string,
+  args: Record<string, string>,
+): Promise<PlaygroundResult> {
+  return playgroundCall(name, scope, projectPath, { kind: "get_prompt", name: promptName, arguments: args });
+}
+
 export async function addServer(
   name: string,
   scope: Scope,

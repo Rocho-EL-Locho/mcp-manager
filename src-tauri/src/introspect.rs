@@ -23,7 +23,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::models::{AppError, Introspection, McpPrompt, McpResource, McpTool, ServerEntry};
+use crate::models::{
+    AppError, Introspection, McpPrompt, McpResource, McpTool, PlaygroundRequest, PlaygroundResult,
+    ServerEntry,
+};
 
 /// Protokoll-Version, die wir im Handshake anbieten. Server, die eine andere
 /// Version fahren, antworten dennoch auf die read-only Listen-Aufrufe.
@@ -78,21 +81,47 @@ fn parse_rpc_response(val: &Value) -> RpcOutcome {
     RpcOutcome::Result(val.get("result").cloned().unwrap_or(Value::Null))
 }
 
-/// Introspiziert einen stdio-Server. `entry.command` muss gesetzt sein.
-///
-/// Gibt IMMER eine `Introspection` zurück: Start-/Handshake-Fehler landen in
-/// `error` (und ggf. erfasster stderr in `logs`), statt als `Err` verloren zu
-/// gehen. So kann die Detail-Ansicht den echten Fehlergrund zeigen.
-pub fn introspect_stdio(entry: &ServerEntry, timeout: Duration) -> Introspection {
+/// Ergebnis eines Transport-Treiberlaufs: das Callback-Resultat plus die
+/// gesammelten Nebeninfos (stderr-Logs nur bei stdio, Verbindungszeit, Notizen).
+struct DriverRun<R> {
+    result: Result<R, AppError>,
+    logs: Option<String>,
+    connect_ms: Option<u64>,
+    notes: Vec<String>,
+}
+
+/// stdio-Treiber: startet den Subprozess, baut den `StdioTransport`, führt `f`
+/// aus (Handshake + beliebige Operationen) und räumt hart auf (killpg). Kapselt
+/// die heiklen Details (eigene Prozessgruppe, stderr-Drain gegen Backpressure,
+/// zeilenweiser stdout-Reader mit Byte-Limit) EINMAL – geteilt von Introspektion
+/// und Playground.
+fn run_stdio<R>(
+    entry: &ServerEntry,
+    timeout: Duration,
+    f: impl FnOnce(
+        &mut dyn RpcTransport,
+        &Instant,
+        Instant,
+        &mut Option<u64>,
+        &mut Vec<String>,
+    ) -> Result<R, AppError>,
+) -> DriverRun<R> {
     let mut notes: Vec<String> = Vec::new();
+    let mut connect_ms: Option<u64> = None;
+    let fail = |msg: String, notes: Vec<String>| DriverRun {
+        result: Err(AppError::Io(msg)),
+        logs: None,
+        connect_ms: None,
+        notes,
+    };
+
     let Some(command) = entry.command.as_ref() else {
-        return error_introspection("Kein command für stdio-Introspektion".into(), None, notes);
+        return fail("Kein command für stdio-Introspektion".into(), notes);
     };
 
     let started = Instant::now();
     let deadline = started + timeout;
 
-    // --- Prozess starten -----------------------------------------------------
     let mut cmd = Command::new(command);
     if let Some(args) = &entry.args {
         cmd.args(args);
@@ -116,13 +145,13 @@ pub fn introspect_stdio(entry: &ServerEntry, timeout: Duration) -> Introspection
             } else {
                 e.to_string()
             };
-            return error_introspection(msg, None, notes);
+            return fail(msg, notes);
         }
     };
 
     let Some(stdin) = child.stdin.take() else {
         cleanup(&mut child);
-        return error_introspection("stdin nicht verfügbar".into(), None, notes);
+        return fail("stdin nicht verfügbar".into(), notes);
     };
 
     // stderr nebenläufig lesen und einmalig über einen Channel bereitstellen.
@@ -170,7 +199,7 @@ pub fn introspect_stdio(entry: &ServerEntry, timeout: Duration) -> Introspection
     // deckelt den Gesamtspeicher (OOM-Schutz gegen riesige/zeilenlose Ausgaben).
     let Some(stdout) = child.stdout.take() else {
         cleanup(&mut child);
-        return error_introspection("stdout nicht verfügbar".into(), None, notes);
+        return fail("stdout nicht verfügbar".into(), notes);
     };
     let (tx, rx) = mpsc::channel::<String>();
     // Bewusst NICHT gejoint (detached): killpg schließt zwar die Pipe, aber ein
@@ -193,15 +222,11 @@ pub fn introspect_stdio(entry: &ServerEntry, timeout: Duration) -> Introspection
         }
     });
 
-    // --- Handshake -----------------------------------------------------------
-    // `connect_ms` wird im Handshake gesetzt, sobald `initialize` beantwortet ist
-    // (Prozessstart bis initialize = echte Verbindungs-/Startzeit).
-    let mut connect_ms: Option<u64> = None;
     let result = {
         // stdin + rx in den Transport verschieben; am Blockende wird er gedroppt
         // -> stdin schließt (EOF ans Kind), rx fällt weg.
         let mut transport = StdioTransport { stdin, rx };
-        run_handshake(
+        f(
             &mut transport,
             &deadline,
             started,
@@ -216,32 +241,49 @@ pub fn introspect_stdio(entry: &ServerEntry, timeout: Duration) -> Introspection
     // Erfassten stderr einsammeln: killpg hat die Pipe geschlossen -> der Reader
     // sieht EOF und sendet. Kurzer, gedeckelter Wait; hält ein Kindeskind die Pipe
     // offen, gibt es eben keine Logs (best effort). Roh belassen – die zentrale
-    // Maskierung (`mask_introspection`) redigiert vor Verlassen des Backends.
+    // Maskierung redigiert vor Verlassen des Backends.
     let logs = err_rx
         .recv_timeout(Duration::from_millis(300))
         .ok()
         .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
         .filter(|s| !s.is_empty());
 
-    match result {
+    DriverRun {
+        result,
+        logs,
+        connect_ms,
+        notes,
+    }
+}
+
+/// Introspiziert einen stdio-Server. `entry.command` muss gesetzt sein.
+///
+/// Gibt IMMER eine `Introspection` zurück: Start-/Handshake-Fehler landen in
+/// `error` (und ggf. erfasster stderr in `logs`), statt als `Err` verloren zu
+/// gehen. So kann die Detail-Ansicht den echten Fehlergrund zeigen.
+pub fn introspect_stdio(entry: &ServerEntry, timeout: Duration) -> Introspection {
+    let run = run_stdio(entry, timeout, |t, deadline, started, cm, notes| {
+        run_handshake(t, deadline, started, cm, notes)
+    });
+    match run.result {
         Ok((tools, resources, prompts, server_name, server_version)) => Introspection {
             tools,
             resources,
             prompts,
             server_name,
             server_version,
-            notes,
-            logs,
+            notes: run.notes,
+            logs: run.logs,
             error: None,
-            connect_ms,
+            connect_ms: run.connect_ms,
             introspected_at: unix_now(),
         },
         Err(e) => {
             // `initialize` kann bereits gelungen sein (connect_ms gesetzt), bevor ein
             // späterer Listen-Aufruf scheiterte. Messung erhalten – gerade langsame
-            // Server (Issue-Use-Case) laufen so ggf. erst nach dem Handshake ins Timeout.
-            let mut intro = error_introspection(e.to_string(), logs, notes);
-            intro.connect_ms = connect_ms;
+            // Server laufen so ggf. erst nach dem Handshake ins Timeout.
+            let mut intro = error_introspection(e.to_string(), run.logs, run.notes);
+            intro.connect_ms = run.connect_ms;
             intro
         }
     }
@@ -275,22 +317,23 @@ type HandshakeData = (
 /// Führt initialize + Listen-Aufrufe durch. Nutzt `notes` für nicht-fatale Hinweise.
 /// `started`/`connect_ms`: sobald `initialize` beantwortet ist, wird die bis dahin
 /// verstrichene Zeit (Prozessstart bis initialize) als Verbindungs-/Startzeit gesetzt.
-fn run_handshake(
+/// Führt `initialize` + `notifications/initialized` aus (der gemeinsame Prefix
+/// für Introspektion UND Playground). Setzt `connect_ms` (Prozessstart bis
+/// initialize-Antwort) und liefert serverInfo name/version. `next_id` wird
+/// weitergezählt, sodass Folge-Requests eindeutige ids bekommen.
+fn initialize(
     transport: &mut dyn RpcTransport,
+    next_id: &mut i64,
     deadline: &Instant,
     started: Instant,
     connect_ms: &mut Option<u64>,
-    notes: &mut Vec<String>,
-) -> Result<HandshakeData, AppError> {
-    let mut next_id: i64 = 1;
-
-    // 1) initialize
+) -> Result<(Option<String>, Option<String>), AppError> {
     let init_params = json!({
         "protocolVersion": PROTOCOL_VERSION,
         "capabilities": {},
         "clientInfo": { "name": "mcp-manager", "version": env!("CARGO_PKG_VERSION") },
     });
-    let init = match request(transport, &mut next_id, deadline, "initialize", init_params)? {
+    let init = match request(transport, next_id, deadline, "initialize", init_params)? {
         RpcOutcome::Result(v) => v,
         RpcOutcome::RpcError(msg) => {
             return Err(AppError::Io(format!("initialize fehlgeschlagen: {msg}")))
@@ -310,8 +353,23 @@ fn run_handshake(
         .and_then(|n| n.as_str())
         .map(str::to_string);
 
-    // 2) notifications/initialized (Notification, ohne id)
+    // notifications/initialized (Notification, ohne id)
     notify(transport, "notifications/initialized")?;
+    Ok((server_name, server_version))
+}
+
+fn run_handshake(
+    transport: &mut dyn RpcTransport,
+    deadline: &Instant,
+    started: Instant,
+    connect_ms: &mut Option<u64>,
+    notes: &mut Vec<String>,
+) -> Result<HandshakeData, AppError> {
+    let mut next_id: i64 = 1;
+
+    // 1) + 2) initialize + notifications/initialized (gemeinsamer Prefix)
+    let (server_name, server_version) =
+        initialize(transport, &mut next_id, deadline, started, connect_ms)?;
 
     // 3) Listen abrufen. Wir fragen bewusst alle drei ab (statt uns nur auf die
     //    angekündigten capabilities zu verlassen) – reale Server deklarieren nicht
@@ -700,20 +758,39 @@ fn read_sse_response(
     }
 }
 
-/// Introspiziert einen HTTP/SSE-Server (Streamable HTTP). `entry.url` muss
-/// gesetzt sein. Gibt – wie stdio – IMMER eine `Introspection` zurück.
-pub fn introspect_http(entry: &ServerEntry, timeout: Duration) -> Introspection {
+/// HTTP-Treiber: baut den `HttpTransport` (ureq-Agent, Redirects aus), führt `f`
+/// aus und schließt die Session best effort (DELETE). Geteilt von Introspektion
+/// und Playground. `logs` ist bei HTTP immer `None` (kein stderr).
+fn run_http<R>(
+    entry: &ServerEntry,
+    timeout: Duration,
+    f: impl FnOnce(
+        &mut dyn RpcTransport,
+        &Instant,
+        Instant,
+        &mut Option<u64>,
+        &mut Vec<String>,
+    ) -> Result<R, AppError>,
+) -> DriverRun<R> {
     let mut notes: Vec<String> = Vec::new();
+    let mut connect_ms: Option<u64> = None;
+    let fail = |msg: String, notes: Vec<String>| DriverRun {
+        result: Err(AppError::Io(msg)),
+        logs: None,
+        connect_ms: None,
+        notes,
+    };
+
     let Some(url) = entry
         .url
         .as_ref()
         .map(|u| u.trim().to_string())
         .filter(|u| !u.is_empty())
     else {
-        return error_introspection("Keine URL für HTTP-Introspektion".into(), None, notes);
+        return fail("Keine URL für HTTP-Introspektion".into(), notes);
     };
     if !(url.starts_with("https://") || url.starts_with("http://")) {
-        return error_introspection(format!("Ungültige HTTP(S)-URL: {url}"), None, notes);
+        return fail(format!("Ungültige HTTP(S)-URL: {url}"), notes);
     }
 
     let started = Instant::now();
@@ -739,18 +816,31 @@ pub fn introspect_http(entry: &ServerEntry, timeout: Duration) -> Introspection 
         headers,
         session_id: None,
     };
-    let mut connect_ms: Option<u64> = None;
-    let result = run_handshake(
+    let result = f(
         &mut transport,
         &deadline,
         started,
         &mut connect_ms,
         &mut notes,
     );
-
     transport.close_session();
 
-    match result {
+    DriverRun {
+        result,
+        logs: None,
+        connect_ms,
+        notes,
+    }
+}
+
+/// Introspiziert einen HTTP/SSE-Server (Streamable HTTP). `entry.url` muss
+/// gesetzt sein. Gibt – wie stdio – IMMER eine `Introspection` zurück.
+pub fn introspect_http(entry: &ServerEntry, timeout: Duration) -> Introspection {
+    let run = run_http(entry, timeout, |t, deadline, started, cm, notes| {
+        run_handshake(t, deadline, started, cm, notes)
+    });
+    let mut notes = run.notes;
+    match run.result {
         Ok((tools, resources, prompts, server_name, server_version)) => Introspection {
             tools,
             resources,
@@ -760,7 +850,7 @@ pub fn introspect_http(entry: &ServerEntry, timeout: Duration) -> Introspection 
             notes,
             logs: None,
             error: None,
-            connect_ms,
+            connect_ms: run.connect_ms,
             introspected_at: unix_now(),
         },
         Err(e) => {
@@ -782,10 +872,118 @@ pub fn introspect_http(entry: &ServerEntry, timeout: Duration) -> Introspection 
                 );
             }
             let mut intro = error_introspection(msg, None, notes);
-            intro.connect_ms = connect_ms;
+            intro.connect_ms = run.connect_ms;
             intro
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Playground: Handshake + genau ein weiterer Request (tools/call, resources/read,
+// prompts/get). Ergebnis ist ROH (unmaskiert) – die Redaktion passiert im
+// Command-Layer (`commands::mask_playground`), analog zu `mask_introspection`.
+// ---------------------------------------------------------------------------
+
+/// JSON-RPC-Methode + params aus einer `PlaygroundRequest`.
+fn playground_call_spec(req: &PlaygroundRequest) -> (&'static str, Value) {
+    match req {
+        PlaygroundRequest::CallTool { name, arguments } => (
+            "tools/call",
+            json!({ "name": name, "arguments": arguments }),
+        ),
+        PlaygroundRequest::ReadResource { uri } => ("resources/read", json!({ "uri": uri })),
+        PlaygroundRequest::GetPrompt { name, arguments } => (
+            "prompts/get",
+            json!({ "name": name, "arguments": arguments.clone().unwrap_or_default() }),
+        ),
+    }
+}
+
+/// Mappt das Treiber-Ergebnis (Handshake + ein Request) auf `PlaygroundResult`.
+fn playground_result(run: DriverRun<RpcOutcome>, duration_ms: Option<u64>) -> PlaygroundResult {
+    match run.result {
+        Ok(RpcOutcome::Result(val)) => {
+            // Tool meldet inhaltlichen Fehler via `isError: true` (kein Transportfehler).
+            let is_error = val
+                .get("isError")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            PlaygroundResult {
+                ok: true,
+                is_error,
+                result: Some(val),
+                error: None,
+                notes: run.notes,
+                logs: run.logs,
+                duration_ms,
+            }
+        }
+        Ok(RpcOutcome::RpcError(msg)) => PlaygroundResult {
+            ok: false,
+            is_error: false,
+            result: None,
+            error: Some(msg),
+            notes: run.notes,
+            logs: run.logs,
+            duration_ms,
+        },
+        Err(e) => PlaygroundResult {
+            ok: false,
+            is_error: false,
+            result: None,
+            error: Some(e.to_string()),
+            notes: run.notes,
+            logs: run.logs,
+            duration_ms,
+        },
+    }
+}
+
+/// Führt eine Playground-Operation gegen einen stdio-Server aus (Handshake + ein
+/// Request). Ergebnis ist ROH – Redaktion erfolgt im Command-Layer.
+pub fn playground_stdio(
+    entry: &ServerEntry,
+    req: &PlaygroundRequest,
+    timeout: Duration,
+) -> PlaygroundResult {
+    let (method, params) = playground_call_spec(req);
+    let start = Instant::now();
+    let run = run_stdio(entry, timeout, move |t, deadline, started, cm, _notes| {
+        let mut next_id: i64 = 1;
+        initialize(t, &mut next_id, deadline, started, cm)?;
+        request(t, &mut next_id, deadline, method, params)
+    });
+    playground_result(run, Some(start.elapsed().as_millis() as u64))
+}
+
+/// Wie `playground_stdio`, aber für HTTP/SSE-Server (Streamable HTTP).
+pub fn playground_http(
+    entry: &ServerEntry,
+    req: &PlaygroundRequest,
+    timeout: Duration,
+) -> PlaygroundResult {
+    let (method, params) = playground_call_spec(req);
+    let start = Instant::now();
+    let run = run_http(entry, timeout, move |t, deadline, started, cm, _notes| {
+        let mut next_id: i64 = 1;
+        initialize(t, &mut next_id, deadline, started, cm)?;
+        request(t, &mut next_id, deadline, method, params)
+    });
+    let mut result = playground_result(run, Some(start.elapsed().as_millis() as u64));
+    // Auth-Hinweis wie bei introspect_http (nur konfigurierte Header werden gesendet).
+    if result
+        .error
+        .as_deref()
+        .is_some_and(|e| e.contains("Authentifizierung"))
+    {
+        result.notes.push(
+            "Es werden nur die konfigurierten Header gesendet; OAuth-Token der claude-CLI sind \
+             hier nicht nutzbar. Ggf. über die Anmelden-Funktion einloggen oder einen \
+             Authorization-Header setzen."
+                .into(),
+        );
+    }
+    result
 }
 
 fn str_field(item: &Value, key: &str) -> Option<String> {
@@ -872,6 +1070,30 @@ mod tests {
         );
     }
 
+    /// Opt-in: echtes `tools/call` (echo) gegen den „everything"-Server via npx.
+    /// Netz-/Toolchain-abhängig. Nur mit `-- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn playground_everything_echo() {
+        let entry = ServerEntry {
+            transport: Some("stdio".into()),
+            command: Some("npx".into()),
+            args: Some(vec![
+                "-y".into(),
+                "@modelcontextprotocol/server-everything".into(),
+            ]),
+            ..Default::default()
+        };
+        let req = PlaygroundRequest::CallTool {
+            name: "echo".into(),
+            arguments: json!({ "message": "hallo playground" }),
+        };
+        let res = playground_stdio(&entry, &req, Duration::from_secs(60));
+        eprintln!("ok={} isError={} err={:?}", res.ok, res.is_error, res.error);
+        eprintln!("result={:?}", res.result);
+        assert!(res.ok, "tools/call sollte gelingen: {:?}", res.error);
+    }
+
     /// Deterministisch (kein Netz): ein Prozess, der sofort nach stderr schreibt
     /// und mit Fehler endet. Der Handshake schlägt fehl -> `error` gesetzt, der
     /// stderr-Text landet (roh) in `logs`. Redaction passiert erst im Command-Layer.
@@ -926,6 +1148,78 @@ mod tests {
         assert!(
             intro.connect_ms.is_some(),
             "connect_ms muss trotz Folgefehler erhalten bleiben"
+        );
+    }
+
+    /// Fake-stdio-Server für Playground-Tests: beantwortet initialize (id 1),
+    /// verwirft notifications/initialized und antwortet auf den EINEN Playground-
+    /// Request (id 2) mit `tool_reply` (rohes JSON-RPC-Result/-Error-Objekt).
+    fn playground_entry(tool_reply: &str) -> ServerEntry {
+        let script = format!(
+            "read a; printf '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"serverInfo\":{{\"name\":\"t\",\"version\":\"1\"}}}}}}\\n'; \
+             read b; read c; printf '{}\\n'",
+            tool_reply.replace('\'', "'\\''")
+        );
+        ServerEntry {
+            transport: Some("stdio".into()),
+            command: Some("sh".into()),
+            args: Some(vec!["-c".into(), script]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn playground_stdio_tool_call_ok() {
+        let entry = playground_entry(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"hi"}],"isError":false}}"#,
+        );
+        let req = PlaygroundRequest::CallTool {
+            name: "echo".into(),
+            arguments: json!({}),
+        };
+        let res = playground_stdio(&entry, &req, Duration::from_secs(5));
+        assert!(res.ok, "ok erwartet: {:?}", res.error);
+        assert!(!res.is_error);
+        let text = res.result.as_ref().and_then(|r| r.get("content")).is_some();
+        assert!(text, "content erwartet: {:?}", res.result);
+        assert!(res.duration_ms.is_some());
+    }
+
+    #[test]
+    fn playground_stdio_tool_is_error() {
+        let entry = playground_entry(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"boom"}],"isError":true}}"#,
+        );
+        let req = PlaygroundRequest::CallTool {
+            name: "fail".into(),
+            arguments: json!({}),
+        };
+        let res = playground_stdio(&entry, &req, Duration::from_secs(5));
+        assert!(res.ok, "Transport ok");
+        assert!(
+            res.is_error,
+            "isError:true muss als Tool-Fehler erkannt werden"
+        );
+    }
+
+    #[test]
+    fn playground_stdio_rpc_error() {
+        let entry = playground_entry(
+            r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"Method not found"}}"#,
+        );
+        let req = PlaygroundRequest::CallTool {
+            name: "nope".into(),
+            arguments: json!({}),
+        };
+        let res = playground_stdio(&entry, &req, Duration::from_secs(5));
+        assert!(!res.ok, "RPC-Fehler -> ok=false");
+        assert!(
+            res.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Method not found"),
+            "error: {:?}",
+            res.error
         );
     }
 
@@ -1247,6 +1541,37 @@ mod http_tests {
         });
         let intro = introspect_http(&http_entry(&url), Duration::from_secs(1));
         assert!(intro.error.is_some(), "Timeout muss einen Fehler liefern");
+    }
+
+    #[test]
+    fn http_playground_tool_call() {
+        let url = spawn_server(|_m, req, _s| {
+            match req.get("method").and_then(|m| m.as_str()).unwrap_or("") {
+                "initialize" => {
+                    Reply::JsonWithSession(json!({"serverInfo": {"name": "x"}}), "s".into())
+                }
+                "notifications/initialized" => Reply::Accepted,
+                "tools/call" => Reply::Json(
+                    json!({"content": [{"type": "text", "text": "remote ok"}], "isError": false}),
+                ),
+                _ => Reply::Status(404),
+            }
+        });
+        let req = PlaygroundRequest::CallTool {
+            name: "echo".into(),
+            arguments: json!({"x": 1}),
+        };
+        let res = playground_http(&http_entry(&url), &req, Duration::from_secs(10));
+        assert!(res.ok, "ok erwartet: {:?}", res.error);
+        assert!(!res.is_error);
+        let text = res
+            .result
+            .as_ref()
+            .and_then(|r| r.get("content"))
+            .and_then(|c| c.get(0))
+            .and_then(|i| i.get("text"))
+            .and_then(|t| t.as_str());
+        assert_eq!(text, Some("remote ok"));
     }
 
     /// Opt-in-Smoke gegen einen echten öffentlichen MCP-Endpoint. Netzabhängig,

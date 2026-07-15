@@ -7,6 +7,7 @@ import { openConfirm } from "../confirm";
 import { toast } from "../toast";
 import { statusMeta, formatLatency } from "./serverList";
 import { field } from "./serverForm";
+import { openToolPlayground, openResourcePlayground, openPromptPlayground } from "./playground";
 
 const ALL_SCOPES: Scope[] = ["user", "local", "project"];
 
@@ -62,6 +63,8 @@ function definitionBody(entry: ServerEntry): HTMLElement {
 interface CapItem {
   title: string;
   desc?: string;
+  /// Optionaler Aktions-Button (Playground: Testen/Lesen/Abrufen).
+  action?: HTMLElement | null;
 }
 
 /// Eine aufklappbare Gruppe (Tools/Ressourcen/Prompts) mit Namen + Beschreibung.
@@ -72,7 +75,12 @@ function capsGroup(label: string, items: CapItem[]): HTMLElement {
       h(
         "div",
         { class: "caps-item" },
-        h("div", { class: "mono caps-item-name", text: it.title }),
+        h(
+          "div",
+          { class: "caps-item-head" },
+          h("div", { class: "mono caps-item-name", text: it.title }),
+          it.action ?? null,
+        ),
         it.desc ? h("div", { class: "muted caps-item-desc", text: it.desc }) : null,
       ),
     );
@@ -85,11 +93,21 @@ function capsGroup(label: string, items: CapItem[]): HTMLElement {
   );
 }
 
+/// Kleiner Playground-Aktions-Button (nur wenn der Server aktiviert ist).
+function playgroundBtn(label: string, onClick: () => void): HTMLElement {
+  const btn = h("button", { class: "btn btn-small", type: "button" }, label);
+  btn.addEventListener("click", onClick);
+  return btn;
+}
+
 /// Rendert das Introspektions-Ergebnis: bei Erfolg Zähler/Server-Info/Listen,
 /// bei Fehler ein Banner. Notizen und ein erfasster stderr-Log-Block (falls
 /// vorhanden) werden in beiden Fällen angehängt.
-function renderIntrospection(intro: Introspection): HTMLElement {
+function renderIntrospection(intro: Introspection, server: MergedServer): HTMLElement {
   const wrap = h("div", { class: "caps" });
+  // Playground-Aktionen nur für aktivierte Server (kein heimlicher Start eines
+  // deaktivierten Servers).
+  const canRun = server.enabled;
 
   if (intro.error) {
     wrap.append(h("p", { class: "form-status error", text: intro.error }));
@@ -129,18 +147,40 @@ function renderIntrospection(intro: Introspection): HTMLElement {
 
     const groups = h("div", { class: "caps-groups" });
     if (intro.tools.length) {
-      groups.append(capsGroup("Tools", intro.tools.map((t) => ({ title: t.name, desc: t.description }))));
+      groups.append(
+        capsGroup(
+          "Tools",
+          intro.tools.map((t) => ({
+            title: t.name,
+            desc: t.description,
+            action: canRun ? playgroundBtn("Testen…", () => openToolPlayground(server, t)) : null,
+          })),
+        ),
+      );
     }
     if (intro.resources.length) {
       groups.append(
         capsGroup(
           "Ressourcen",
-          intro.resources.map((r) => ({ title: r.name ?? r.uri, desc: r.description ?? r.uri })),
+          intro.resources.map((r) => ({
+            title: r.name ?? r.uri,
+            desc: r.description ?? r.uri,
+            action: canRun ? playgroundBtn("Lesen…", () => openResourcePlayground(server, r)) : null,
+          })),
         ),
       );
     }
     if (intro.prompts.length) {
-      groups.append(capsGroup("Prompts", intro.prompts.map((p) => ({ title: p.name, desc: p.description }))));
+      groups.append(
+        capsGroup(
+          "Prompts",
+          intro.prompts.map((p) => ({
+            title: p.name,
+            desc: p.description,
+            action: canRun ? playgroundBtn("Abrufen…", () => openPromptPlayground(server, p)) : null,
+          })),
+        ),
+      );
     }
     if (groups.childElementCount) wrap.append(groups);
   }
@@ -245,7 +285,7 @@ function capabilitiesSection(server: MergedServer, opts: DetailOptions): HTMLEle
     // nichts mehr rendern oder als Seiteneffekt die Liste neu zeichnen.
     if (!content.isConnected) return;
     clear(content);
-    content.append(renderIntrospection(intro));
+    content.append(renderIntrospection(intro, server));
     loadedOnce = true;
     btnLabel.textContent = "Aktualisieren";
     // Liste nur bei erfolgreicher Introspektion über die Zähler informieren –
