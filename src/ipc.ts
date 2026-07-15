@@ -306,3 +306,21 @@ export async function setScope(
     toProject: toProject ?? null,
   });
 }
+
+export async function cloneServer(
+  name: string,
+  fromScope: Scope,
+  newName: string,
+  toScope: Scope,
+  fromProject?: string,
+  toProject?: string,
+): Promise<void> {
+  return invoke("clone_server", {
+    name,
+    fromScope,
+    newName,
+    toScope,
+    fromProject: fromProject ?? null,
+    toProject: toProject ?? null,
+  });
+}

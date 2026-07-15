@@ -34,6 +34,7 @@ pub fn run() {
             commands::toggle_mcpjson_server,
             commands::toggle_user_server,
             commands::set_scope,
+            commands::clone_server,
             commands::run_claude_assistant,
             commands::get_settings,
             commands::set_settings,
