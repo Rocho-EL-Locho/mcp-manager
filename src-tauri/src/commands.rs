@@ -857,6 +857,40 @@ fn toggle_user_server_impl(
     }
 }
 
+/// Kopiert eine Server-Definition verifiziert in einen Ziel-Scope: via
+/// `claude mcp add-json` anlegen, danach über `collect_definitions` bestätigen.
+/// Gemeinsame Basis für `set_scope` (Verschieben) und `clone_server` (Duplizieren) –
+/// der Aufrufer entscheidet, ob die Quelle danach entfernt wird.
+fn copy_definition(
+    settings: &AppSettings,
+    entry: &ServerEntry,
+    name: &str,
+    to_scope: Scope,
+    to_project: &Option<String>,
+) -> Result<(), AppError> {
+    let json = serde_json::to_string(entry).map_err(|e| AppError::Parse(e.to_string()))?;
+
+    // 1. Im Ziel-Scope anlegen.
+    run_mut(
+        settings.claude_path(),
+        &["mcp", "add-json", "-s", to_scope.cli_value(), name, &json],
+        cwd_for(to_scope, to_project),
+        settings.mut_timeout(),
+    )?;
+
+    // 2. Erfolg verifizieren.
+    let to_dir = resolve_project_dir(to_project.clone());
+    let landed = collect_definitions(&to_dir)
+        .into_iter()
+        .any(|d| d.scope == to_scope && d.name == name);
+    if !landed {
+        return Err(AppError::Io(
+            "Anlegen im Ziel-Scope wurde nicht bestätigt.".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Verschiebt einen Server in einen anderen Scope: verifiziertes Anlegen im
 /// Ziel-Scope, danach Entfernen aus dem Quell-Scope (nie umgekehrt).
 #[tauri::command]
@@ -884,7 +918,6 @@ fn set_scope_impl(
     }
 
     let from_dir = resolve_project_dir(from_project.clone());
-    let to_dir = resolve_project_dir(to_project.clone());
     let timeout = settings.mut_timeout();
     let claude_path = settings.claude_path();
 
@@ -893,25 +926,9 @@ fn set_scope_impl(
         .find(|d| d.scope == from_scope && d.name == name)
         .map(|d| d.entry)
         .ok_or_else(|| AppError::Io("Quell-Definition nicht gefunden".into()))?;
-    let json = serde_json::to_string(&entry).map_err(|e| AppError::Parse(e.to_string()))?;
 
-    // 1. Im Ziel-Scope anlegen.
-    run_mut(
-        claude_path,
-        &["mcp", "add-json", "-s", to_scope.cli_value(), &name, &json],
-        cwd_for(to_scope, &to_project),
-        timeout,
-    )?;
-
-    // 2. Erfolg verifizieren.
-    let landed = collect_definitions(&to_dir)
-        .into_iter()
-        .any(|d| d.scope == to_scope && d.name == name);
-    if !landed {
-        return Err(AppError::Io(
-            "Anlegen im Ziel-Scope wurde nicht bestätigt – Quelle bleibt unangetastet.".into(),
-        ));
-    }
+    // 1.+2. Verifiziert im Ziel-Scope anlegen (Quelle bleibt bei Fehler unangetastet).
+    copy_definition(settings, &entry, &name, to_scope, &to_project)?;
 
     // 3. Erst jetzt aus dem Quell-Scope entfernen.
     if let Err(e) = run_mut(
@@ -928,6 +945,108 @@ fn set_scope_impl(
     }
 
     Ok(())
+}
+
+/// Dupliziert einen Server in einen (ggf. anderen) Scope/ein anderes Projekt.
+/// Die Quelle bleibt bestehen. Secrets werden backend-seitig aufgelöst und
+/// wandern nicht durchs Webview.
+#[tauri::command]
+pub async fn clone_server(
+    state: State<'_, AppState>,
+    name: String,
+    from_scope: Scope,
+    from_project: Option<String>,
+    new_name: String,
+    to_scope: Scope,
+    to_project: Option<String>,
+) -> Result<(), AppError> {
+    clone_server_impl(
+        &state.settings(),
+        name,
+        from_scope,
+        from_project,
+        new_name,
+        to_scope,
+        to_project,
+    )
+}
+
+fn clone_server_impl(
+    settings: &AppSettings,
+    name: String,
+    from_scope: Scope,
+    from_project: Option<String>,
+    new_name: String,
+    to_scope: Scope,
+    to_project: Option<String>,
+) -> Result<(), AppError> {
+    let new_name = new_name.trim().to_string();
+    if new_name.is_empty() {
+        return Err(AppError::Io("Neuer Name darf nicht leer sein".into()));
+    }
+
+    let from_dir = resolve_project_dir(from_project.clone());
+    let to_dir = resolve_project_dir(to_project.clone());
+
+    // Ziel-Projektverzeichnis muss existieren – sonst könnte die CLI die Definition
+    // ins Leere schreiben. User-Scope braucht kein Projektverzeichnis.
+    if matches!(to_scope, Scope::Local | Scope::Project) && !to_dir.is_dir() {
+        return Err(AppError::Io(format!(
+            "Zielprojekt existiert nicht: {}",
+            to_dir.display()
+        )));
+    }
+
+    // 1. Unmaskierte Quell-Definition auflösen (Config zuerst, dann Stash für
+    //    deaktivierte User-Server – analog zu reveal_server_entry).
+    let from_defs = collect_definitions(&from_dir);
+    let entry = from_defs
+        .iter()
+        .find(|d| d.scope == from_scope && d.name == name)
+        .map(|d| d.entry.clone())
+        .or_else(|| {
+            if from_scope == Scope::User {
+                crate::stash::peek(&name).map(|item| item.entry)
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| AppError::Io("Quell-Definition nicht gefunden".into()))?;
+
+    // 2. Kollision im Ziel prüfen – niemals überschreiben. Deaktivierte User-Server
+    //    liegen ausschließlich im Stash (nicht in der Config) und müssen mitgeprüft
+    //    werden, sonst überschreibt ein späteres Deaktivieren den Klon lautlos.
+    //    Quell-Definitionen wiederverwenden, wenn Quelle und Ziel dasselbe
+    //    Verzeichnis meinen – auch bei unterschiedlicher Schreibweise (Symlink,
+    //    Trailing-Slash) via Kanonisierung, sonst nur ein zusätzlicher Read.
+    let same_dir = from_dir == to_dir
+        || matches!(
+            (std::fs::canonicalize(&from_dir), std::fs::canonicalize(&to_dir)),
+            (Ok(a), Ok(b)) if a == b
+        );
+    let to_defs = if same_dir {
+        from_defs
+    } else {
+        collect_definitions(&to_dir)
+    };
+    let in_config = to_defs.iter().any(|d| d.scope == to_scope && d.name == new_name);
+    let in_stash = to_scope == Scope::User && crate::stash::peek(&new_name).is_some();
+    if in_config || in_stash {
+        let suffix = if in_stash && !in_config {
+            " (aktuell deaktiviert)"
+        } else {
+            ""
+        };
+        return Err(AppError::Io(format!(
+            "Ein Server namens „{}“ existiert im Ziel-Scope ({}) bereits{}",
+            new_name,
+            to_scope.cli_value(),
+            suffix
+        )));
+    }
+
+    // 3. Verifiziert im Ziel anlegen.
+    copy_definition(settings, &entry, &new_name, to_scope, &to_project)
 }
 
 /// Listet alle Claude-Code-Projekte (Einträge unter `projects` in ~/.claude.json).
@@ -1055,6 +1174,17 @@ mod tests {
         to_project: Option<String>,
     ) -> Result<(), AppError> {
         set_scope_impl(&cfg(), name, from_scope, to_scope, from_project, to_project)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn clone_server(
+        name: String,
+        from_scope: Scope,
+        from_project: Option<String>,
+        new_name: String,
+        to_scope: Scope,
+        to_project: Option<String>,
+    ) -> Result<(), AppError> {
+        clone_server_impl(&cfg(), name, from_scope, from_project, new_name, to_scope, to_project)
     }
 
     /// Opt-in-Integrationstest: ruft echtes `claude mcp list` auf (health-checkt
@@ -1230,6 +1360,102 @@ mod tests {
 
         remove_server(name.clone(), Scope::Local, Some(proj)).expect("cleanup");
         eprintln!("set_scope OK");
+    }
+
+    /// Leerer Zielname wird abgelehnt, bevor irgendetwas an der Umgebung passiert.
+    #[test]
+    fn clone_server_rejects_empty_name() {
+        let err = clone_server(
+            "irgendwas".into(),
+            Scope::User,
+            None,
+            "   ".into(),
+            Scope::User,
+            None,
+        )
+        .expect_err("leerer Name muss abgelehnt werden");
+        assert!(matches!(err, AppError::Io(_)));
+    }
+
+    /// Opt-in: Duplizieren user -> local. Quelle bleibt bestehen, Klon entsteht
+    /// unter neuem Namen.
+    #[test]
+    #[ignore]
+    fn clone_server_roundtrip() {
+        let name = "mcpmgr-clonetest".to_string();
+        let clone_name = "mcpmgr-clonetest-kopie".to_string();
+        let dir = default_project_path();
+        let proj = dir.to_string_lossy().to_string();
+
+        let _ = remove_server(name.clone(), Scope::User, None);
+        let _ = remove_server(clone_name.clone(), Scope::Local, Some(proj.clone()));
+
+        let e = ServerEntry {
+            transport: Some("stdio".into()),
+            command: Some("echo".into()),
+            args: Some(vec!["x".into()]),
+            ..Default::default()
+        };
+        add_server(name.clone(), Scope::User, None, e).expect("add");
+
+        clone_server(
+            name.clone(),
+            Scope::User,
+            None,
+            clone_name.clone(),
+            Scope::Local,
+            Some(proj.clone()),
+        )
+        .expect("clone_server");
+
+        let defs = collect_definitions(&dir);
+        let src_stays = defs.iter().any(|d| d.scope == Scope::User && d.name == name);
+        let clone_here = defs.iter().any(|d| d.scope == Scope::Local && d.name == clone_name);
+        assert!(src_stays, "Quelle bleibt in user");
+        assert!(clone_here, "Klon liegt in local");
+
+        // Kollision: erneutes Klonen auf denselben Zielnamen muss scheitern.
+        let dup = clone_server(
+            name.clone(),
+            Scope::User,
+            None,
+            clone_name.clone(),
+            Scope::Local,
+            Some(proj.clone()),
+        );
+        assert!(dup.is_err(), "Kollision wird abgelehnt");
+
+        remove_server(name, Scope::User, None).expect("cleanup src");
+        remove_server(clone_name, Scope::Local, Some(proj)).expect("cleanup clone");
+        eprintln!("clone_server OK");
+    }
+
+    /// Opt-in: Klonen auf den Namen eines nur deaktivierten (im Stash liegenden)
+    /// User-Servers muss als Kollision abgelehnt werden – sonst würde der Klon
+    /// den deaktivierten Eintrag beim nächsten Deaktivieren lautlos überschreiben.
+    #[test]
+    #[ignore]
+    fn clone_rejects_stashed_name_collision() {
+        let src = "mcpmgr-clonesrc".to_string();
+        let target = "mcpmgr-clonestash".to_string();
+        let e = ServerEntry {
+            transport: Some("stdio".into()),
+            command: Some("echo".into()),
+            ..Default::default()
+        };
+
+        let _ = remove_server(src.clone(), Scope::User, None);
+        let _ = crate::stash::remove(&target);
+
+        add_server(src.clone(), Scope::User, None, e.clone()).expect("add src");
+        crate::stash::upsert(&target, e).expect("stash target");
+
+        let res = clone_server(src.clone(), Scope::User, None, target.clone(), Scope::User, None);
+        assert!(res.is_err(), "Kollision mit Stash-Eintrag muss abgelehnt werden");
+
+        remove_server(src, Scope::User, None).expect("cleanup src");
+        crate::stash::remove(&target).expect("cleanup stash");
+        eprintln!("clone_rejects_stashed_name_collision OK");
     }
 
     /// Opt-in: echter Assistent-Aufruf gegen einen bekannten MCP-Server (ruft

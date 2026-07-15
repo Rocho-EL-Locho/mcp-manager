@@ -1,11 +1,12 @@
 import { h, clear } from "../dom";
 import { icon, setIcon } from "../icons";
-import type { MergedServer, ServerEntry, Scope, Introspection, ServerStatus, RuntimePreflight } from "../ipc";
-import { revealServerEntry, setScope, introspectServer, peekIntrospection, healthCheck, preflightServer } from "../ipc";
+import type { MergedServer, ServerEntry, Scope, Introspection, ServerStatus, RuntimePreflight, ProjectInfo } from "../ipc";
+import { revealServerEntry, setScope, cloneServer, listProjects, introspectServer, peekIntrospection, healthCheck, preflightServer } from "../ipc";
 import { openModal } from "../modal";
 import { openConfirm } from "../confirm";
 import { toast } from "../toast";
 import { statusMeta, formatLatency } from "./serverList";
+import { field } from "./serverForm";
 
 const ALL_SCOPES: Scope[] = ["user", "local", "project"];
 
@@ -300,6 +301,127 @@ export interface DetailOptions {
   onRechecked?: (server: MergedServer, status: ServerStatus) => void;
 }
 
+/// Öffnet ein Formular-Modal zum Duplizieren eines Servers (Original bleibt bestehen).
+function openDuplicateModal(server: MergedServer, onDone: () => void): void {
+  const currentScope = server.scope as Scope;
+
+  const nameInput = h("input", { class: "inp" }) as HTMLInputElement;
+  nameInput.value = `${server.name}-kopie`;
+
+  const scopeSelect = h(
+    "select",
+    { class: "inp" },
+    h("option", { value: "user" }, "user (global)"),
+    h("option", { value: "local" }, "local (projekt-privat)"),
+    h("option", { value: "project" }, "project (.mcp.json)"),
+  ) as HTMLSelectElement;
+  scopeSelect.value = currentScope;
+
+  // Projekt-Auswahl: Dropdown aus bekannten Projekten + Freitext-Pfad.
+  const projSelect = h("select", { class: "inp" }, h("option", { value: "" }, "– Projekt wählen –")) as HTMLSelectElement;
+  const projInput = h("input", { class: "inp mono", placeholder: "/pfad/zum/projekt" }) as HTMLInputElement;
+  void listProjects()
+    .then((projs: ProjectInfo[]) => {
+      for (const p of projs) {
+        const label = p.exists ? p.path : `${p.path} (fehlt)`;
+        const opt = h("option", { value: p.path }, label) as HTMLOptionElement;
+        if (!p.exists) opt.disabled = true; // fehlende Verzeichnisse nicht auswählbar
+        projSelect.appendChild(opt);
+      }
+      // Standard: aktuelles Projekt des Servers vorbelegen, falls vorhanden.
+      if (server.project_path) {
+        projSelect.value = server.project_path;
+        projInput.value = server.project_path;
+      }
+    })
+    .catch(() => {
+      projSelect.appendChild(
+        h("option", { value: "" }, "(Projekte nicht ladbar – Pfad manuell eingeben)"),
+      );
+    });
+  projSelect.addEventListener("change", () => {
+    if (projSelect.value) projInput.value = projSelect.value;
+  });
+
+  const projField = field(
+    "Projekt",
+    h("div", { class: "scope-row" }, projSelect, projInput),
+    "Ziel-Verzeichnis für local/project (Dropdown oder eigener Pfad).",
+  );
+  const scopeHint = h("div", { class: "field-hint", text: "" });
+
+  const syncScopeUi = () => {
+    const isProjectScoped = scopeSelect.value === "local" || scopeSelect.value === "project";
+    projField.style.display = isProjectScoped ? "" : "none";
+    scopeHint.textContent =
+      scopeSelect.value === "project"
+        ? "Der Server wird in .mcp.json des Zielprojekts angelegt und muss dort ggf. erst bestätigt werden."
+        : "";
+  };
+  scopeSelect.addEventListener("change", syncScopeUi);
+  syncScopeUi();
+
+  const status = h("p", { class: "form-status" });
+  const cancelBtn = h("button", { class: "btn" }, "Abbrechen") as HTMLButtonElement;
+  const okBtn = h("button", { class: "btn btn-primary" }, "Duplizieren") as HTMLButtonElement;
+
+  const form = h(
+    "div",
+    { class: "server-form" },
+    field("Neuer Name", nameInput),
+    field("Ziel-Scope", scopeSelect, undefined),
+    scopeHint,
+    projField,
+    status,
+  );
+
+  const modal = openModal(`Duplizieren: ${server.name}`, form, [cancelBtn, okBtn]);
+  cancelBtn.addEventListener("click", () => modal.close());
+  nameInput.focus();
+  nameInput.select();
+
+  okBtn.addEventListener("click", async () => {
+    const newName = nameInput.value.trim();
+    const toScope = scopeSelect.value as Scope;
+    const isProjectScoped = toScope === "local" || toScope === "project";
+    const toProject = isProjectScoped ? projInput.value.trim() : undefined;
+
+    status.className = "form-status";
+    if (!newName) {
+      status.className = "form-status error";
+      status.textContent = "Bitte einen neuen Namen angeben.";
+      return;
+    }
+    if (isProjectScoped && !toProject) {
+      status.className = "form-status error";
+      status.textContent = "Bitte ein Zielprojekt wählen oder einen Pfad angeben.";
+      return;
+    }
+
+    okBtn.disabled = true;
+    cancelBtn.disabled = true;
+    status.textContent = "wird angelegt…";
+    try {
+      await cloneServer(
+        server.name,
+        currentScope,
+        newName,
+        toScope,
+        server.project_path ?? undefined,
+        toProject,
+      );
+      toast(`„${newName}" in ${toScope} angelegt`);
+      modal.close();
+      onDone();
+    } catch (e) {
+      okBtn.disabled = false;
+      cancelBtn.disabled = false;
+      status.className = "form-status error";
+      status.textContent = "Fehler: " + String(e);
+    }
+  });
+}
+
 export function openDetail(server: MergedServer, opts: DetailOptions = {}): void {
   // Status-Bereich (Badges + sichtbare Fehlergrund-Zeile) neu-rendbar halten,
   // damit „Erneut prüfen" ihn nach einem Health-Check aktualisieren kann.
@@ -427,11 +549,25 @@ export function openDetail(server: MergedServer, opts: DetailOptions = {}): void
         },
       });
     });
+    const dupBtn = h("button", { class: "btn btn-small" }, "Duplizieren");
+    dupBtn.addEventListener("click", () => {
+      openDuplicateModal(server, () => {
+        modal.close();
+        opts.onChanged?.();
+      });
+    });
     scopeSection = h(
       "div",
       { class: "detail-scope" },
       h("h3", { text: "Scope ändern" }),
       h("div", { class: "scope-row" }, select, moveBtn),
+      h("h3", { text: "Duplizieren" }),
+      h(
+        "div",
+        { class: "scope-row" },
+        h("span", { class: "muted", text: "Kopie in einen anderen Scope / ein anderes Projekt anlegen." }),
+        dupBtn,
+      ),
     );
   }
 
