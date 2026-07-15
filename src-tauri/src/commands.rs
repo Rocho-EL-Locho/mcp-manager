@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 
-use tauri::State;
+use tauri::{Emitter, State};
 
 use crate::claude_cli::{home_dir, resolve_claude, run_claude};
 use crate::config_read::{
@@ -55,6 +55,8 @@ pub struct AppState {
     settings: RwLock<AppSettings>,
     /// Status-/Latenz-Historie pro Server (Feature 09), beim Start geladen.
     metrics: Mutex<crate::metrics::Metrics>,
+    /// Laufende Live-Diagnose-Sessions (Feature 08). Max. eine gleichzeitig.
+    log_sessions: Mutex<HashMap<String, crate::logview::LogSessionHandle>>,
 }
 
 impl Default for AppState {
@@ -65,6 +67,7 @@ impl Default for AppState {
             // Einstellungen beim Start laden (fehlend/korrupt -> Defaults, nie Fehler).
             settings: RwLock::new(crate::settings::load()),
             metrics: Mutex::new(crate::metrics::load()),
+            log_sessions: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -76,6 +79,14 @@ impl AppState {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// Beendet alle laufenden Log-Sessions (killpg). Für den App-Exit-Hook.
+    pub fn kill_all_log_sessions(&self) {
+        let mut s = self.log_sessions.lock().unwrap_or_else(|e| e.into_inner());
+        for (_, h) in s.drain() {
+            h.kill();
+        }
     }
 }
 
@@ -672,6 +683,60 @@ pub fn get_metrics(
     let key = introspection_key(scope, &name, &project_path);
     let m = state.metrics.lock().unwrap_or_else(|e| e.into_inner());
     crate::metrics::points_for(&m, &key)
+}
+
+/// Startet eine Live-Diagnose-Session (Feature 08) für einen stdio-Server:
+/// eigene, langlebige Instanz, deren stderr + JSON-RPC live als `mcp-log`-Events
+/// gestreamt werden. Beendet eine evtl. laufende Session (max. eine). Liefert die
+/// Session-Id (für stop/buffer).
+#[tauri::command]
+pub fn start_log_session(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    name: String,
+    scope: Scope,
+    project_path: Option<String>,
+) -> Result<String, AppError> {
+    let entry = resolve_entry(scope, &name, &project_path)?;
+    if transport_of(&entry) != "stdio" {
+        return Err(AppError::Io(
+            "Diagnose-Session wird nur für stdio-Server unterstützt.".into(),
+        ));
+    }
+    let key = introspection_key(scope, &name, &project_path);
+    let id = format!("logsess::{}::{}", key, crate::introspect::unix_now());
+
+    let mut sessions = state.log_sessions.lock().unwrap_or_else(|e| e.into_inner());
+    // Nur eine Session gleichzeitig – laufende beenden.
+    for (_, h) in sessions.drain() {
+        h.kill();
+    }
+    // Jede gebatchte Zeilengruppe als `mcp-log`-Event ans Webview.
+    let handle = crate::logview::start(&entry, move |lines| {
+        let _ = app.emit(crate::logview::EVENT_NAME, serde_json::json!({ "lines": lines }));
+    })?;
+    sessions.insert(id.clone(), handle);
+    Ok(id)
+}
+
+/// Beendet eine Diagnose-Session (killpg der Prozessgruppe).
+#[tauri::command]
+pub fn stop_log_session(state: State<'_, AppState>, id: String) -> Result<(), AppError> {
+    let mut sessions = state.log_sessions.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(h) = sessions.remove(&id) {
+        h.kill();
+    }
+    Ok(())
+}
+
+/// Aktueller Ring-Puffer einer Session (Backfill beim Wieder-Öffnen der Ansicht).
+#[tauri::command]
+pub fn log_session_buffer(
+    state: State<'_, AppState>,
+    id: String,
+) -> Vec<crate::logview::LogLine> {
+    let sessions = state.log_sessions.lock().unwrap_or_else(|e| e.into_inner());
+    sessions.get(&id).map(|h| h.buffer()).unwrap_or_default()
 }
 
 /// Laufzeit-Preflight für einen Server: prüft, ob der benötigte Befehl

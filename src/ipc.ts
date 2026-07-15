@@ -201,6 +201,34 @@ export async function preflightServer(
   });
 }
 
+/** Eine Zeile der Live-Diagnose-Session (Spiegel von Rust `LogLine`). */
+export interface LogLine {
+  seq: number;
+  ts: number;
+  /** stderr | rpc_out | rpc_in | stdout | closed */
+  kind: string;
+  text: string;
+}
+
+/// Startet eine Live-Diagnose-Session; liefert die Session-Id.
+export async function startLogSession(
+  name: string,
+  scope: Scope,
+  projectPath?: string,
+): Promise<string> {
+  return invoke<string>("start_log_session", { name, scope, projectPath: projectPath ?? null });
+}
+
+/// Beendet eine Diagnose-Session.
+export async function stopLogSession(id: string): Promise<void> {
+  return invoke("stop_log_session", { id });
+}
+
+/// Aktueller Ring-Puffer einer Session (Backfill beim Wieder-Öffnen).
+export async function logSessionBuffer(id: string): Promise<LogLine[]> {
+  return invoke<LogLine[]>("log_session_buffer", { id });
+}
+
 /** Ein Messpunkt der Status-/Latenz-Historie (Spiegel von Rust `MetricPoint`). */
 export interface MetricPoint {
   ts: number;

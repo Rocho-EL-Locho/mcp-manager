@@ -1109,6 +1109,69 @@ body {
   user-select: text;
 }
 
+/* ---------- Live-Log-Viewer ---------- */
+.logview {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.logview-controls {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+.logview-controls .inp {
+  flex: 1;
+}
+.logview-notice {
+  font-size: 0.75rem;
+}
+.logview-panel {
+  height: 16rem;
+  overflow: auto;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.4rem 0.55rem;
+  font-size: 0.75rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+.log-line {
+  display: block;
+}
+.log-kind {
+  display: inline-block;
+  min-width: 4.5rem;
+  margin-right: 0.5rem;
+  opacity: 0.7;
+  text-transform: uppercase;
+  font-size: 0.68rem;
+}
+.log-stderr {
+  color: var(--muted);
+}
+.log-rpc-out {
+  color: var(--accent);
+}
+.log-rpc-in {
+  color: var(--ok);
+}
+.log-stdout {
+  color: var(--text);
+}
+.log-closed {
+  color: var(--error);
+  font-weight: 600;
+}
+.badge-live {
+  color: var(--ok);
+  border: 1px solid var(--ok);
+  background: var(--ok-soft);
+}
+
 /* ---------- Verlauf / Sparkline ---------- */
 .detail-metrics {
   margin-top: 0.3rem;
