@@ -369,3 +369,34 @@ export async function restoreBackup(id: string, onlyPaths?: string[]): Promise<v
 export async function deleteBackup(id: string): Promise<void> {
   return invoke("delete_snapshot", { id });
 }
+
+/** Eine Definition innerhalb eines Namenskonflikts (Spiegel von Rust `ConflictDefinition`). */
+export interface ConflictDefinition {
+  scope: Scope;
+  project_path: string | null;
+  summary: string;
+  /** Fingerprint nur informativ; der Gleichheitsvergleich kommt aus `identical`. */
+  fingerprint: number;
+}
+
+/** Namenskonflikt über Scopes (Spiegel von Rust `ConflictInfo`). */
+export interface ConflictInfo {
+  name: string;
+  definitions: ConflictDefinition[];
+  /** Scope, dessen Definition effektiv verwendet wird (local > project > user). */
+  effective_scope: Scope;
+  identical: boolean;
+}
+
+export async function listConflicts(projectPath?: string): Promise<ConflictInfo[]> {
+  return invoke<ConflictInfo[]>("list_conflicts", { projectPath: projectPath ?? null });
+}
+
+export async function renameServer(
+  name: string,
+  scope: Scope,
+  newName: string,
+  projectPath?: string,
+): Promise<void> {
+  return invoke("rename_server", { name, scope, newName, projectPath: projectPath ?? null });
+}

@@ -167,6 +167,29 @@ pub struct MergedServer {
     pub runtime_missing: Option<bool>,
 }
 
+/// Eine einzelne Definition innerhalb eines Namenskonflikts.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConflictDefinition {
+    pub scope: Scope,
+    pub project_path: Option<String>,
+    /// Maskierte Kurzbeschreibung (keine Secrets ins Webview).
+    pub summary: String,
+    /// Hash über die normalisierte Definition – nur für den Gleichheitsvergleich.
+    pub fingerprint: u64,
+}
+
+/// Ein Namenskonflikt: derselbe Servername in mehreren Scopes.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConflictInfo {
+    pub name: String,
+    pub definitions: Vec<ConflictDefinition>,
+    /// Scope, dessen Definition Claude Code tatsächlich nutzt (Präzedenz
+    /// local > project > user).
+    pub effective_scope: Scope,
+    /// true, wenn alle Definitionen inhaltsgleich sind (nur Duplikat, kein echter Konflikt).
+    pub identical: bool,
+}
+
 /// Ein Claude-Code-Projekt (Eintrag unter `projects` in ~/.claude.json).
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectInfo {

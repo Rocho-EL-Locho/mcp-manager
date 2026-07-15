@@ -11,6 +11,8 @@ export interface ListHandlers {
   onRemove: (server: MergedServer) => void;
   onLogin: (server: MergedServer) => void;
   onToggle: (server: MergedServer, enabled: boolean) => void;
+  /// Öffnet den Konflikt-Dialog für einen Server mit Namenskollision.
+  onConflict: (server: MergedServer) => void;
 }
 
 export type StatusFilter = "all" | "connected" | "failed" | "needs_auth" | "disabled";
@@ -198,7 +200,20 @@ function serverCard(
     capsBadge(server),
     latencyBadge(server),
     server.has_secrets ? icon("lock", "lock", "enthält Geheimnisse") : null,
-    server.collision ? icon("alert", "warn-icon", "Name existiert in mehreren Scopes") : null,
+    server.collision
+      ? h(
+          "button",
+          {
+            class: "icon-btn warn-icon",
+            title: "Name existiert in mehreren Scopes – Konflikt anzeigen",
+            onclick: (e: Event) => {
+              e.stopPropagation();
+              handlers.onConflict(server);
+            },
+          },
+          icon("alert"),
+        )
+      : null,
     server.runtime_missing
       ? icon("terminal", "warn-icon", "Laufzeit nicht auf PATH – Details öffnen")
       : null,

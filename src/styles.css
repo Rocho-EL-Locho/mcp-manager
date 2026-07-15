@@ -690,6 +690,68 @@ body {
   gap: 0.5rem;
 }
 
+/* Bare Icon-Button (klickbares Warn-Icon in der Serverliste) */
+.icon-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  color: inherit;
+}
+
+/* ---------- Konflikte ---------- */
+.conflict-banner {
+  width: 100%;
+  cursor: pointer;
+  text-align: left;
+  font-size: 0.85rem;
+}
+.conflict-banner:hover {
+  border-color: var(--warn);
+}
+.conflict-intro {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.6rem;
+  font-size: 0.85rem;
+}
+.conflict-effective {
+  background: var(--accent-soft);
+}
+.conflict-actions {
+  display: flex;
+  gap: 0.4rem;
+  justify-content: flex-end;
+}
+.conflict-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+.conflict-list-item {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.5rem 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  cursor: pointer;
+  text-align: left;
+}
+.conflict-list-item:hover {
+  border-color: var(--accent);
+  background: var(--surface-2);
+}
+.conflict-list-item .muted {
+  margin-left: auto;
+  font-size: 0.78rem;
+}
+
 /* ---------- Backups / Snapshots ---------- */
 .backups-toolbar {
   display: flex;
