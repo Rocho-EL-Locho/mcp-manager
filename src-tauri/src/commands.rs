@@ -1130,6 +1130,14 @@ fn definition_fingerprint(entry: &ServerEntry) -> u64 {
 /// der Konflikt beim Reaktivieren überraschend). Liefert je Konflikt die
 /// Definitionen (maskiert), den effektiven Scope (Präzedenz local > project >
 /// user) und ob alle Definitionen inhaltsgleich sind.
+///
+/// **Bewusst pro Projekt-Kontext** (`project_path` bzw. Home): geprüft wird
+/// user + local/project GENAU dieses Kontexts – so, wie Claude Code beim
+/// Arbeiten in genau diesem Verzeichnis auflöst. Ein „globaler" Konflikt über
+/// mehrere Projekte hinweg wäre nicht sinnvoll darstellbar, weil der effektive
+/// Scope kontextabhängig ist (local von Projekt A vs. local von Projekt B haben
+/// keinen gemeinsamen Gewinner). Konflikte anderer Projekte erscheinen daher
+/// erst beim Öffnen des jeweiligen Projekts.
 #[tauri::command]
 pub fn list_conflicts(project_path: Option<String>) -> Result<Vec<ConflictInfo>, AppError> {
     let dir = resolve_project_dir(project_path);
@@ -1224,11 +1232,18 @@ fn rename_server_impl(
     let dir = resolve_project_dir(project_path.clone());
     let defs = collect_definitions(&dir);
 
-    // Quell-Definition (Config, dann Stash für deaktivierte user-Server).
-    let entry = defs
+    // Quell-Definition: zuerst die aktive Config, sonst der Stash (deaktivierter
+    // user-Server). `from_stash` merkt sich, dass die Quelle deaktiviert war –
+    // dann bleibt der umbenannte Server ebenfalls deaktiviert (er wird NICHT
+    // durch das Umbenennen unbeabsichtigt aktiviert).
+    let config_entry = defs
         .iter()
         .find(|d| d.scope == scope && d.name == name)
-        .map(|d| d.entry.clone())
+        .map(|d| d.entry.clone());
+    let from_stash = config_entry.is_none()
+        && scope == Scope::User
+        && crate::stash::peek(&name).is_some();
+    let entry = config_entry
         .or_else(|| {
             if scope == Scope::User {
                 crate::stash::peek(&name).map(|item| item.entry)
@@ -1255,8 +1270,17 @@ fn rename_server_impl(
         Some(format!("auto: rename_server {name} -> {new_name}")),
     )?;
 
-    // Verifiziert unter neuem Namen anlegen, dann Original entfernen (Snapshot
-    // wurde bereits angelegt -> hier überspringen).
+    if from_stash {
+        // Deaktivierten Server umbenennen: unter neuem Namen wieder in den Stash
+        // legen und den alten Eintrag entfernen – kein claude-Aufruf, kein
+        // Aktivieren. Erst upsert, dann remove (Reihenfolge wie beim Deaktivieren).
+        crate::stash::upsert(&new_name, entry)?;
+        crate::stash::remove(&name)?;
+        return Ok(());
+    }
+
+    // Aktiver Server: verifiziert unter neuem Namen anlegen, dann Original
+    // entfernen (Snapshot wurde bereits angelegt -> hier überspringen).
     copy_definition(settings, &entry, &new_name, scope, &project_path)?;
     remove_server_impl(settings, name, scope, project_path, false)
 }
@@ -1655,6 +1679,44 @@ mod tests {
         let _ = remove_server(name.clone(), Scope::User, None);
         let _ = remove_server(name.clone(), Scope::Local, Some(proj));
         eprintln!("list_conflicts OK");
+    }
+
+    /// Opt-in: Umbenennen eines DEAKTIVIERTEN user-Servers hält ihn deaktiviert
+    /// (bleibt im Stash, wird nicht aktiviert). Nur mit `-- --ignored`.
+    #[test]
+    #[ignore]
+    fn rename_disabled_user_server_stays_disabled() {
+        let name = "mcpmgr-renametest".to_string();
+        let new_name = "mcpmgr-renametest2".to_string();
+        let _ = remove_server(name.clone(), Scope::User, None);
+        let _ = crate::stash::remove(&name);
+        let _ = crate::stash::remove(&new_name);
+
+        let e = ServerEntry {
+            transport: Some("stdio".into()),
+            command: Some("echo".into()),
+            args: Some(vec!["x".into()]),
+            ..Default::default()
+        };
+        add_server(name.clone(), Scope::User, None, e).expect("add");
+        toggle_user_server(name.clone(), false, None).expect("disable"); // -> Stash
+        assert!(crate::stash::peek(&name).is_some(), "vor Rename im Stash");
+
+        rename_server_impl(&cfg(), name.clone(), Scope::User, None, new_name.clone())
+            .expect("rename");
+
+        assert!(crate::stash::peek(&name).is_none(), "alter Stash-Eintrag entfernt");
+        assert!(
+            crate::stash::peek(&new_name).is_some(),
+            "neuer Name bleibt deaktiviert im Stash"
+        );
+        let active = collect_definitions(&default_project_path())
+            .into_iter()
+            .any(|d| d.scope == Scope::User && d.name == new_name);
+        assert!(!active, "neuer Name darf NICHT aktiv in der Config sein");
+
+        let _ = crate::stash::remove(&new_name);
+        eprintln!("rename disabled OK");
     }
 
     /// Opt-in: mcpjson-Toggle schreibt korrekt in settings.local.json.
