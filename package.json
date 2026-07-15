@@ -13,7 +13,8 @@
     "tauri:build": "APPIMAGE_EXTRACT_AND_RUN=1 NO_STRIP=1 tauri build"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2"
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-notification": "^2.3.3"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",

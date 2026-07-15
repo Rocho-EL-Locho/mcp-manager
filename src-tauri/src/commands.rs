@@ -53,6 +53,8 @@ pub struct AppState {
     introspection_cache: IntrospectionCache,
     /// Persistente App-Einstellungen, beim Start geladen und im Speicher gecacht.
     settings: RwLock<AppSettings>,
+    /// Status-/Latenz-Historie pro Server (Feature 09), beim Start geladen.
+    metrics: Mutex<crate::metrics::Metrics>,
 }
 
 impl Default for AppState {
@@ -62,6 +64,7 @@ impl Default for AppState {
             introspection_cache: Mutex::new(HashMap::new()),
             // Einstellungen beim Start laden (fehlend/korrupt -> Defaults, nie Fehler).
             settings: RwLock::new(crate::settings::load()),
+            metrics: Mutex::new(crate::metrics::load()),
         }
     }
 }
@@ -214,6 +217,35 @@ pub async fn list_servers(
             }
         }
     }
+    drop(cache);
+
+    // Status-/Verfügbarkeits-Historie fortschreiben – nur bei echtem Health-Check
+    // (with_status), ein Batch-Write pro Refresh. Externe Server (scope=None)
+    // werden übersprungen. Bewusst OHNE connect_ms: Latenz wird nur bei einer
+    // echten Introspektion gemessen (siehe introspect_server) – hier würde sonst
+    // der gecachte Wert als Scheinmessung wiederholt. Fehler blockieren nie.
+    if with_status {
+        let now = crate::introspect::unix_now();
+        let batch: Vec<(String, crate::metrics::MetricPoint)> = servers
+            .iter()
+            .filter_map(|s| {
+                let scope = s.scope?;
+                Some((
+                    introspection_key(scope, &s.name, &s.project_path),
+                    crate::metrics::MetricPoint {
+                        ts: now,
+                        status_kind: crate::metrics::status_kind(&s.status).to_string(),
+                        connect_ms: None,
+                    },
+                ))
+            })
+            .collect();
+        if !batch.is_empty() {
+            let mut m = state.metrics.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = crate::metrics::record(&mut m, now, batch);
+        }
+    }
+
     Ok(servers)
 }
 
@@ -520,6 +552,20 @@ pub async fn introspect_server(
 
     mask_introspection(&mut introspection);
 
+    // Echter Latenz-Messpunkt für die Historie (nur bei erfolgreicher
+    // Introspektion mit gemessener connect_ms) – so trägt die Sparkline echte
+    // Messungen statt wiederholter Cache-Werte. Best effort.
+    if introspection.error.is_none() && introspection.connect_ms.is_some() {
+        let now = crate::introspect::unix_now();
+        let point = crate::metrics::MetricPoint {
+            ts: now,
+            status_kind: "connected".to_string(),
+            connect_ms: introspection.connect_ms,
+        };
+        let mut m = state.metrics.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = crate::metrics::record(&mut m, now, vec![(key.clone(), point)]);
+    }
+
     state
         .introspection_cache
         .lock()
@@ -613,6 +659,19 @@ pub fn peek_introspection(
         .unwrap_or_else(|e| e.into_inner())
         .get(&key)
         .cloned())
+}
+
+/// Liefert die Status-/Latenz-Historie eines Servers (aus dem Speicher-Cache).
+#[tauri::command]
+pub fn get_metrics(
+    state: State<'_, AppState>,
+    name: String,
+    scope: Scope,
+    project_path: Option<String>,
+) -> Vec<crate::metrics::MetricPoint> {
+    let key = introspection_key(scope, &name, &project_path);
+    let m = state.metrics.lock().unwrap_or_else(|e| e.into_inner());
+    crate::metrics::points_for(&m, &key)
 }
 
 /// Laufzeit-Preflight für einen Server: prüft, ob der benötigte Befehl

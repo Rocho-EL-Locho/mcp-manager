@@ -39,3 +39,20 @@ export function h(
 export function clear(el: Element): void {
   while (el.firstChild) el.removeChild(el.firstChild);
 }
+
+// SVG-Elemente brauchen den SVG-Namespace (createElementNS) – `h()` erzeugt nur
+// HTML-Elemente. Attribute sind hier rein numerisch/statisch (kein XSS).
+export function svgEl(
+  tag: string,
+  attrs?: Record<string, string | number>,
+  ...children: Array<Node | null | undefined>
+): SVGElement {
+  const el = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  if (attrs) {
+    for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, String(v));
+  }
+  for (const c of children) {
+    if (c) el.append(c);
+  }
+  return el;
+}

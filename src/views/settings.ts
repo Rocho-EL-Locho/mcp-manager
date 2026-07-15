@@ -106,13 +106,18 @@ export async function openSettings(opts: SettingsOptions): Promise<void> {
 
   // --- Verhalten ---
   const autoRefresh = numberInput(settings.auto_refresh_minutes, 0, AUTO_REFRESH_MAX);
-  const notif = switchControl({ on: settings.notifications, disabled: true, title: "noch nicht verfügbar" });
+  let notifOn = settings.notifications;
+  const notif = switchControl({ on: settings.notifications, onChange: (v) => (notifOn = v) });
   const retention = numberInput(settings.snapshot_retention, RETENTION_MIN, RETENTION_MAX);
 
   const behaviorGroup = group(
     "Verhalten",
-    field("Auto-Refresh (Minuten, 0 = aus)", autoRefresh, "Wird mit Health-Monitoring (Feature 09) aktiv."),
-    field("Benachrichtigungen", notif, "Verfügbar mit Health-Monitoring (Feature 09)."),
+    field(
+      "Auto-Refresh (Minuten, 0 = aus)",
+      autoRefresh,
+      "Aktualisiert den Status periodisch selbst (pausiert bei offenem Dialog/Hintergrund).",
+    ),
+    field("Benachrichtigungen", notif, "Desktop-Hinweis bei Statusverschlechterung (braucht Auto-Refresh)."),
     field(
       "Snapshot-Aufbewahrung",
       retention,
@@ -183,6 +188,7 @@ export async function openSettings(opts: SettingsOptions): Promise<void> {
       list_timeout_secs: listV,
       mut_timeout_secs: mutV,
       auto_refresh_minutes: refreshN,
+      notifications: notifOn,
       snapshot_retention: retentionV,
       theme: themeSelect.value as Theme,
     };

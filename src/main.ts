@@ -17,8 +17,10 @@ import {
   listConflicts,
   renameServer,
 } from "./ipc";
-import type { MergedServer, ProjectInfo, Scope, BackupInfo, ConflictInfo } from "./ipc";
+import type { MergedServer, ProjectInfo, Scope, BackupInfo, ConflictInfo, AppSettings } from "./ipc";
 import { openConflictDialog, openConflictsOverview } from "./views/conflictDialog";
+import { modalsOpen } from "./modal";
+import { notifyStatusChange } from "./notify";
 import { renderServerList, defaultFilter, selectionKey } from "./views/serverList";
 import type { FilterState, BulkAction } from "./views/serverList";
 import { renderSidebar } from "./views/sidebar";
@@ -115,6 +117,32 @@ function pruneSelection(): void {
 // die Ansicht überschreibt. Nur der jüngste Aufruf darf schreiben/rendern.
 let refreshSeq = 0;
 
+// Gecachte App-Einstellungen (Auto-Refresh-Intervall, Benachrichtigungen).
+// Beim Start geladen und im onSaved-Callback aktualisiert.
+let appSettings: AppSettings | null = null;
+let autoTimer: number | undefined;
+
+/// Momentaufnahme des Status je Server (Schlüssel -> status.kind) für den
+/// Vorher/Nachher-Vergleich der Statuswechsel-Erkennung.
+function statusSnapshot(servers: MergedServer[]): Map<string, string> {
+  const m = new Map<string, string>();
+  for (const s of servers) m.set(selectionKey(s), s.status.kind);
+  return m;
+}
+
+/// Vergleicht alten/neuen Status und benachrichtigt bei Verschlechterung
+/// (connected -> failed / needs_auth), sofern Benachrichtigungen aktiviert sind.
+function notifyDegradations(prev: Map<string, string>, next: MergedServer[]): void {
+  if (!appSettings?.notifications) return;
+  for (const s of next) {
+    const before = prev.get(selectionKey(s));
+    const after = s.status.kind;
+    if (before === "connected" && (after === "failed" || after === "needs_auth")) {
+      void notifyStatusChange(s.name, after);
+    }
+  }
+}
+
 async function refresh(): Promise<void> {
   const seq = ++refreshSeq;
   state.error = null;
@@ -158,12 +186,16 @@ async function refresh(): Promise<void> {
   // Phase 2: frischer Health-Status im Hintergrund.
   state.loading = true;
   renderControls();
+  // Vorherigen Status (aus der Schnell-Liste = letzter bekannter Stand) merken,
+  // um Verschlechterungen zu erkennen.
+  const prevStatus = statusSnapshot(state.servers);
   try {
     const servers = await listServers(state.reveal, project, true);
     if (seq !== refreshSeq) return;
     state.servers = servers;
     pruneSelection();
     state.lastRefresh = new Date();
+    notifyDegradations(prevStatus, servers);
   } catch (e) {
     if (seq !== refreshSeq) return;
     state.error = String(e);
@@ -174,6 +206,26 @@ async function refresh(): Promise<void> {
       renderContent();
     }
   }
+}
+
+/// (Re)startet den Auto-Refresh-Timer gemäß den Einstellungen. 0 Minuten = aus.
+function applyAutoRefresh(): void {
+  if (autoTimer !== undefined) {
+    window.clearInterval(autoTimer);
+    autoTimer = undefined;
+  }
+  const minutes = appSettings?.auto_refresh_minutes ?? 0;
+  if (minutes <= 0) return;
+  autoTimer = window.setInterval(
+    () => {
+      // Nicht refreshen, während das Fenster im Hintergrund ist, bereits ein
+      // Refresh läuft oder ein Modal offen ist (sonst würde ein Full-Rebuild dem
+      // Nutzer ein offenes Formular unter der Hand wegreißen).
+      if (document.hidden || state.loading || modalsOpen()) return;
+      void refresh();
+    },
+    minutes * 60_000,
+  );
 }
 
 async function recheck(server: MergedServer): Promise<void> {
@@ -250,7 +302,11 @@ function refreshClaudeBadge(): void {
 
 function onSettings(): void {
   void openSettings({
-    onSaved: () => {
+    onSaved: (saved) => {
+      // Geänderte Einstellungen übernehmen: Auto-Refresh-Timer neu setzen,
+      // Benachrichtigungs-Flag cachen.
+      appSettings = saved;
+      applyAutoRefresh();
       // Pfad-/Timeout-Änderungen können Auflösung und Status betreffen.
       refreshClaudeBadge();
       void refresh();
@@ -646,9 +702,13 @@ async function main(): Promise<void> {
   app.append(topbar, layout);
   applySidebarVisibility();
 
-  // Gespeichertes Theme früh anwenden (best effort; Fehler => System-Default).
+  // Einstellungen laden: Theme anwenden, Auto-Refresh-Timer starten, Flags cachen.
   void getSettings()
-    .then((s) => applyTheme(s.theme))
+    .then((s) => {
+      appSettings = s;
+      applyTheme(s.theme);
+      applyAutoRefresh();
+    })
     .catch(() => applyTheme("system"));
 
   refreshClaudeBadge();

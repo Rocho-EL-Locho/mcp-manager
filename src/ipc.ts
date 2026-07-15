@@ -201,6 +201,26 @@ export async function preflightServer(
   });
 }
 
+/** Ein Messpunkt der Status-/Latenz-Historie (Spiegel von Rust `MetricPoint`). */
+export interface MetricPoint {
+  ts: number;
+  statusKind: string;
+  connectMs?: number;
+}
+
+/// Status-/Latenz-Historie eines Servers (für die Sparkline im Detail-Modal).
+export async function getMetrics(
+  name: string,
+  scope: Scope,
+  projectPath?: string,
+): Promise<MetricPoint[]> {
+  return invoke<MetricPoint[]>("get_metrics", {
+    name,
+    scope,
+    projectPath: projectPath ?? null,
+  });
+}
+
 /// Gecachtes Introspektions-Ergebnis abrufen, ohne den Server-Prozess zu starten.
 export async function peekIntrospection(
   name: string,

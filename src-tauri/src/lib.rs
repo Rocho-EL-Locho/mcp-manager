@@ -4,6 +4,7 @@ mod commands;
 mod config_read;
 mod introspect;
 mod mask;
+mod metrics;
 mod models;
 mod parse;
 mod preflight;
@@ -15,6 +16,8 @@ mod toggles;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Desktop-Benachrichtigungen bei Statusverschlechterung (Feature 09).
+        .plugin(tauri_plugin_notification::init())
         .manage(commands::AppState::default())
         .invoke_handler(tauri::generate_handler![
             commands::check_claude,
@@ -26,6 +29,7 @@ pub fn run() {
             commands::introspect_server,
             commands::peek_introspection,
             commands::playground_call,
+            commands::get_metrics,
             commands::preflight_server,
             commands::add_server,
             commands::update_server,

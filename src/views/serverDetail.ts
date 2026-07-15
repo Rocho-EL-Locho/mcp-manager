@@ -1,7 +1,7 @@
-import { h, clear } from "../dom";
+import { h, clear, svgEl } from "../dom";
 import { icon, setIcon } from "../icons";
-import type { MergedServer, ServerEntry, Scope, Introspection, ServerStatus, RuntimePreflight, ProjectInfo } from "../ipc";
-import { revealServerEntry, setScope, cloneServer, listProjects, introspectServer, peekIntrospection, healthCheck, preflightServer } from "../ipc";
+import type { MergedServer, ServerEntry, Scope, Introspection, ServerStatus, RuntimePreflight, ProjectInfo, MetricPoint } from "../ipc";
+import { revealServerEntry, setScope, cloneServer, listProjects, introspectServer, peekIntrospection, healthCheck, preflightServer, getMetrics } from "../ipc";
 import { openModal } from "../modal";
 import { openConfirm } from "../confirm";
 import { toast } from "../toast";
@@ -264,6 +264,77 @@ function runtimeSection(server: MergedServer): HTMLElement | null {
 
 /// Abschnitt „Fähigkeiten": On-Demand-Introspektion mit Laden/Aktualisieren-Button.
 /// Beim Öffnen wird ein bereits gecachtes Ergebnis (ohne Prozessstart) vorgeladen.
+/// Mini-Sparkline der Status-/Latenz-Historie: farbige Punkte je Messung
+/// (Verfügbarkeit), plus eine Latenzlinie über die Punkte mit `connectMs`.
+function renderSparkline(points: MetricPoint[]): HTMLElement {
+  if (points.length < 2) {
+    return h("p", { class: "muted", text: "Noch keine Historie – nach ein paar Aktualisierungen." });
+  }
+  const W = 260;
+  const H = 44;
+  const pad = 5;
+  const n = points.length;
+  const xAt = (i: number) => pad + (i / (n - 1)) * (W - 2 * pad);
+
+  const svg = svgEl("svg", {
+    viewBox: `0 0 ${W} ${H}`,
+    class: "sparkline",
+    preserveAspectRatio: "none",
+    role: "img",
+  });
+
+  // Latenzlinie (nur Punkte mit connectMs; braucht mind. 2).
+  const lat = points
+    .map((p, i) => ({ i, v: p.connectMs }))
+    .filter((o): o is { i: number; v: number } => typeof o.v === "number");
+  if (lat.length >= 2) {
+    const vals = lat.map((o) => o.v);
+    const max = Math.max(...vals);
+    const min = Math.min(...vals);
+    const range = max - min || 1;
+    const yAt = (v: number) => H - pad - ((v - min) / range) * (H - 2 * pad - 6);
+    const pts = lat.map((o) => `${xAt(o.i).toFixed(1)},${yAt(o.v).toFixed(1)}`).join(" ");
+    svg.append(svgEl("polyline", { points: pts, class: "sparkline-line", fill: "none" }));
+  }
+
+  // Status-Punkte auf der Grundlinie.
+  points.forEach((p, i) => {
+    svg.append(
+      svgEl("circle", {
+        cx: xAt(i).toFixed(1),
+        cy: H - pad,
+        r: 2.2,
+        class: `spark-dot spark-${p.statusKind}`,
+      }),
+    );
+  });
+
+  const latestLatency = lat.length ? lat[lat.length - 1].v : undefined;
+  const caption =
+    `letzte ${n} Messungen` + (latestLatency !== undefined ? ` · zuletzt ${formatLatency(latestLatency)}` : "");
+  return h("div", { class: "sparkline-wrap" }, svg, h("div", { class: "muted sparkline-caption", text: caption }));
+}
+
+/// Abschnitt „Verlauf" im Detail-Modal: lädt die Historie und rendert die
+/// Sparkline. Nur für Server mit Scope (externe haben keine Historie).
+function metricsSection(server: MergedServer): HTMLElement | null {
+  const scope = server.scope;
+  if (!scope) return null;
+  const box = h("div", { class: "detail-metrics" }, h("p", { class: "muted", text: "Verlauf wird geladen…" }));
+  void getMetrics(server.name, scope, server.project_path ?? undefined)
+    .then((pts) => {
+      if (!box.isConnected) return;
+      clear(box);
+      box.append(renderSparkline(pts));
+    })
+    .catch(() => {
+      if (!box.isConnected) return;
+      clear(box);
+      box.append(h("p", { class: "muted", text: "Keine Historie verfügbar." }));
+    });
+  return h("div", { class: "detail-section" }, h("h3", { text: "Verlauf" }), box);
+}
+
 function capabilitiesSection(server: MergedServer, opts: DetailOptions): HTMLElement | null {
   // Nur für Server mit lokaler Definition (Scope bekannt) sinnvoll.
   if (!server.entry || !server.scope) return null;
@@ -627,6 +698,7 @@ export function openDetail(server: MergedServer, opts: DetailOptions = {}): void
     defWrap,
     runtimeSection(server),
     capabilitiesSection(server, opts),
+    metricsSection(server),
     scopeSection,
   );
 

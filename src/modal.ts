@@ -6,6 +6,12 @@ export interface ModalHandle {
   setBody(node: Node): void;
 }
 
+/// Ist gerade ein Modal (Overlay) offen? Genutzt vom Auto-Refresh, um einen
+/// Full-Rebuild zu unterlassen, solange der Nutzer in einem Dialog arbeitet.
+export function modalsOpen(): boolean {
+  return document.querySelector(".modal-overlay") !== null;
+}
+
 /// Öffnet ein modales Overlay. Schließen per ✕, Klick auf den Hintergrund oder Escape.
 export function openModal(title: string, body: Node, footer?: Node[]): ModalHandle {
   const bodyWrap = h("div", { class: "modal-body" }, body);
