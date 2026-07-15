@@ -1704,6 +1704,120 @@ select.inp option {
   color: var(--muted);
 }
 
+/* ---------- Registry-Browser (Feature 10) ---------- */
+.registry-searchbar {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 0.6rem;
+}
+.registry-searchbar .inp {
+  flex: 1;
+}
+
+.registry-results {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  max-height: 52vh;
+  overflow: auto;
+}
+
+.registry-card {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.6rem 0.7rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.registry-card-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.registry-card-title {
+  font-weight: 600;
+}
+.registry-card-name {
+  font-size: 0.74rem;
+  overflow-wrap: anywhere;
+}
+.registry-card-desc {
+  font-size: 0.83rem;
+  line-height: 1.5;
+}
+
+.registry-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+
+.registry-card-actions,
+.registry-variant-actions {
+  margin-top: 0.2rem;
+}
+
+.registry-details {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-top: 0.35rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--border);
+}
+
+.registry-variant {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.5rem 0.6rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.registry-variant-head {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+.registry-cmd {
+  font-size: 0.76rem;
+  overflow-wrap: anywhere;
+  color: var(--text);
+}
+
+.registry-envlist {
+  margin: 0;
+  padding-left: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-size: 0.8rem;
+}
+.registry-envdesc {
+  font-size: 0.75rem;
+  line-height: 1.4;
+}
+
+.registry-repo a {
+  color: var(--accent);
+  font-size: 0.82rem;
+}
+.registry-trust {
+  font-size: 0.75rem;
+  border-left: 3px solid var(--border-strong);
+  padding-left: 0.5rem;
+}
+
+.registry-more {
+  margin-top: 0.6rem;
+  display: flex;
+  justify-content: center;
+}
+
 /* ---------- Einstellungen ---------- */
 .settings-group {
   margin-bottom: 1.4rem;

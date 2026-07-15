@@ -400,6 +400,47 @@ export async function runClaudeAssistant(
   });
 }
 
+// --- Registry-Browser (Feature 10) ---
+
+export interface RegistryEnvVarInfo {
+  name: string;
+  required: boolean;
+  secret: boolean;
+  description: string | null;
+}
+
+export interface RegistryVariant {
+  kind: string; // npm | pypi | oci | http | sse
+  label: string;
+  entry: ServerEntry;
+  env_vars: RegistryEnvVarInfo[];
+  secret_keys: string[];
+}
+
+export interface RegistryEntryView {
+  name: string;
+  title: string;
+  description: string;
+  version: string;
+  repository_url: string | null;
+  variants: RegistryVariant[];
+}
+
+export interface RegistrySearchPage {
+  servers: RegistryEntryView[];
+  next_cursor: string | null;
+}
+
+export async function searchRegistry(
+  query: string,
+  cursor?: string,
+): Promise<RegistrySearchPage> {
+  return invoke<RegistrySearchPage>("search_registry", {
+    query,
+    cursor: cursor ?? null,
+  });
+}
+
 export async function getSettings(): Promise<AppSettings> {
   return invoke<AppSettings>("get_settings");
 }

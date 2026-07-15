@@ -9,6 +9,7 @@ mod metrics;
 mod models;
 mod parse;
 mod preflight;
+mod registry;
 mod settings;
 mod snapshot;
 mod stash;
@@ -50,6 +51,7 @@ pub fn run() {
             commands::list_conflicts,
             commands::rename_server,
             commands::run_claude_assistant,
+            commands::search_registry,
             commands::get_settings,
             commands::set_settings,
             commands::create_snapshot,

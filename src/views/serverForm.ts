@@ -9,7 +9,7 @@ import { toast } from "../toast";
 export interface ServerFormOptions {
   mode: "add" | "edit";
   server?: MergedServer;
-  prefill?: { name?: string; entry?: ServerEntry };
+  prefill?: { name?: string; entry?: ServerEntry; secretKeys?: string[] };
   /// Gewähltes Preset (Add-Modus): liefert Prefill, docsUrl und Secret-Führung.
   preset?: ServerPreset;
   /// Zielprojekt für local/project-Scope (Add-Modus).
@@ -126,7 +126,7 @@ export async function openServerForm(opts: ServerFormOptions): Promise<void> {
     if (opts.defaultScope) scope = opts.defaultScope;
   }
 
-  const secretKeys = opts.preset?.secretKeys ?? [];
+  const secretKeys = opts.prefill?.secretKeys ?? opts.preset?.secretKeys ?? [];
 
   // Ursprüngliches type merken, um bei stdio keinen "type"-Key neu hinzuzufügen.
   const hadType = initEntry.type != null;
