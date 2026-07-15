@@ -57,6 +57,9 @@ pub struct AppState {
     metrics: Mutex<crate::metrics::Metrics>,
     /// Laufende Live-Diagnose-Sessions (Feature 08). Max. eine gleichzeitig.
     log_sessions: Mutex<HashMap<String, crate::logview::LogSessionHandle>>,
+    /// Registry-Suche (Feature 10): Ergebnisseiten mit 5-min-TTL, Key
+    /// "query\0cursor". Spart wiederholte Netz-Abfragen beim Blättern/Tippen.
+    registry_cache: Mutex<HashMap<String, (u64, crate::registry::RegistrySearchPage)>>,
 }
 
 impl Default for AppState {
@@ -68,6 +71,7 @@ impl Default for AppState {
             settings: RwLock::new(crate::settings::load()),
             metrics: Mutex::new(crate::metrics::load()),
             log_sessions: Mutex::new(HashMap::new()),
+            registry_cache: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -1572,6 +1576,45 @@ pub async fn run_claude_assistant(
         extra_context.as_deref(),
         state.settings().claude_path(),
     )
+}
+
+/// Durchsucht die offizielle MCP-Registry (Feature 10). Ergebnisse werden 5
+/// Minuten pro (Query, Cursor) gecacht; das blockierende `ureq` läuft im
+/// Command-Thread-Pool (nicht dem UI-Thread), analog `run_claude_assistant`.
+#[tauri::command]
+pub async fn search_registry(
+    state: State<'_, AppState>,
+    query: String,
+    cursor: Option<String>,
+) -> Result<crate::registry::RegistrySearchPage, AppError> {
+    const TTL_SECS: u64 = 300;
+    // Obergrenze, damit viele unterschiedliche Suchen/Cursor den Cache nicht
+    // unbegrenzt wachsen lassen (stale Einträge werden sonst nie entfernt).
+    const MAX_ENTRIES: usize = 64;
+    let key = format!("{}\u{0}{}", query.trim(), cursor.as_deref().unwrap_or(""));
+    let now = crate::introspect::unix_now();
+
+    // Cache-Treffer (frisch genug)?
+    {
+        let cache = state.registry_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((ts, page)) = cache.get(&key) {
+            if now.saturating_sub(*ts) < TTL_SECS {
+                return Ok(page.clone());
+            }
+        }
+    }
+
+    let page = crate::registry::fetch(query.trim(), cursor.as_deref())?;
+    let mut cache = state.registry_cache.lock().unwrap_or_else(|e| e.into_inner());
+    // Stale Einträge aufräumen; wenn danach noch zu viele, komplett leeren.
+    if cache.len() >= MAX_ENTRIES {
+        cache.retain(|_, (ts, _)| now.saturating_sub(*ts) < TTL_SECS);
+        if cache.len() >= MAX_ENTRIES {
+            cache.clear();
+        }
+    }
+    cache.insert(key, (now, page.clone()));
+    Ok(page)
 }
 
 /// Liefert die aktuellen App-Einstellungen (aus dem Speicher-Cache).
