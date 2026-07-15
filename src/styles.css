@@ -1109,6 +1109,41 @@ body {
   user-select: text;
 }
 
+/* ---------- Verlauf / Sparkline ---------- */
+.detail-metrics {
+  margin-top: 0.3rem;
+}
+.sparkline-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+.sparkline {
+  width: 100%;
+  height: 44px;
+  display: block;
+}
+.sparkline-line {
+  stroke: var(--accent);
+  stroke-width: 1.5;
+}
+.sparkline-caption {
+  font-size: 0.75rem;
+}
+.spark-dot {
+  fill: var(--muted);
+}
+.spark-connected {
+  fill: var(--ok);
+}
+.spark-failed {
+  fill: var(--error);
+}
+.spark-needs_auth,
+.spark-pending_approval {
+  fill: var(--warn);
+}
+
 /* ---------- Tool-Playground ---------- */
 .pg {
   display: flex;

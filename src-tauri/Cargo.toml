@@ -23,6 +23,8 @@ libc = "0.2"
 # ureq (klein, blockierend, rustls) statt reqwest/tokio – passt zum bestehenden
 # blockierenden Thread-/Channel-Modell von introspect.rs.
 ureq = "2"
+# Desktop-Benachrichtigungen bei Statusverschlechterung (Feature 09).
+tauri-plugin-notification = "2"
 
 [profile.release]
 opt-level = "s"
