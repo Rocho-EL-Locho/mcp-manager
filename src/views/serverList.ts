@@ -186,6 +186,7 @@ function serverCard(
   server: MergedServer,
   handlers: ListHandlers,
   sel: SelectContext | null,
+  logActive = false,
 ): HTMLElement {
   const st = statusMeta(server.status);
 
@@ -199,6 +200,7 @@ function serverCard(
     h("span", { class: "badge badge-scope", text: server.origin }),
     capsBadge(server),
     latencyBadge(server),
+    logActive ? h("span", { class: "badge badge-live", title: "Diagnose-Session läuft" }, "● Diagnose") : null,
     server.has_secrets ? icon("lock", "lock", "enthält Geheimnisse") : null,
     server.collision
       ? h(
@@ -278,6 +280,7 @@ export function renderServerList(
   handlers: ListHandlers,
   visibleGroups?: string[],
   bulk?: BulkContext,
+  activeLogKey?: string | null,
 ): HTMLElement {
   const root = h("div", { class: "server-list" });
   const bodyEl = h("div", { class: "server-list-body" });
@@ -435,11 +438,13 @@ export function renderServerList(
             rerenderBulkBar();
           });
           sel = { selected: box.checked, checkbox: box };
-          const card = serverCard(s, handlers, sel);
+          const logActive = activeLogKey != null && key === activeLogKey;
+          const card = serverCard(s, handlers, sel, logActive);
           selCards.set(key, { card, box });
           bodyEl.append(card);
         } else {
-          bodyEl.append(serverCard(s, handlers, null));
+          const logActive = activeLogKey != null && selectionKey(s) === activeLogKey;
+          bodyEl.append(serverCard(s, handlers, null, logActive));
         }
       }
     }

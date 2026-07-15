@@ -3,6 +3,7 @@ mod claude_cli;
 mod commands;
 mod config_read;
 mod introspect;
+mod logview;
 mod mask;
 mod metrics;
 mod models;
@@ -12,6 +13,8 @@ mod settings;
 mod snapshot;
 mod stash;
 mod toggles;
+
+use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -30,6 +33,9 @@ pub fn run() {
             commands::peek_introspection,
             commands::playground_call,
             commands::get_metrics,
+            commands::start_log_session,
+            commands::stop_log_session,
+            commands::log_session_buffer,
             commands::preflight_server,
             commands::add_server,
             commands::update_server,
@@ -51,6 +57,13 @@ pub fn run() {
             commands::restore_snapshot,
             commands::delete_snapshot,
         ])
-        .run(tauri::generate_context!())
-        .expect("Fehler beim Starten der Tauri-Anwendung");
+        .build(tauri::generate_context!())
+        .expect("Fehler beim Starten der Tauri-Anwendung")
+        // Beim App-Exit alle laufenden Diagnose-Sessions hart beenden (kein
+        // zurückbleibender npx-/Serverprozess). Feature 08.
+        .run(|app, event| {
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                app.state::<commands::AppState>().kill_all_log_sessions();
+            }
+        });
 }

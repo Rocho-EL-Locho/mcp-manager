@@ -8,6 +8,7 @@ import { toast } from "../toast";
 import { statusMeta, formatLatency } from "./serverList";
 import { field } from "./serverForm";
 import { openToolPlayground, openResourcePlayground, openPromptPlayground } from "./playground";
+import { createLogView } from "./logView";
 
 const ALL_SCOPES: Scope[] = ["user", "local", "project"];
 
@@ -335,6 +336,24 @@ function metricsSection(server: MergedServer): HTMLElement | null {
   return h("div", { class: "detail-section" }, h("h3", { text: "Verlauf" }), box);
 }
 
+/// „Logs"-Sektion (Feature 08): Live-Diagnose nur für stdio-Server. Gibt das
+/// Element + eine `dispose`-Funktion zurück (Listener beim Modal-Schließen abmelden).
+function logsSection(
+  server: MergedServer,
+  opts: DetailOptions,
+): { element: HTMLElement; dispose: () => void } | null {
+  const scope = server.scope;
+  // Nur stdio-Server (lokaler Prozess) und mit bekanntem Scope.
+  if (!scope || !server.entry?.command) return null;
+
+  const view = createLogView(server, scope, opts.activeLogSession ?? null, {
+    onStarted: (id) => opts.onLogSessionChange?.(server, id),
+    onStopped: () => opts.onLogSessionChange?.(server, null),
+  });
+  const element = h("div", { class: "detail-section" }, h("h3", { text: "Logs (Diagnose)" }), view.element);
+  return { element, dispose: view.dispose };
+}
+
 function capabilitiesSection(server: MergedServer, opts: DetailOptions): HTMLElement | null {
   // Nur für Server mit lokaler Definition (Scope bekannt) sinnvoll.
   if (!server.entry || !server.scope) return null;
@@ -410,6 +429,10 @@ export interface DetailOptions {
   /// Wird nach einem erneuten Health-Check aufgerufen, damit die Liste den neuen
   /// Status ohne teuren Full-Refresh übernehmen kann.
   onRechecked?: (server: MergedServer, status: ServerStatus) => void;
+  /// Aktive Log-Session-Id für DIESEN Server (Feature 08), falls eine läuft.
+  activeLogSession?: string | null;
+  /// Meldet Start (Id) / Stop (null) einer Log-Session – für das Listen-Badge.
+  onLogSessionChange?: (server: MergedServer, id: string | null) => void;
 }
 
 /// Öffnet ein Formular-Modal zum Duplizieren eines Servers (Original bleibt bestehen).
@@ -682,6 +705,7 @@ export function openDetail(server: MergedServer, opts: DetailOptions = {}): void
     );
   }
 
+  const logs = logsSection(server, opts);
   const body = h(
     "div",
     { class: "detail" },
@@ -698,9 +722,11 @@ export function openDetail(server: MergedServer, opts: DetailOptions = {}): void
     defWrap,
     runtimeSection(server),
     capabilitiesSection(server, opts),
+    logs?.element ?? null,
     metricsSection(server),
     scopeSection,
   );
 
-  const modal = openModal(server.name, body);
+  // Beim Schließen den Log-Event-Listener abmelden (Session läuft weiter).
+  const modal = openModal(server.name, body, undefined, () => logs?.dispose());
 }

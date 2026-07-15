@@ -50,6 +50,8 @@ interface State {
   sidebarVisible: boolean;
   filter: FilterState;
   selection: Set<string>;
+  /// Laufende Live-Diagnose-Session (Feature 08): welcher Server (selectionKey) + Id.
+  logSession: { key: string; id: string } | null;
 }
 
 const state: State = {
@@ -66,6 +68,7 @@ const state: State = {
   sidebarVisible: true,
   filter: defaultFilter(),
   selection: new Set(),
+  logSession: null,
 };
 
 let contentEl: HTMLElement;
@@ -608,6 +611,14 @@ function renderContent(): void {
         onDetails: (s) =>
           openDetail(s, {
             onChanged: () => void refresh(),
+            activeLogSession:
+              state.logSession && state.logSession.key === selectionKey(s)
+                ? state.logSession.id
+                : null,
+            onLogSessionChange: (srv, id) => {
+              state.logSession = id ? { key: selectionKey(srv), id } : null;
+              renderContent();
+            },
             onRechecked: (srv, status) => {
               // Neuen Health-Status ohne teuren Full-Refresh in die Liste übernehmen.
               const target = state.servers.find(
@@ -646,6 +657,7 @@ function renderContent(): void {
         selection: state.selection,
         onBulk,
       },
+      state.logSession?.key ?? null,
     ),
   );
 

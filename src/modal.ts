@@ -12,14 +12,25 @@ export function modalsOpen(): boolean {
   return document.querySelector(".modal-overlay") !== null;
 }
 
-/// Öffnet ein modales Overlay. Schließen per ✕, Klick auf den Hintergrund oder Escape.
-export function openModal(title: string, body: Node, footer?: Node[]): ModalHandle {
+/// Öffnet ein modales Overlay. Schließen per ✕, Klick auf den Hintergrund oder
+/// Escape. `onClose` wird bei jedem dieser Wege genau einmal aufgerufen (z. B. um
+/// Event-Listener abzumelden oder eine Session zu stoppen).
+export function openModal(
+  title: string,
+  body: Node,
+  footer?: Node[],
+  onClose?: () => void,
+): ModalHandle {
   const bodyWrap = h("div", { class: "modal-body" }, body);
   const overlay = h("div", { class: "modal-overlay" });
 
+  let closed = false;
   const close = () => {
+    if (closed) return;
+    closed = true;
     document.removeEventListener("keydown", onKey);
     overlay.remove();
+    onClose?.();
   };
   const onKey = (e: KeyboardEvent) => {
     if (e.key !== "Escape") return;
