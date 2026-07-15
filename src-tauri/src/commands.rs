@@ -73,6 +73,25 @@ impl AppState {
     }
 }
 
+/// Ermittelt den Transport eines Servers – spiegelt `src/transport.ts`:
+/// explizites `type` gewinnt, sonst aus der URL (`…/sse` ⇒ sse, sonst http),
+/// sonst `command` ⇒ stdio (Default stdio).
+fn transport_of(entry: &ServerEntry) -> &'static str {
+    match entry.transport.as_deref() {
+        Some("stdio") => return "stdio",
+        Some("http") => return "http",
+        Some("sse") => return "sse",
+        _ => {}
+    }
+    if let Some(url) = entry.url.as_deref() {
+        if url.trim_end_matches('/').ends_with("/sse") {
+            return "sse";
+        }
+        return "http";
+    }
+    "stdio"
+}
+
 /// Stabiler Cache-Schlüssel für die Introspektion eines Servers.
 fn introspection_key(scope: Scope, name: &str, project_path: &Option<String>) -> String {
     let dir = resolve_project_dir(project_path.clone());
@@ -479,27 +498,11 @@ pub async fn introspect_server(
         })
         .ok_or_else(|| AppError::Io("Server-Definition nicht gefunden".into()))?;
 
-    let mut introspection = if entry.command.is_some() {
-        // Gibt immer eine Introspection zurück; Start-/Handshake-Fehler stehen in
-        // `error`/`logs` (statt als Err), damit die Detail-Ansicht sie zeigen kann.
-        crate::introspect::introspect_stdio(&entry, INTROSPECT_TIMEOUT)
-    } else {
-        // HTTP/SSE: in dieser Version nicht unterstützt (kein Prozess-Start).
-        Introspection {
-            tools: Vec::new(),
-            resources: Vec::new(),
-            prompts: Vec::new(),
-            server_name: None,
-            server_version: None,
-            notes: vec![
-                "Introspektion wird derzeit nur für stdio-Server unterstützt (HTTP/SSE folgt)."
-                    .into(),
-            ],
-            logs: None,
-            error: None,
-            connect_ms: None,
-            introspected_at: crate::introspect::unix_now(),
-        }
+    // Beide Zweige geben immer eine Introspection zurück; Start-/Handshake-Fehler
+    // stehen in `error`/`logs` (statt als Err), damit die Detail-Ansicht sie zeigt.
+    let mut introspection = match transport_of(&entry) {
+        "stdio" => crate::introspect::introspect_stdio(&entry, INTROSPECT_TIMEOUT),
+        _ => crate::introspect::introspect_http(&entry, INTROSPECT_TIMEOUT),
     };
 
     mask_introspection(&mut introspection);
