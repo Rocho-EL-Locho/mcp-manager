@@ -8,6 +8,7 @@ mod models;
 mod parse;
 mod preflight;
 mod settings;
+mod snapshot;
 mod stash;
 mod toggles;
 
@@ -38,6 +39,10 @@ pub fn run() {
             commands::run_claude_assistant,
             commands::get_settings,
             commands::set_settings,
+            commands::create_snapshot,
+            commands::list_snapshots,
+            commands::restore_snapshot,
+            commands::delete_snapshot,
         ])
         .run(tauri::generate_context!())
         .expect("Fehler beim Starten der Tauri-Anwendung");

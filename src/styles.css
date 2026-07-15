@@ -681,6 +681,95 @@ body {
   background: var(--error-soft);
 }
 
+.banner-warn {
+  border-color: var(--warn);
+  color: var(--warn);
+  background: var(--warn-soft);
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+/* ---------- Backups / Snapshots ---------- */
+.backups-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 0.9rem;
+}
+
+.table-wrap {
+  overflow-x: auto;
+}
+
+.backups-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+.backups-table th,
+.backups-table td {
+  text-align: left;
+  padding: 0.5rem 0.65rem;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.backups-table th {
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 0.78rem;
+}
+.backups-table td.num,
+.backups-table th.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.backups-actions {
+  display: flex;
+  gap: 0.4rem;
+  justify-content: flex-end;
+}
+
+.tag {
+  display: inline-block;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  background: var(--surface-2);
+  color: var(--muted);
+}
+.tag-manual {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.tag-warn {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.restore-files {
+  max-height: 34vh;
+  overflow-y: auto;
+  margin-top: 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+.restore-file {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.25rem 0.35rem;
+  border-radius: var(--radius-sm);
+}
+.restore-file:hover {
+  background: var(--surface-2);
+}
+.restore-file .muted {
+  margin-left: auto;
+  font-size: 0.78rem;
+}
+
 /* ---------- Modal ---------- */
 .modal-overlay {
   position: fixed;

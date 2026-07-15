@@ -236,8 +236,14 @@ export async function removeServer(
   name: string,
   scope: Scope,
   projectPath?: string,
+  skipSnapshot = false,
 ): Promise<void> {
-  return invoke("remove_server", { name, scope, projectPath: projectPath ?? null });
+  return invoke("remove_server", {
+    name,
+    scope,
+    projectPath: projectPath ?? null,
+    skipSnapshot,
+  });
 }
 
 export async function loginServer(name: string): Promise<void> {
@@ -260,8 +266,12 @@ export async function toggleMcpjsonServer(
   return invoke("toggle_mcpjson_server", { name, projectPath: projectPath ?? null, enabled });
 }
 
-export async function toggleUserServer(name: string, enabled: boolean): Promise<void> {
-  return invoke("toggle_user_server", { name, enabled, entry: null });
+export async function toggleUserServer(
+  name: string,
+  enabled: boolean,
+  skipSnapshot = false,
+): Promise<void> {
+  return invoke("toggle_user_server", { name, enabled, entry: null, skipSnapshot });
 }
 
 export interface AssistantResult {
@@ -323,4 +333,39 @@ export async function cloneServer(
     fromProject: fromProject ?? null,
     toProject: toProject ?? null,
   });
+}
+
+/** Eine im Snapshot gesicherte Datei (Feldnamen = snake_case, serde). */
+export interface BackupFile {
+  original_path: string;
+  stored: string;
+  existed: boolean;
+  size: number;
+}
+
+/** Ein Snapshot der MCP-Konfiguration (Spiegel von Rust `SnapshotManifest`). */
+export interface BackupInfo {
+  id: string;
+  created_at: number;
+  note: string | null;
+  auto: boolean;
+  files: BackupFile[];
+  /** Manifest fehlte/war unlesbar – dann ist nur Löschen sinnvoll. */
+  corrupt: boolean;
+}
+
+export async function listBackups(): Promise<BackupInfo[]> {
+  return invoke<BackupInfo[]>("list_snapshots");
+}
+
+export async function createBackup(note?: string, auto = false): Promise<BackupInfo> {
+  return invoke<BackupInfo>("create_snapshot", { note: note ?? null, auto });
+}
+
+export async function restoreBackup(id: string, onlyPaths?: string[]): Promise<void> {
+  return invoke("restore_snapshot", { id, onlyPaths: onlyPaths ?? null });
+}
+
+export async function deleteBackup(id: string): Promise<void> {
+  return invoke("delete_snapshot", { id });
 }
