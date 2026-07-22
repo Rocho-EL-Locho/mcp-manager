@@ -22,7 +22,7 @@ libc = "0.2"
 # Synchroner HTTP-Client für die HTTP/SSE-Introspektion (Feature 06). Bewusst
 # ureq (klein, blockierend, rustls) statt reqwest/tokio – passt zum bestehenden
 # blockierenden Thread-/Channel-Modell von introspect.rs.
-ureq = "2"
+ureq = "3"
 # Desktop-Benachrichtigungen bei Statusverschlechterung (Feature 09).
 tauri-plugin-notification = "2"
 
