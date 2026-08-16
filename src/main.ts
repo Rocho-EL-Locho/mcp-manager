@@ -153,13 +153,18 @@ async function refresh(): Promise<void> {
   if (seq !== refreshSeq) return;
 
   // Backups-Ansicht: eigener, health-check-freier Ladepfad.
+  // Erst in eine lokale Variable laden, DANN den Guard prüfen, DANN zuweisen:
+  // wird der State vor der Prüfung geschrieben, überschreibt ein überholter Lauf
+  // frische Daten und der `return` verhindert nur noch das Rendern.
   if (state.view.kind === "backups") {
     try {
-      state.backups = await listBackups();
+      const backups = await listBackups();
+      if (seq !== refreshSeq) return;
+      state.backups = backups;
     } catch (e) {
+      if (seq !== refreshSeq) return;
       state.error = String(e);
     }
-    if (seq !== refreshSeq) return;
     renderContent();
     return;
   }
@@ -173,12 +178,15 @@ async function refresh(): Promise<void> {
     state.servers = servers;
     pruneSelection();
     // Namenskonflikte parallel-günstig mitladen (kein Health-Check nötig).
+    // Auch hier: laden, Guard, erst dann zuweisen.
     try {
-      state.conflicts = await listConflicts(project);
+      const conflicts = await listConflicts(project);
+      if (seq !== refreshSeq) return;
+      state.conflicts = conflicts;
     } catch {
+      if (seq !== refreshSeq) return;
       state.conflicts = [];
     }
-    if (seq !== refreshSeq) return;
     renderContent();
   } catch (e) {
     if (seq !== refreshSeq) return;
@@ -610,6 +618,9 @@ function renderContent(): void {
       {
         onDetails: (s) =>
           openDetail(s, {
+            // Projekt-Kontext durchreichen – der Scope-Wechsel braucht ihn als
+            // Zielprojekt.
+            projectPath: currentProjectPath(),
             onChanged: () => void refresh(),
             activeLogSession:
               state.logSession && state.logSession.key === selectionKey(s)

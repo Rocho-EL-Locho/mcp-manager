@@ -26,11 +26,14 @@ use crate::config_read::{
     settings_path,
 };
 use crate::models::AppError;
+use crate::toggles::{write_private, write_private_temp};
 
 /// Manifest eines Snapshots (`manifest.json` im Snapshot-Verzeichnis).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotManifest {
-    /// "<unix_ts>-<nanos>" – zugleich der Verzeichnisname.
+    /// "<unix_ts>-<nanos>" – zugleich der Verzeichnisname. Beim Auflisten wird
+    /// sie aus dem Verzeichnisnamen gesetzt (nicht aus dem Manifest-Inhalt) und
+    /// vor jeder Pfad-Bildung validiert (siehe `valid_id`).
     pub id: String,
     /// Erstellungszeit (Unix-Sekunden).
     pub created_at: u64,
@@ -78,29 +81,41 @@ fn set_mode(path: &Path, mode: u32) {
 #[cfg(not(unix))]
 fn set_mode(_path: &Path, _mode: u32) {}
 
-/// Schreibt Bytes in eine Datei, die unter Unix direkt mit Modus 0600 angelegt
-/// wird (kein kurzes world-readable-Fenster – die Inhalte können Secrets
-/// enthalten). Muster wie `stash::save`.
-fn write_private(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .map_err(|e| AppError::Io(e.to_string()))?;
-        f.write_all(bytes)
-            .map_err(|e| AppError::Io(e.to_string()))?;
+/// Obergrenze für die Länge einer Snapshot-Id (das erzeugte Format
+/// `<unix_ts>-<nanos:09>` ist rund 20 Zeichen lang).
+const MAX_ID_LEN: usize = 64;
+
+/// Prüft, ob `id` eine unbedenkliche Snapshot-Id ist.
+///
+/// Die Id landet in `root.join(id)` und steuert damit `remove_dir_all` bzw. den
+/// Restore – ein `..` darin würde aus dem Löschen eines Snapshots das Löschen
+/// eines beliebigen Verzeichnisses machen. Erlaubt ist deshalb ausschließlich
+/// das selbst erzeugte Format: nicht leer, höchstens [`MAX_ID_LEN`] Zeichen,
+/// nur ASCII-Ziffern und Bindestrich – und in der Pfad-Zerlegung genau eine
+/// normale Komponente. Damit sind `/`, `..`, `.` und absolute Pfade
+/// ausgeschlossen.
+fn valid_id(id: &str) -> bool {
+    if id.is_empty() || id.len() > MAX_ID_LEN {
+        return false;
     }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, bytes).map_err(|e| AppError::Io(e.to_string()))?;
+    if !id.bytes().all(|b| b.is_ascii_digit() || b == b'-') {
+        return false;
     }
-    Ok(())
+    let mut comps = Path::new(id).components();
+    let einzelne_komponente = matches!(
+        comps.next(),
+        Some(std::path::Component::Normal(c)) if c.to_str() == Some(id)
+    );
+    einzelne_komponente && comps.next().is_none()
+}
+
+/// Prüft die Id und liefert das zugehörige Snapshot-Verzeichnis. Einziger Weg,
+/// aus einer von außen kommenden Id einen Pfad zu machen.
+fn snapshot_dir(root: &Path, id: &str) -> Result<PathBuf, AppError> {
+    if !valid_id(id) {
+        return Err(AppError::Io(format!("ungültige Snapshot-Id: {id}")));
+    }
+    Ok(root.join(id))
 }
 
 /// Legt ein Verzeichnis an und schränkt es (Unix) auf 0700 ein.
@@ -226,19 +241,34 @@ fn list_in(root: &Path) -> Result<Vec<SnapshotManifest>, AppError> {
         Err(_) => return Ok(out),
     };
     for entry in entries.flatten() {
-        if !entry.path().is_dir() {
+        // `file_type()` stammt aus dem Verzeichniseintrag und folgt keinen
+        // Symlinks – ein untergeschobener Symlink taucht gar nicht erst als
+        // Snapshot auf (und wäre über `delete` auch nicht entfernbar).
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
         let id = entry.file_name().to_string_lossy().to_string();
-        let manifest_path = entry.path().join("manifest.json");
-        match std::fs::read_to_string(&manifest_path)
+        // Konsistenz mit `delete_in`/`restore_in`: was dort abgelehnt würde,
+        // wird hier gar nicht erst angeboten – sonst stünde ein nicht
+        // löschbarer Eintrag in der Liste.
+        if !valid_id(&id) {
+            continue;
+        }
+        let parsed = std::fs::read_to_string(entry.path().join("manifest.json"))
             .ok()
-            .and_then(|t| serde_json::from_str::<SnapshotManifest>(&t).ok())
-        {
-            Some(m) => out.push(m),
+            .and_then(|t| serde_json::from_str::<SnapshotManifest>(&t).ok());
+        match parsed {
+            Some(mut m) => {
+                // Maßgeblich ist der Verzeichnisname, nicht der Manifest-Inhalt:
+                // eine Id aus dem Inhalt könnte auf ein fremdes Verzeichnis
+                // zeigen (kopierter Snapshot, manipulierte manifest.json).
+                m.id = id;
+                m.corrupt = false;
+                out.push(m);
+            }
             // Fehlendes/kaputtes Manifest: als beschädigt listen (nur löschbar).
             None => out.push(SnapshotManifest {
-                id: id.clone(),
+                id,
                 created_at: 0,
                 note: Some("(beschädigt)".into()),
                 auto: false,
@@ -268,7 +298,7 @@ fn restore_in(
     only_paths: Option<Vec<String>>,
     retention: u32,
 ) -> Result<(), AppError> {
-    let snap_dir = root.join(id);
+    let snap_dir = snapshot_dir(root, id)?;
     let manifest = read_manifest(&snap_dir)?;
 
     // Zwei-Phasen-Restore: erst ALLE Ziele vorbereiten (Temp-Dateien schreiben
@@ -329,15 +359,16 @@ fn restore_in(
                     return Err(AppError::Io(e.to_string()));
                 }
             };
-            let fname = target
-                .file_name()
-                .and_then(|f| f.to_str())
-                .unwrap_or("datei");
-            let tmp = parent.join(format!(".{fname}.mcpmgr-restore.tmp"));
-            if let Err(e) = write_private(&tmp, &bytes) {
-                cleanup(&to_rename, &created_dirs);
-                return Err(e);
-            }
+            // Temp-Datei mit unvorhersagbarem Namen, exklusiv angelegt und ohne
+            // Symlinks zu folgen: das Zielverzeichnis (z. B. ein Projektordner)
+            // ist nicht zwingend nutzer-privat.
+            let tmp = match write_private_temp(parent, &bytes) {
+                Ok(p) => p,
+                Err(e) => {
+                    cleanup(&to_rename, &created_dirs);
+                    return Err(e);
+                }
+            };
             to_rename.push((tmp, target));
         } else if target.exists() && parent.is_dir() {
             // Existierte beim Snapshot nicht -> beim Restore entfernen.
@@ -381,8 +412,13 @@ pub fn delete(id: &str) -> Result<(), AppError> {
 }
 
 fn delete_in(root: &Path, id: &str) -> Result<(), AppError> {
-    let dir = root.join(id);
-    if dir.is_dir() {
+    let dir = snapshot_dir(root, id)?;
+    // `symlink_metadata` folgt keinem Symlink: nur ein echtes Verzeichnis wird
+    // entfernt – dasselbe Kriterium, nach dem `list_in` überhaupt auflistet.
+    if std::fs::symlink_metadata(&dir)
+        .map(|m| m.is_dir())
+        .unwrap_or(false)
+    {
         std::fs::remove_dir_all(&dir).map_err(|e| AppError::Io(e.to_string()))?;
     }
     Ok(())
@@ -435,6 +471,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Namen aller in `dir` zurückgebliebenen Temp-Dateien.
+    fn leftover_temps(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with(".mcpmgr-") && n.ends_with(".tmp"))
+            .collect()
     }
 
     #[test]
@@ -629,9 +675,9 @@ mod tests {
             "B1",
             "b bleibt unverändert"
         );
-        // Keine Temp-Dateien zurückgelassen.
+        // Keine Temp-Dateien zurückgelassen (Namen sind zufällig -> Ordner scannen).
         assert!(
-            !base.join(".a.json.mcpmgr-restore.tmp").exists(),
+            leftover_temps(&base).is_empty(),
             "Temp-Datei aufgeräumt"
         );
     }
@@ -709,6 +755,99 @@ mod tests {
         let listed = list_in(&root).unwrap();
         assert_eq!(listed.len(), 1);
         assert!(listed[0].corrupt);
+    }
+
+    #[test]
+    fn id_validierung_lehnt_pfad_traversal_ab() {
+        assert!(valid_id("1234-000000000"), "erzeugtes Format ist gültig");
+        assert!(valid_id("1"));
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../..",
+            "../opfer",
+            "/etc",
+            "a/b",
+            "1234-000000000/..",
+            "beschädigt",
+            "abc",
+            ".hidden",
+        ] {
+            assert!(!valid_id(bad), "muss abgelehnt werden: {bad:?}");
+        }
+        assert!(
+            !valid_id(&"1".repeat(MAX_ID_LEN + 1)),
+            "Längenlimit greift"
+        );
+    }
+
+    #[test]
+    fn loeschen_und_restore_lehnen_traversal_id_ab() {
+        let base = tmp("traversal");
+        let root = base.join("snapshots");
+        std::fs::create_dir_all(&root).unwrap();
+        let opfer = base.join("opfer");
+        write(&opfer.join("wichtig.txt"), "bleibt");
+
+        assert!(
+            delete_in(&root, "../opfer").is_err(),
+            "Pfad-Traversal beim Löschen abgelehnt"
+        );
+        assert!(
+            opfer.join("wichtig.txt").exists(),
+            "fremdes Verzeichnis unangetastet"
+        );
+        assert!(
+            restore_in(&root, "../opfer", None, 20).is_err(),
+            "Pfad-Traversal beim Restore abgelehnt"
+        );
+    }
+
+    #[test]
+    fn liste_nimmt_die_id_aus_dem_verzeichnisnamen() {
+        // Regression: eine kopierte/manipulierte manifest.json darf die Id nicht
+        // bestimmen – sonst zeigte „Löschen" auf ein fremdes Verzeichnis.
+        let base = tmp("id-aus-dirname");
+        let root = base.join("snapshots");
+        let a = base.join("a.json");
+        write(&a, "A");
+        let m = create_in(&root, &[(a.clone(), true)], None, false, 20).unwrap();
+
+        let manifest_path = root.join(&m.id).join("manifest.json");
+        let mut roh: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        roh["id"] = serde_json::json!("../../opfer");
+        std::fs::write(&manifest_path, serde_json::to_string(&roh).unwrap()).unwrap();
+
+        let listed = list_in(&root).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, m.id, "Id kommt aus dem Verzeichnisnamen");
+        // ... und ist damit auch löschbar.
+        delete_in(&root, &listed[0].id).unwrap();
+        assert!(list_in(&root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn auflisten_und_loeschen_sind_konsistent() {
+        let base = tmp("konsistenz");
+        let root = base.join("snapshots");
+        // Gültiger Verzeichnisname, kaputtes Manifest -> gelistet UND löschbar.
+        let kaputt = root.join("1234-000000000");
+        std::fs::create_dir_all(&kaputt).unwrap();
+        std::fs::write(kaputt.join("manifest.json"), "{ kaputt").unwrap();
+        // Unzulässiger Verzeichnisname -> weder gelistet noch löschbar.
+        let fremd = root.join("fremdes-verzeichnis");
+        std::fs::create_dir_all(&fremd).unwrap();
+
+        let listed = list_in(&root).unwrap();
+        assert_eq!(listed.len(), 1, "nur der gültige Eintrag wird angeboten");
+        assert_eq!(listed[0].id, "1234-000000000");
+        for m in &listed {
+            delete_in(&root, &m.id).expect("jeder gelistete Snapshot ist löschbar");
+        }
+        assert!(delete_in(&root, "fremdes-verzeichnis").is_err());
+        assert!(fremd.is_dir(), "unbekanntes Verzeichnis bleibt liegen");
     }
 
     /// Opt-in-Smoketest gegen die echte Umgebung dieser Maschine: erstellt einen

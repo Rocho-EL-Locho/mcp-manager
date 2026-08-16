@@ -25,7 +25,7 @@ export interface ServerPreset {
 
 /// Transport eines Presets ableiten (für Badges im Auswahl-Schritt).
 export function presetTransport(p: ServerPreset): "stdio" | "http" | "sse" {
-  return transportOfEntry(p.entry) ?? "stdio";
+  return transportOfEntry(p.entry);
 }
 
 /// Tiefe Kopie der Vorlage, damit das Formular den Katalog nie mutiert.

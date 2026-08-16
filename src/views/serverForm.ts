@@ -5,6 +5,7 @@ import { addServer, updateServer, revealServerEntry } from "../ipc";
 import { openModal } from "../modal";
 import type { ServerPreset } from "../presets";
 import { toast } from "../toast";
+import { transportOfEntry } from "../transport";
 
 export interface ServerFormOptions {
   mode: "add" | "edit";
@@ -130,10 +131,12 @@ export async function openServerForm(opts: ServerFormOptions): Promise<void> {
 
   // Ursprüngliches type merken, um bei stdio keinen "type"-Key neu hinzuzufügen.
   const hadType = initEntry.type != null;
-  // type normalisieren: nur stdio/http/sse sind gültige Optionen, sonst aus url ableiten.
-  const initTransport = ["stdio", "http", "sse"].includes(initEntry.type ?? "")
-    ? (initEntry.type as string)
-    : (initEntry.url ? "http" : "stdio");
+  // type normalisieren: nur stdio/http/sse sind gültige Optionen, sonst aus url
+  // ableiten. Bewusst über die GEMEINSAME Ableitung – eine eigene ohne die
+  // `/sse`-Regel würde `{"url": "…/sse"}` ohne explizites `type` als „http"
+  // vorbelegen, und weil beim Speichern `type` immer geschrieben wird, kippte
+  // ein beliebiger unbeteiligter Edit den Server dauerhaft von sse auf http.
+  const initTransport: string = transportOfEntry(initEntry);
 
   // Felder
   const nameInput = h("input", { class: "inp" }) as HTMLInputElement;

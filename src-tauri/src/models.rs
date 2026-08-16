@@ -218,8 +218,11 @@ pub struct ConflictDefinition {
     pub project_path: Option<String>,
     /// Maskierte Kurzbeschreibung (keine Secrets ins Webview).
     pub summary: String,
-    /// Hash über die normalisierte Definition – nur für den Gleichheitsvergleich.
-    pub fingerprint: u64,
+    // BEWUSST KEIN `fingerprint`: der Hash wird über die UNMASKIERTE Definition
+    // (inkl. env/headers im Klartext) gebildet. Ihn zu serialisieren ließe einen
+    // deterministischen 64-Bit-Hash eines Secrets die Maskierungsgrenze
+    // überschreiten – ohne Nutzen, denn der Gleichheitsvergleich passiert im
+    // Backend und steht dem Frontend als `ConflictInfo::identical` zur Verfügung.
 }
 
 /// Ein Namenskonflikt: derselbe Servername in mehreren Scopes.

@@ -3,8 +3,17 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { startLogSession, stopLogSession, logSessionBuffer } from "../ipc";
 import type { LogLine, MergedServer, Scope } from "../ipc";
 import { toast } from "../toast";
+import { LOG_RING_CAPACITY } from "../constants";
 
 const EVENT = "mcp-log";
+
+/// Nutzlast eines `mcp-log`-Events. Der Kanalname ist fest, deshalb trägt jedes
+/// Batch die Session-Id: eine eben beendete Vorgänger-Session schickt noch ihre
+/// `closed`-Zeile hinterher, die nicht als eigenes Ende gedeutet werden darf.
+interface LogBatch {
+  sessionId: string;
+  lines: LogLine[];
+}
 
 export interface LogViewCallbacks {
   /// Nach erfolgreichem Start (Session-Id) – für das „Diagnose läuft"-Badge.
@@ -32,6 +41,15 @@ export function createLogView(
   let unlisten: UnlistenFn | null = null;
   const lines: LogLine[] = [];
   const seen = new Set<number>();
+  /// Kleinste noch gehaltene `seq`. Alles darunter wurde bereits verdrängt und
+  /// darf über einen späteren Backfill nicht erneut (und dann unsortiert)
+  /// einlaufen.
+  let oldestKeptSeq = 0;
+  /// Batches, die eintreffen, bevor die eigene Session-Id bekannt ist. Der
+  /// Listener läuft bewusst VOR dem Start, damit keine Handshake-Zeile verloren
+  /// geht; verwerfen statt puffern würde sie erst über den Backfill und damit in
+  /// falscher Reihenfolge nachliefern.
+  let pending: LogBatch[] | null = null;
   let filter = "";
   let autoscroll = true;
 
@@ -63,8 +81,30 @@ export function createLogView(
     scrollToBottom();
   };
 
+  /// Verdrängt die ältesten Zeilen, sobald die Ring-Kapazität überschritten ist –
+  /// Array, Dedup-Set und DOM-Knoten gemeinsam. Der DOM enthält genau die zum
+  /// aktuellen Filter passenden Zeilen in derselben Reihenfolge, daher gehört
+  /// zum verdrängten Eintrag der erste Knoten – aber nur, wenn er sichtbar war.
+  const evictOverflow = () => {
+    while (lines.length > LOG_RING_CAPACITY) {
+      const dropped = lines.shift();
+      if (!dropped) break;
+      seen.delete(dropped.seq);
+      oldestKeptSeq = dropped.seq + 1;
+      if (matches(dropped)) panel.firstElementChild?.remove();
+    }
+  };
+
+  /// Alles verwerfen (neue Session: `seq` zählt wieder bei 0).
+  const resetBuffer = () => {
+    lines.length = 0;
+    seen.clear();
+    oldestKeptSeq = 0;
+    clear(panel);
+  };
+
   const addLine = (l: LogLine) => {
-    if (seen.has(l.seq)) return;
+    if (l.seq < oldestKeptSeq || seen.has(l.seq)) return;
     seen.add(l.seq);
     lines.push(l);
     if (l.kind === "closed") {
@@ -77,10 +117,22 @@ export function createLogView(
       panel.append(lineNode(l));
       scrollToBottom();
     }
+    evictOverflow();
   };
 
   const handleBatch = (batch: LogLine[]) => {
     for (const l of batch) addLine(l);
+  };
+
+  /// Ein eingehendes Event: puffern, solange die eigene Id noch fehlt, sonst
+  /// fremde (alte) Sessions verwerfen.
+  const handleEvent = (batch: LogBatch) => {
+    if (pending) {
+      pending.push(batch);
+      return;
+    }
+    if (batch.sessionId !== sessionId) return;
+    handleBatch(batch.lines);
   };
 
   // --- Steuerleiste -------------------------------------------------------
@@ -115,20 +167,30 @@ export function createLogView(
 
   const doStart = async () => {
     startBtn.disabled = true;
+    // Ab jetzt puffern: die Id der eigenen Session steht erst nach dem Start fest.
+    pending = [];
     try {
       // Zuerst lauschen, DANN starten – so gehen keine Handshake-Zeilen verloren.
       if (!unlisten) {
-        unlisten = await listen<{ lines: LogLine[] }>(EVENT, (e) => handleBatch(e.payload.lines));
+        unlisten = await listen<LogBatch>(EVENT, (e) => handleEvent(e.payload));
       }
-      sessionId = await startLogSession(server.name, scope, server.project_path ?? undefined);
-      cb.onStarted(sessionId);
+      const id = await startLogSession(server.name, scope, server.project_path ?? undefined);
+      // Reihenfolge wichtig: erst leeren (die `seq` der neuen Session startet
+      // wieder bei 0 und kollidierte sonst mit dem Dedup-Set der alten).
+      resetBuffer();
+      sessionId = id;
+      cb.onStarted(id);
       setRunning(true);
+      const buffered = pending;
+      pending = null;
+      for (const b of buffered) if (b.sessionId === id) handleBatch(b.lines);
       // Ring-Backfill (falls schon Zeilen vor dem Listener anfielen) – dedup per seq.
-      handleBatch(await logSessionBuffer(sessionId));
+      handleBatch(await logSessionBuffer(id));
     } catch (e) {
       toast("Diagnose-Session fehlgeschlagen: " + String(e), "error");
       setRunning(false);
     } finally {
+      pending = null;
       startBtn.disabled = false;
     }
   };
@@ -168,8 +230,9 @@ export function createLogView(
   if (activeSessionId) {
     setRunning(true);
     void (async () => {
+      // Andocken: die Id ist bereits bekannt, es muss nicht gepuffert werden.
       if (!unlisten) {
-        unlisten = await listen<{ lines: LogLine[] }>(EVENT, (e) => handleBatch(e.payload.lines));
+        unlisten = await listen<LogBatch>(EVENT, (e) => handleEvent(e.payload));
       }
       handleBatch(await logSessionBuffer(activeSessionId));
     })();

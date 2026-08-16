@@ -433,6 +433,9 @@ export interface DetailOptions {
   activeLogSession?: string | null;
   /// Meldet Start (Id) / Stop (null) einer Log-Session – für das Listen-Badge.
   onLogSessionChange?: (server: MergedServer, id: string | null) => void;
+  /// Aktuell gewählter Projekt-Kontext (`undefined` = kein Projekt gewählt).
+  /// Wird beim Scope-Wechsel als ZIEL-Projekt gebraucht.
+  projectPath?: string;
 }
 
 /// Öffnet ein Formular-Modal zum Duplizieren eines Servers (Original bleibt bestehen).
@@ -669,12 +672,33 @@ export function openDetail(server: MergedServer, opts: DetailOptions = {}): void
     const moveBtn = h("button", { class: "btn btn-small" }, "Verschieben");
     moveBtn.addEventListener("click", () => {
       const target = select.value as Scope;
+      // Zielprojekt MUSS mit: ohne den Parameter fällt das Backend aufs
+      // Home-Verzeichnis zurück und legt dort an. Weil die Verifikation dann
+      // ebenfalls Home liest, bleibt der Fehler unentdeckt – und danach wird die
+      // Quelle korrekt gelöscht: der Server verschwindet aus dem Projekt und
+      // liegt unbemerkt im Home-Projekt.
+      const targetProject = opts.projectPath ?? server.project_path ?? undefined;
+      // user-Scope liegt immer global in ~/.claude.json, unabhängig vom Projekt.
+      const targetLabel =
+        target === "user" ? "global (~/.claude.json)" : (targetProject ?? "Home-Verzeichnis");
       openConfirm({
         title: `Scope ändern: ${server.name}`,
         message: `„${server.name}" von ${currentScope} nach ${target} verschieben? Zuerst im Ziel anlegen, dann aus der Quelle entfernen.`,
+        extra: h(
+          "p",
+          { class: "muted" },
+          "Ziel: ",
+          h("span", { class: "mono", text: targetLabel }),
+        ),
         confirmLabel: "Verschieben",
         onConfirm: async () => {
-          await setScope(server.name, currentScope, target, server.project_path ?? undefined, undefined);
+          await setScope(
+            server.name,
+            currentScope,
+            target,
+            server.project_path ?? undefined,
+            targetProject,
+          );
         },
         onDone: () => {
           toast(`Scope → ${target}`);
