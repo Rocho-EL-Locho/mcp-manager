@@ -53,10 +53,26 @@ pub struct LogLine {
     pub text: String,
 }
 
+/// Poll-Abstand, in dem der Monitor-Thread das Kind unter dem Reap-Lock abfragt.
+const REAP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Serialisiert das Ernten des Kindprozesses gegen jedes `killpg`.
+///
+/// `true`, sobald der Monitor den Prozess geerntet hat: ab dann ist die PGID
+/// freigegeben und darf NICHT mehr signalisiert werden – nach PID-
+/// Wiederverwendung träfe das Signal sonst eine fremde Prozessgruppe des
+/// Nutzers. Der Monitor erntet nur unter diesem Lock und setzt das Flag darin;
+/// `kill()` und der Watchdog halten denselben Lock über Prüfung UND Signal.
+/// Ein Lock **vor** `child.wait()` ginge nicht – er müsste über die gesamte
+/// Session gehalten werden und „Stoppen" liefe in einen Deadlock; daher pollt
+/// der Monitor mit `try_wait`.
+type ReapFlag = Arc<Mutex<bool>>;
+
 /// Handle einer laufenden Session (im `AppState` unter der Session-Id gehalten).
 pub struct LogSessionHandle {
     pgid: i32,
     stop: Arc<AtomicBool>,
+    reaped: ReapFlag,
     ring: Arc<Mutex<VecDeque<LogLine>>>,
     /// stdin offen halten – ein Drop gäbe dem Server EOF auf stdin (viele beenden
     /// sich dann). Wird beim Kill mit der Prozessgruppe ohnehin geschlossen.
@@ -74,18 +90,31 @@ impl LogSessionHandle {
             .collect()
     }
 
-    /// Beendet die gesamte Prozessgruppe hart (idempotent).
     pub fn kill(&self) {
         self.stop.store(true, Ordering::SeqCst);
-        unsafe {
-            libc::killpg(self.pgid, libc::SIGKILL);
+        // Prüfung und Signal unter demselben Lock, unter dem der Monitor erntet:
+        // sonst ginge das killpg auf eine bereits freigegebene Prozessgruppe.
+        let reaped = self.reaped.lock().unwrap_or_else(|e| e.into_inner());
+        if !*reaped {
+            unsafe {
+                libc::killpg(self.pgid, libc::SIGKILL);
+            }
         }
     }
 }
 
 fn truncate_line(mut s: String) -> String {
     if s.len() > MAX_LINE {
-        s.truncate(MAX_LINE);
+        // Auf die nächstkleinere ZEICHENgrenze kürzen. `String::truncate`
+        // paniked, wenn die Byte-Grenze mitten in ein Mehrbyte-Zeichen fällt –
+        // und der Text kommt aus `from_utf8_lossy` beliebiger Server-Ausgabe
+        // (ein Umlaut in einem Traceback genügt). Der Reader-Thread stürbe
+        // still, der Strom lieferte nichts mehr, die Ansicht wirkte eingefroren.
+        let mut end = MAX_LINE;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
         s.push_str("… (gekürzt)");
     }
     s
@@ -199,21 +228,39 @@ pub fn start(
     })?;
 
     let pgid = child.id() as i32;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| AppError::Io("stdin nicht verfügbar".into()))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| AppError::Io("stdout nicht verfügbar".into()))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| AppError::Io("stderr nicht verfügbar".into()))?;
+    // Auf jedem Fehlerpfad NACH dem spawn muss die Prozessgruppe getötet und das
+    // Kind geerntet werden: `Child::drop` tut beides nicht, sonst bliebe ein
+    // verwaister npx/uvx-Prozess samt Zombie zurück (Muster wie
+    // `introspect::cleanup`).
+    let mut take_pipes = || -> Result<_, AppError> {
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| AppError::Io("stdin nicht verfügbar".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| AppError::Io("stdout nicht verfügbar".into()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| AppError::Io("stderr nicht verfügbar".into()))?;
+        Ok((stdin, stdout, stderr))
+    };
+    let (mut stdin, stdout, stderr) = match take_pipes() {
+        Ok(pipes) => pipes,
+        Err(e) => {
+            unsafe {
+                libc::killpg(pgid, libc::SIGKILL);
+            }
+            let _ = child.wait();
+            return Err(e);
+        }
+    };
 
     let ring = Arc::new(Mutex::new(VecDeque::with_capacity(RING_CAPACITY)));
     let stop = Arc::new(AtomicBool::new(false));
+    let reaped: ReapFlag = Arc::new(Mutex::new(false));
     let seq = Arc::new(AtomicU64::new(0));
 
     let (tx, rx) = mpsc::sync_channel::<(String, String)>(CHANNEL_CAPACITY);
@@ -277,9 +324,33 @@ pub fn start(
     // Monitor-Thread: besitzt den Child, wartet aufs Ende, meldet `closed`.
     {
         let stop = stop.clone();
+        let reaped = reaped.clone();
         let tx_close = tx.clone();
         std::thread::spawn(move || {
-            let code = child.wait().ok().and_then(|s| s.code());
+            // Gepollt statt blockierend gewartet: das Ernten muss unter dem
+            // Reap-Lock passieren (siehe `ReapFlag`).
+            let code = loop {
+                let done = {
+                    let mut reaped = reaped.lock().unwrap_or_else(|e| e.into_inner());
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            *reaped = true;
+                            Some(status.code())
+                        }
+                        Ok(None) => None,
+                        // Kind nicht mehr abfragbar: als geerntet behandeln,
+                        // damit auf die PGID kein Signal mehr geht.
+                        Err(_) => {
+                            *reaped = true;
+                            Some(None)
+                        }
+                    }
+                };
+                match done {
+                    Some(code) => break code,
+                    None => std::thread::sleep(REAP_POLL_INTERVAL),
+                }
+            };
             let text = if stop.load(Ordering::SeqCst) {
                 "Diagnose-Session beendet.".to_string()
             } else {
@@ -297,6 +368,7 @@ pub fn start(
     // Watchdog: nach SESSION_TIMEOUT killen, falls nicht schon gestoppt.
     {
         let stop = stop.clone();
+        let reaped = reaped.clone();
         std::thread::spawn(move || {
             let deadline = Instant::now() + SESSION_TIMEOUT;
             while Instant::now() < deadline {
@@ -306,8 +378,13 @@ pub fn start(
                 std::thread::sleep(Duration::from_secs(1));
             }
             if !stop.swap(true, Ordering::SeqCst) {
-                unsafe {
-                    libc::killpg(pgid, libc::SIGKILL);
+                // Wie in `kill()`: nur signalisieren, solange das Kind nicht
+                // geerntet und die PGID damit noch die unsere ist.
+                let reaped = reaped.lock().unwrap_or_else(|e| e.into_inner());
+                if !*reaped {
+                    unsafe {
+                        libc::killpg(pgid, libc::SIGKILL);
+                    }
                 }
             }
         });
@@ -320,6 +397,7 @@ pub fn start(
     Ok(LogSessionHandle {
         pgid,
         stop,
+        reaped,
         ring,
         _stdin: stdin,
     })
@@ -354,6 +432,32 @@ mod tests {
         let long = "a".repeat(MAX_LINE + 500);
         let out = truncate_line(long);
         assert!(out.len() <= MAX_LINE + 32);
+        assert!(out.ends_with("(gekürzt)"));
+    }
+
+    #[test]
+    fn truncate_never_splits_a_multibyte_char() {
+        // Umlaute sind 2 Byte: je nach Vorlauf fällt MAX_LINE davor, mitten
+        // hinein oder dahinter. Alle drei Fälle dürfen nicht paniken und müssen
+        // gültiges UTF-8 liefern.
+        for pad in [MAX_LINE - 1, MAX_LINE, MAX_LINE + 1] {
+            let s = format!("{}{}", "a".repeat(pad), "ä".repeat(400));
+            let out = truncate_line(s);
+            assert!(out.ends_with("(gekürzt)"), "pad={pad}");
+            // Kein halbes Zeichen: das gekürzte Stück endet auf einer Zeichengrenze.
+            let body = out.trim_end_matches("… (gekürzt)");
+            assert!(body.len() <= MAX_LINE, "pad={pad}");
+            assert!(std::str::from_utf8(body.as_bytes()).is_ok(), "pad={pad}");
+        }
+    }
+
+    #[test]
+    fn truncate_handles_line_of_pure_multibyte() {
+        // Ein Füllbyte vor lauter 4-Byte-Zeichen: MAX_LINE liegt damit garantiert
+        // 3 Byte tief in einem Emoji – genau hier paniked der alte Code.
+        let s = format!("x{}", "🔧".repeat(MAX_LINE));
+        assert!(!s.is_char_boundary(MAX_LINE), "Test träfe sonst keine Grenze");
+        let out = truncate_line(s);
         assert!(out.ends_with("(gekürzt)"));
     }
 

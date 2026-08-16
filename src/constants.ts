@@ -21,3 +21,11 @@ export const AUTO_REFRESH_MAX = 10080;
  *  (`settings.rs::validate`, `RETENTION_MIN`/`RETENTION_MAX`). */
 export const RETENTION_MIN = 1;
 export const RETENTION_MAX = 500;
+
+/** Zeilen-Obergrenze der Live-Diagnose-Ansicht – Spiegel von
+ *  `logview.rs::RING_CAPACITY`. Das Backend deckelt seinen Ring, emittiert aber
+ *  jede Zeile; ohne dieselbe Grenze im Webview sammeln Array und DOM unbegrenzt
+ *  (ein Server in der stderr-Schleife erzeugt so hunderttausende Knoten, und
+ *  stirbt der Webview daran, läuft der Exit-Hook nicht mehr → verwaiste
+ *  Prozessgruppe). Beim Anhängen wird vorne verworfen. */
+export const LOG_RING_CAPACITY = 2000;

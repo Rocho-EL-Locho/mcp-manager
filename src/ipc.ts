@@ -524,8 +524,8 @@ export interface ConflictDefinition {
   scope: Scope;
   project_path: string | null;
   summary: string;
-  /** Fingerprint nur informativ; der Gleichheitsvergleich kommt aus `identical`. */
-  fingerprint: number;
+  // Kein `fingerprint`: er wird über die unmaskierte Definition gebildet und
+  // bleibt deshalb im Backend. Der Gleichheitsvergleich kommt aus `identical`.
 }
 
 /** Namenskonflikt über Scopes (Spiegel von Rust `ConflictInfo`). */

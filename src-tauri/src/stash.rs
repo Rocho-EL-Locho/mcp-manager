@@ -61,44 +61,18 @@ fn save(stash: &Stash) -> Result<(), AppError> {
         .ok_or_else(|| AppError::Io("kein Config-Verzeichnis".into()))?;
     std::fs::create_dir_all(parent).map_err(|e| AppError::Io(e.to_string()))?;
 
-    if path.exists() {
-        let bak = parent.join("stash.json.bak");
-        if std::fs::copy(&path, &bak).is_ok() {
-            // Backup enthält Klartext-Secrets -> ebenfalls auf 0600 einschränken.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&bak, std::fs::Permissions::from_mode(0o600));
-            }
-        }
+    // Bisherigen Stand als .bak sichern. Auch das Backup enthält Klartext-
+    // Secrets, wird also direkt mit 0600 angelegt (kein Nachträglich-Einschränken
+    // und damit kein offenes Fenster). Best-effort: ein fehlgeschlagenes Backup
+    // darf das Speichern nicht verhindern.
+    if let Ok(alt) = std::fs::read(&path) {
+        let _ = crate::toggles::write_private(&parent.join("stash.json.bak"), &alt);
     }
 
-    let tmp = parent.join(".stash.json.tmp");
     let text = serde_json::to_string_pretty(stash).map_err(|e| AppError::Parse(e.to_string()))?;
-
-    // Temp-Datei unter Unix direkt mit Modus 0600 anlegen, BEVOR Klartext-Secrets
-    // hineingeschrieben werden – kein kurzes world-/group-readable-Fenster.
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)
-            .map_err(|e| AppError::Io(e.to_string()))?;
-        f.write_all(text.as_bytes())
-            .map_err(|e| AppError::Io(e.to_string()))?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(&tmp, text).map_err(|e| AppError::Io(e.to_string()))?;
-    }
-
-    std::fs::rename(&tmp, &path).map_err(|e| AppError::Io(e.to_string()))?;
-    Ok(())
+    // Gemeinsame Routine: private Temp-Datei (0600, O_NOFOLLOW, unvorhersagbarer
+    // Name) + rename.
+    crate::toggles::atomic_write_bytes(&path, text.as_bytes())
 }
 
 /// Definition ablegen (vor dem Entfernen aufrufen).
