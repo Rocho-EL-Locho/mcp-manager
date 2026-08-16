@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Standard-Berechtigungen. Alle Funktionen laufen über eigene Commands; es werden keine Shell-/FS-Plugins ans Webview freigegeben.",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "notification:default"]
 }

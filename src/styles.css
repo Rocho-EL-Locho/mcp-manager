@@ -38,12 +38,90 @@
   --shadow: 0 10px 30px rgba(0, 0, 0, 0.42);
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35);
 
+  /* Weiche Hintergrund-Aufhellung oben (Body-Verlauf) */
+  --bg-glow: #24231f;
+
   --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
   --font-mono: ui-monospace, "JetBrains Mono", "SFMono-Regular", "Fira Code", Menlo, monospace;
 
   font-family: var(--font-ui);
   font-size: 14px;
   color-scheme: dark;
+}
+
+/* ---------- Themes ----------
+   Basis `:root` (oben) = Dunkel. Es matcht auch data-theme="dark" sowie "system"
+   auf dunklem OS und den Zustand VOR dem ersten JS (kein Attribut) auf dunklem OS.
+
+   Hell greift (a) explizit bei data-theme="light" und (b) auf hellem OS für alles,
+   was NICHT explizit auf Dunkel/Hell gesetzt ist – also "system" UND der Vor-JS-
+   Default. Dadurch folgt die Seite schon vor dem ersten Paint dem OS-Farbschema
+   (kein Dark-Flash), ohne ein von der CSP verbotenes Inline-Skript. Ein explizit
+   gewähltes Theme gewinnt dank höherer Spezifität immer gegen die OS-Präferenz. */
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --bg: #f4f2ee;
+  --surface: #ffffff;
+  --surface-2: #f1efea;
+  --surface-3: #e6e3dc;
+  --border: #e2ded6;
+  --border-strong: #cbc7bd;
+
+  --text: #23211d;
+  --muted: #5f5c54;
+  --faint: #8a877e;
+
+  --accent: #2f8676;
+  --accent-2: #256b5e;
+  --accent-soft: rgba(47, 134, 118, 0.14);
+  --accent-ink: #ffffff;
+
+  --ok: #4f8a35;
+  --ok-soft: rgba(79, 138, 53, 0.14);
+  --warn: #a9781c;
+  --warn-soft: rgba(169, 120, 28, 0.15);
+  --error: #c8483b;
+  --error-soft: rgba(200, 72, 59, 0.13);
+
+  --shadow: 0 10px 30px rgba(30, 28, 24, 0.14);
+  --shadow-sm: 0 1px 2px rgba(30, 28, 24, 0.1);
+  --bg-glow: #ffffff;
+}
+
+@media (prefers-color-scheme: light) {
+  /* „system" und der Vor-JS-Default (kein Attribut) auf hellem OS -> Hell.
+     Explizit Dunkel/Hell sind ausgenommen und regeln sich selbst. */
+  :root:not([data-theme="dark"]):not([data-theme="light"]) {
+    color-scheme: light;
+
+    --bg: #f4f2ee;
+    --surface: #ffffff;
+    --surface-2: #f1efea;
+    --surface-3: #e6e3dc;
+    --border: #e2ded6;
+    --border-strong: #cbc7bd;
+
+    --text: #23211d;
+    --muted: #5f5c54;
+    --faint: #8a877e;
+
+    --accent: #2f8676;
+    --accent-2: #256b5e;
+    --accent-soft: rgba(47, 134, 118, 0.14);
+    --accent-ink: #ffffff;
+
+    --ok: #4f8a35;
+    --ok-soft: rgba(79, 138, 53, 0.14);
+    --warn: #a9781c;
+    --warn-soft: rgba(169, 120, 28, 0.15);
+    --error: #c8483b;
+    --error-soft: rgba(200, 72, 59, 0.13);
+
+    --shadow: 0 10px 30px rgba(30, 28, 24, 0.14);
+    --shadow-sm: 0 1px 2px rgba(30, 28, 24, 0.1);
+    --bg-glow: #ffffff;
+  }
 }
 
 * {
@@ -58,7 +136,7 @@ body {
 body {
   margin: 0;
   /* sanfter neutraler Verlauf von oben statt flachem Digital-Schwarz */
-  background: radial-gradient(130% 90% at 50% -20%, #24231f 0%, var(--bg) 60%);
+  background: radial-gradient(130% 90% at 50% -20%, var(--bg-glow) 0%, var(--bg) 60%);
   background-attachment: fixed;
   color: var(--text);
   -webkit-font-smoothing: antialiased;
@@ -367,8 +445,8 @@ body {
   font-weight: 600;
 }
 .btn-primary:hover:not(:disabled) {
-  background: #6cc3f0;
-  border-color: #6cc3f0;
+  background: var(--accent-2);
+  border-color: var(--accent-2);
 }
 
 .btn-danger {
@@ -524,6 +602,69 @@ body {
   color: var(--warn);
 }
 
+.card.selected {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+/* ---------- Auswahl-Checkbox ---------- */
+.select-box {
+  accent-color: var(--accent);
+  width: 15px;
+  height: 15px;
+  cursor: pointer;
+  flex: none;
+}
+.group-header .select-box {
+  margin-right: 0.1rem;
+}
+
+/* ---------- Filterleiste ---------- */
+.filter-bar {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 0.4rem;
+  flex-wrap: wrap;
+}
+.filter-search {
+  flex: 1 1 14rem;
+  min-width: 10rem;
+}
+.filter-select {
+  flex: 0 0 auto;
+  width: auto;
+}
+
+/* ---------- Bulk-Aktionsleiste ---------- */
+.bulk-bar {
+  display: none;
+}
+.bulk-bar.visible {
+  display: flex;
+  position: sticky;
+  bottom: 0;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.6rem;
+  padding: 0.6rem 0.75rem;
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+}
+.bulk-count {
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+.bulk-list {
+  max-height: 40vh;
+  overflow-y: auto;
+  margin: 0.4rem 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
 /* ---------- Banner ---------- */
 .banner {
   padding: 0.65rem 0.85rem;
@@ -535,8 +676,165 @@ body {
 
 .banner-error {
   border-color: var(--error);
-  color: #ffb7bd;
+  /* theme-abhängig: heller Fehlerton auf dunklem, dunkler auf hellem Grund */
+  color: var(--error);
   background: var(--error-soft);
+}
+
+.banner-warn {
+  border-color: var(--warn);
+  color: var(--warn);
+  background: var(--warn-soft);
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+/* Bare Icon-Button (klickbares Warn-Icon in der Serverliste) */
+.icon-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  color: inherit;
+}
+
+/* ---------- Konflikte ---------- */
+.conflict-banner {
+  width: 100%;
+  cursor: pointer;
+  text-align: left;
+  font-size: 0.85rem;
+}
+.conflict-banner:hover {
+  border-color: var(--warn);
+}
+.conflict-intro {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.6rem;
+  font-size: 0.85rem;
+}
+.conflict-effective {
+  background: var(--accent-soft);
+}
+.conflict-actions {
+  display: flex;
+  gap: 0.4rem;
+  justify-content: flex-end;
+}
+.conflict-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+.conflict-list-item {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.5rem 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  cursor: pointer;
+  text-align: left;
+}
+.conflict-list-item:hover {
+  border-color: var(--accent);
+  background: var(--surface-2);
+}
+.conflict-list-item .muted {
+  margin-left: auto;
+  font-size: 0.78rem;
+}
+
+/* ---------- Tabellen (generisch) ----------
+   Bewusst feature-neutral benannt: benutzt von der Snapshot-Ansicht UND vom
+   Konflikt-Dialog. Vorher hieß das `.snapshots-table` – wer die Snapshot-Optik
+   anfasste, veränderte stumm den Konflikt-Dialog mit. `.table-wrap` gehört dazu
+   (waagerechtes Scrollen statt Layout-Sprengen). */
+.table-wrap {
+  overflow-x: auto;
+}
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+.data-table th,
+.data-table td {
+  text-align: left;
+  padding: 0.5rem 0.65rem;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.data-table th {
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 0.78rem;
+}
+.data-table td.num,
+.data-table th.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- Snapshots ---------- */
+.snapshots-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 0.9rem;
+}
+.snapshots-actions {
+  display: flex;
+  gap: 0.4rem;
+  justify-content: flex-end;
+}
+
+.tag {
+  display: inline-block;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  background: var(--surface-2);
+  color: var(--muted);
+}
+.tag-manual {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.tag-warn {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.restore-files {
+  max-height: 34vh;
+  overflow-y: auto;
+  margin-top: 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+.restore-file {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.25rem 0.35rem;
+  border-radius: var(--radius-sm);
+}
+.restore-file:hover {
+  background: var(--surface-2);
+}
+.restore-file .muted {
+  margin-left: auto;
+  font-size: 0.78rem;
 }
 
 /* ---------- Modal ---------- */
@@ -759,6 +1057,16 @@ body {
   border-top: 1px solid var(--border);
 }
 
+.caps-item-head {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  justify-content: space-between;
+}
+.caps-item-head .btn {
+  flex: none;
+}
+
 .caps-item-name {
   font-size: 0.82rem;
   overflow-wrap: anywhere;
@@ -802,6 +1110,176 @@ body {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   max-height: 16rem;
+  overflow: auto;
+  user-select: text;
+}
+
+/* ---------- Live-Log-Viewer ---------- */
+.logview {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.logview-controls {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+.logview-controls .inp {
+  flex: 1;
+}
+.logview-notice {
+  font-size: 0.75rem;
+}
+.logview-panel {
+  height: 16rem;
+  overflow: auto;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.4rem 0.55rem;
+  font-size: 0.75rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+.log-line {
+  display: block;
+}
+.log-kind {
+  display: inline-block;
+  min-width: 4.5rem;
+  margin-right: 0.5rem;
+  opacity: 0.7;
+  text-transform: uppercase;
+  font-size: 0.68rem;
+}
+.log-stderr {
+  color: var(--muted);
+}
+.log-rpc-out {
+  color: var(--accent);
+}
+.log-rpc-in {
+  color: var(--ok);
+}
+.log-stdout {
+  color: var(--text);
+}
+.log-closed {
+  color: var(--error);
+  font-weight: 600;
+}
+.badge-live {
+  color: var(--ok);
+  border: 1px solid var(--ok);
+  background: var(--ok-soft);
+}
+
+/* ---------- Verlauf / Sparkline ---------- */
+.detail-metrics {
+  margin-top: 0.3rem;
+}
+.sparkline-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+.sparkline {
+  width: 100%;
+  height: 44px;
+  display: block;
+}
+.sparkline-line {
+  stroke: var(--accent);
+  stroke-width: 1.5;
+}
+.sparkline-caption {
+  font-size: 0.75rem;
+}
+.spark-dot {
+  fill: var(--muted);
+}
+.spark-connected {
+  fill: var(--ok);
+}
+.spark-failed {
+  fill: var(--error);
+}
+.spark-needs_auth,
+.spark-pending_approval {
+  fill: var(--warn);
+}
+
+/* ---------- Tool-Playground ---------- */
+.pg {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+.pg-args {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+.pg-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+.pg-json {
+  width: 100%;
+  resize: vertical;
+}
+.pg-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+.pg-result {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.pg-result:empty {
+  display: none;
+}
+.pg-result-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.pg-text {
+  margin: 0;
+  padding: 0.55rem 0.7rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 0.78rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 22rem;
+  overflow: auto;
+  user-select: text;
+}
+.pg-raw > summary {
+  cursor: pointer;
+  font-size: 0.8rem;
+  color: var(--muted);
+  user-select: none;
+}
+.pg-raw > pre {
+  margin: 0.35rem 0 0;
+  padding: 0.55rem 0.7rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 0.76rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 22rem;
   overflow: auto;
   user-select: text;
 }
@@ -866,7 +1344,9 @@ select.inp {
   -webkit-appearance: none;
   background-color: var(--bg);
   color: var(--text);
-  background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12"><path d="M2 4l4 4 4-4" fill="none" stroke="%2357ab9b" stroke-width="1.6"/></svg>');
+  /* Neutrales Grau (Ton von --faint, in Hell wie Dunkel nahezu identisch) statt
+     hartcodiertem Akzent-Teal – background-image kann keine CSS-Variable nutzen. */
+  background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12"><path d="M2 4l4 4 4-4" fill="none" stroke="%2382807a" stroke-width="1.6"/></svg>');
   background-repeat: no-repeat;
   background-position: right 0.6rem center;
   padding-right: 1.9rem;
@@ -878,7 +1358,9 @@ select.inp option {
   color: var(--text);
 }
 
-select.inp:disabled {
+/* Deaktivierte Felder (auch Zukunfts-Features im Einstellungs-Dialog) klar als
+   „nicht editierbar" kennzeichnen – gilt für input/textarea/select gleichermaßen. */
+.inp:disabled {
   color: var(--muted);
   cursor: default;
   opacity: 0.7;
@@ -895,6 +1377,102 @@ select.inp:disabled {
   display: grid;
   grid-template-columns: 1fr 1fr auto;
   gap: 0.4rem;
+}
+
+.kv-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.kv-secret-hint {
+  font-size: 0.7rem;
+  color: var(--accent);
+  padding-left: 0.1rem;
+}
+
+/* ---------- Preset-Kopf im Formular ---------- */
+.preset-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  padding: 0.6rem 0.75rem;
+  margin-bottom: 0.9rem;
+  background: var(--accent-soft);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.preset-head-desc {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.preset-head-docs {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  white-space: nowrap;
+  font-size: 0.8rem;
+  font-weight: 500;
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.preset-head-docs:hover {
+  text-decoration: underline;
+}
+
+/* ---------- Server-Auswahl (Picker) ---------- */
+.picker-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 0.55rem;
+}
+
+.picker-section-label {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--muted);
+  margin: 1rem 0 0.55rem;
+}
+
+.picker-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  text-align: left;
+  padding: 0.7rem 0.8rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s, box-shadow 0.12s;
+}
+
+.picker-card:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  box-shadow: var(--shadow-sm);
+}
+
+.picker-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+}
+
+.picker-card-title {
+  font-weight: 600;
+  font-size: 0.88rem;
+}
+
+.picker-card-desc {
+  font-size: 0.76rem;
+  color: var(--muted);
+  line-height: 1.3;
 }
 
 .form-status {
@@ -1056,6 +1634,15 @@ select.inp:disabled {
   outline-offset: 2px;
 }
 
+/* Deaktivierter Schalter (Zukunfts-Features): ausgegraut, nicht klickbar. */
+.switch-input:disabled + .slider {
+  opacity: 0.45;
+  cursor: default;
+}
+.switch:has(.switch-input:disabled) {
+  cursor: default;
+}
+
 /* ---------- Scope-Wechsel im Detail ---------- */
 .detail-scope {
   margin-top: 1.2rem;
@@ -1120,6 +1707,152 @@ select.inp:disabled {
   font-family: var(--font-mono);
   font-size: 0.72rem;
   color: var(--muted);
+}
+
+/* ---------- Registry-Browser ---------- */
+.registry-searchbar {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 0.6rem;
+}
+.registry-searchbar .inp {
+  flex: 1;
+}
+
+.registry-results {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  max-height: 52vh;
+  overflow: auto;
+}
+
+.registry-card {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.6rem 0.7rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.registry-card-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.registry-card-title {
+  font-weight: 600;
+}
+.registry-card-name {
+  font-size: 0.74rem;
+  overflow-wrap: anywhere;
+}
+.registry-card-desc {
+  font-size: 0.83rem;
+  line-height: 1.5;
+}
+
+.registry-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+
+.registry-card-actions,
+.registry-variant-actions {
+  margin-top: 0.2rem;
+}
+
+.registry-details {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-top: 0.35rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--border);
+}
+
+.registry-variant {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.5rem 0.6rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.registry-variant-head {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+.registry-cmd {
+  font-size: 0.76rem;
+  overflow-wrap: anywhere;
+  color: var(--text);
+}
+
+.registry-envlist {
+  margin: 0;
+  padding-left: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-size: 0.8rem;
+}
+.registry-envdesc {
+  font-size: 0.75rem;
+  line-height: 1.4;
+}
+
+.registry-repo a {
+  color: var(--accent);
+  font-size: 0.82rem;
+}
+.registry-trust {
+  font-size: 0.75rem;
+  border-left: 3px solid var(--border-strong);
+  padding-left: 0.5rem;
+}
+
+.registry-more {
+  margin-top: 0.6rem;
+  display: flex;
+  justify-content: center;
+}
+
+/* ---------- Einstellungen ---------- */
+.settings-group {
+  margin-bottom: 1.4rem;
+}
+.settings-group:last-of-type {
+  margin-bottom: 0;
+}
+
+.settings-group-title {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin: 0 0 0.7rem;
+  padding-bottom: 0.35rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.settings-path-row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+.settings-path-row .inp {
+  flex: 1;
+}
+
+/* Kompaktere Zahlenfelder als volle Breite */
+.settings-form input[type="number"] {
+  width: 8rem;
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -108,6 +108,23 @@ export interface ProjectInfo {
   is_home: boolean;
 }
 
+export type Theme = "system" | "light" | "dark";
+
+/** Persistente App-Einstellungen. Feldnamen = snake_case (serde-Serialisierung). */
+export interface AppSettings {
+  /** Pfad zur claude-CLI; null = automatische Auflösung. */
+  claude_path: string | null;
+  list_timeout_secs: number;
+  mut_timeout_secs: number;
+  /** Auto-Refresh-Intervall in Minuten (0 = aus); steuert `applyAutoRefresh`. */
+  auto_refresh_minutes: number;
+  /** Desktop-Hinweis bei Statusverschlechterung; braucht Auto-Refresh. */
+  notifications: boolean;
+  /** Zahl aufbewahrter automatischer Snapshots. */
+  snapshot_retention: number;
+  theme: Theme;
+}
+
 export async function checkClaude(): Promise<ClaudeInfo> {
   return invoke<ClaudeInfo>("check_claude");
 }
@@ -182,6 +199,54 @@ export async function preflightServer(
   });
 }
 
+/** Eine Zeile der Live-Diagnose-Session (Spiegel von Rust `LogLine`). */
+export interface LogLine {
+  seq: number;
+  ts: number;
+  /** stderr | rpc_out | rpc_in | stdout | closed */
+  kind: string;
+  text: string;
+}
+
+/// Startet eine Live-Diagnose-Session; liefert die Session-Id.
+export async function startLogSession(
+  name: string,
+  scope: Scope,
+  projectPath?: string,
+): Promise<string> {
+  return invoke<string>("start_log_session", { name, scope, projectPath: projectPath ?? null });
+}
+
+/// Beendet eine Diagnose-Session.
+export async function stopLogSession(id: string): Promise<void> {
+  return invoke("stop_log_session", { id });
+}
+
+/// Aktueller Ring-Puffer einer Session (Backfill beim Wieder-Öffnen).
+export async function logSessionBuffer(id: string): Promise<LogLine[]> {
+  return invoke<LogLine[]>("log_session_buffer", { id });
+}
+
+/** Ein Messpunkt der Status-/Latenz-Historie (Spiegel von Rust `MetricPoint`). */
+export interface MetricPoint {
+  ts: number;
+  statusKind: string;
+  connectMs?: number;
+}
+
+/// Status-/Latenz-Historie eines Servers (für die Sparkline im Detail-Modal).
+export async function getMetrics(
+  name: string,
+  scope: Scope,
+  projectPath?: string,
+): Promise<MetricPoint[]> {
+  return invoke<MetricPoint[]>("get_metrics", {
+    name,
+    scope,
+    projectPath: projectPath ?? null,
+  });
+}
+
 /// Gecachtes Introspektions-Ergebnis abrufen, ohne den Server-Prozess zu starten.
 export async function peekIntrospection(
   name: string,
@@ -193,6 +258,66 @@ export async function peekIntrospection(
     scope,
     projectPath: projectPath ?? null,
   });
+}
+
+/** Ergebnis eines Playground-Aufrufs (Spiegel von Rust `PlaygroundResult`). */
+export interface PlaygroundResult {
+  ok: boolean;
+  isError: boolean;
+  result?: unknown;
+  error?: string;
+  notes: string[];
+  logs?: string;
+  durationMs?: number;
+}
+
+/** Playground-Operation (serde tag "kind", snake_case). */
+export type PlaygroundRequest =
+  | { kind: "call_tool"; name: string; arguments: unknown }
+  | { kind: "read_resource"; uri: string }
+  | { kind: "get_prompt"; name: string; arguments: Record<string, string> };
+
+async function playgroundCall(
+  name: string,
+  scope: Scope,
+  projectPath: string | undefined,
+  request: PlaygroundRequest,
+): Promise<PlaygroundResult> {
+  return invoke<PlaygroundResult>("playground_call", {
+    name,
+    scope,
+    projectPath: projectPath ?? null,
+    request,
+  });
+}
+
+export function callTool(
+  name: string,
+  scope: Scope,
+  projectPath: string | undefined,
+  toolName: string,
+  args: unknown,
+): Promise<PlaygroundResult> {
+  return playgroundCall(name, scope, projectPath, { kind: "call_tool", name: toolName, arguments: args });
+}
+
+export function readResource(
+  name: string,
+  scope: Scope,
+  projectPath: string | undefined,
+  uri: string,
+): Promise<PlaygroundResult> {
+  return playgroundCall(name, scope, projectPath, { kind: "read_resource", uri });
+}
+
+export function getPrompt(
+  name: string,
+  scope: Scope,
+  projectPath: string | undefined,
+  promptName: string,
+  args: Record<string, string>,
+): Promise<PlaygroundResult> {
+  return playgroundCall(name, scope, projectPath, { kind: "get_prompt", name: promptName, arguments: args });
 }
 
 export async function addServer(
@@ -217,8 +342,14 @@ export async function removeServer(
   name: string,
   scope: Scope,
   projectPath?: string,
+  skipSnapshot = false,
 ): Promise<void> {
-  return invoke("remove_server", { name, scope, projectPath: projectPath ?? null });
+  return invoke("remove_server", {
+    name,
+    scope,
+    projectPath: projectPath ?? null,
+    skipSnapshot,
+  });
 }
 
 export async function loginServer(name: string): Promise<void> {
@@ -241,8 +372,12 @@ export async function toggleMcpjsonServer(
   return invoke("toggle_mcpjson_server", { name, projectPath: projectPath ?? null, enabled });
 }
 
-export async function toggleUserServer(name: string, enabled: boolean): Promise<void> {
-  return invoke("toggle_user_server", { name, enabled, entry: null });
+export async function toggleUserServer(
+  name: string,
+  enabled: boolean,
+  skipSnapshot = false,
+): Promise<void> {
+  return invoke("toggle_user_server", { name, enabled, entry: null, skipSnapshot });
 }
 
 export interface AssistantResult {
@@ -263,6 +398,56 @@ export async function runClaudeAssistant(
   });
 }
 
+// --- Registry-Browser (offizielle MCP-Registry) ---
+
+export interface RegistryEnvVarInfo {
+  name: string;
+  required: boolean;
+  secret: boolean;
+  description: string | null;
+}
+
+export interface RegistryVariant {
+  kind: string; // npm | pypi | oci | http | sse
+  label: string;
+  entry: ServerEntry;
+  env_vars: RegistryEnvVarInfo[];
+  secret_keys: string[];
+}
+
+export interface RegistryEntryView {
+  name: string;
+  title: string;
+  description: string;
+  version: string;
+  repository_url: string | null;
+  variants: RegistryVariant[];
+}
+
+export interface RegistrySearchPage {
+  servers: RegistryEntryView[];
+  next_cursor: string | null;
+}
+
+export async function searchRegistry(
+  query: string,
+  cursor?: string,
+): Promise<RegistrySearchPage> {
+  return invoke<RegistrySearchPage>("search_registry", {
+    query,
+    cursor: cursor ?? null,
+  });
+}
+
+export async function getSettings(): Promise<AppSettings> {
+  return invoke<AppSettings>("get_settings");
+}
+
+/// Validiert + persistiert die Einstellungen und liefert die normalisierte Fassung.
+export async function setSettings(settings: AppSettings): Promise<AppSettings> {
+  return invoke<AppSettings>("set_settings", { settings });
+}
+
 export async function setScope(
   name: string,
   fromScope: Scope,
@@ -277,4 +462,90 @@ export async function setScope(
     fromProject: fromProject ?? null,
     toProject: toProject ?? null,
   });
+}
+
+export async function cloneServer(
+  name: string,
+  fromScope: Scope,
+  newName: string,
+  toScope: Scope,
+  fromProject?: string,
+  toProject?: string,
+): Promise<void> {
+  return invoke("clone_server", {
+    name,
+    fromScope,
+    newName,
+    toScope,
+    fromProject: fromProject ?? null,
+    toProject: toProject ?? null,
+  });
+}
+
+/** Eine im Snapshot gesicherte Datei (Feldnamen = snake_case, serde). */
+export interface SnapshotFile {
+  original_path: string;
+  stored: string;
+  existed: boolean;
+  size: number;
+  /** Fehlendes Zielverzeichnis beim Restore neu anlegen (globale Config) statt überspringen. */
+  create_parent: boolean;
+}
+
+/** Ein Snapshot der MCP-Konfiguration (Spiegel von Rust `SnapshotManifest`). */
+export interface SnapshotInfo {
+  id: string;
+  created_at: number;
+  note: string | null;
+  auto: boolean;
+  files: SnapshotFile[];
+  /** Manifest fehlte/war unlesbar – dann ist nur Löschen sinnvoll. */
+  corrupt: boolean;
+}
+
+export async function listSnapshots(): Promise<SnapshotInfo[]> {
+  return invoke<SnapshotInfo[]>("list_snapshots");
+}
+
+export async function createSnapshot(note?: string, auto = false): Promise<SnapshotInfo> {
+  return invoke<SnapshotInfo>("create_snapshot", { note: note ?? null, auto });
+}
+
+export async function restoreSnapshot(id: string, onlyPaths?: string[]): Promise<void> {
+  return invoke("restore_snapshot", { id, onlyPaths: onlyPaths ?? null });
+}
+
+export async function deleteSnapshot(id: string): Promise<void> {
+  return invoke("delete_snapshot", { id });
+}
+
+/** Eine Definition innerhalb eines Namenskonflikts (Spiegel von Rust `ConflictDefinition`). */
+export interface ConflictDefinition {
+  scope: Scope;
+  project_path: string | null;
+  summary: string;
+  // Kein Fingerprint: der Gleichheitsvergleich passiert im Backend und kommt
+  // als `identical` (der Hash lief über die unmaskierte Definition).
+}
+
+/** Namenskonflikt über Scopes (Spiegel von Rust `ConflictInfo`). */
+export interface ConflictInfo {
+  name: string;
+  definitions: ConflictDefinition[];
+  /** Scope, dessen Definition effektiv verwendet wird (local > project > user). */
+  effective_scope: Scope;
+  identical: boolean;
+}
+
+export async function listConflicts(projectPath?: string): Promise<ConflictInfo[]> {
+  return invoke<ConflictInfo[]>("list_conflicts", { projectPath: projectPath ?? null });
+}
+
+export async function renameServer(
+  name: string,
+  scope: Scope,
+  newName: string,
+  projectPath?: string,
+): Promise<void> {
+  return invoke("rename_server", { name, scope, newName, projectPath: projectPath ?? null });
 }

@@ -1,19 +1,24 @@
 import { h } from "../dom";
 import { icon } from "../icons";
 import type { ProjectInfo } from "../ipc";
+import { homeRelative } from "../paths";
 
-export type View = { kind: "global" } | { kind: "project"; path: string };
+export type View =
+  | { kind: "global" }
+  | { kind: "project"; path: string }
+  | { kind: "snapshots" };
 
 export interface SidebarHandlers {
   onSelect: (view: View) => void;
   onDeleteProject: (project: ProjectInfo) => void;
 }
 
-/// Kürzt lange Pfade für die Anzeige (Home -> ~, sonst letzte Segmente).
-function shortPath(path: string, home: string): string {
+/// Pfad für die schmale Seitenleiste: home-relativ (`homeRelative`), das
+/// Home-Verzeichnis selbst ausdrücklich beschriftet, und lange Pfade in der
+/// Mitte elidiert, damit die Zeile nicht umbricht.
+function shortenForSidebar(path: string, home: string): string {
   if (path === home) return "~  (Home)";
-  let p = path;
-  if (home && p.startsWith(home + "/")) p = "~/" + p.slice(home.length + 1);
+  const p = homeRelative(path, home);
   const parts = p.split("/");
   if (parts.length > 3) return parts.slice(0, 1).concat("…", parts.slice(-2)).join("/");
   return p;
@@ -21,8 +26,9 @@ function shortPath(path: string, home: string): string {
 
 function isActive(view: View, item: View): boolean {
   if (view.kind !== item.kind) return false;
-  if (view.kind === "global") return true;
-  return item.kind === "project" && view.path === item.path;
+  if (view.kind === "project" && item.kind === "project") return view.path === item.path;
+  // global / snapshots: Gleichheit der Art genügt.
+  return true;
 }
 
 export function renderSidebar(
@@ -45,11 +51,24 @@ export function renderSidebar(
   );
   root.append(globalItem);
 
+  // Snapshot-Eintrag (eigene Content-Ansicht, kein Projekt).
+  root.append(
+    h(
+      "button",
+      {
+        class: `side-item ${isActive(view, { kind: "snapshots" }) ? "side-active" : ""}`,
+        onclick: () => handlers.onSelect({ kind: "snapshots" }),
+      },
+      icon("archive"),
+      h("span", { class: "side-label", text: "Snapshots" }),
+    ),
+  );
+
   root.append(h("div", { class: "side-header", text: `Projekte (${projects.length})` }));
 
   for (const p of projects) {
     const itemView: View = { kind: "project", path: p.path };
-    const label = h("span", { class: "side-label", text: shortPath(p.path, home) });
+    const label = h("span", { class: "side-label", text: shortenForSidebar(p.path, home) });
     label.title = p.path + (p.exists ? "" : "  (Verzeichnis fehlt)");
 
     const meta = h(

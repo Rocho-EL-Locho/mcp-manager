@@ -4,7 +4,7 @@
 //! Klartext (env-Werte, headers, inline in args wie `-e TOKEN=...`). Standardmäßig
 //! wird alles maskiert; Klartext gibt es nur bei explizitem `reveal = true`.
 
-use crate::models::ServerEntry;
+use crate::models::{Introspection, PlaygroundResult, ServerEntry};
 
 pub const MASK: &str = "••••••••";
 
@@ -122,21 +122,80 @@ fn mask_url_query(url: &str) -> (String, bool) {
     }
 }
 
+/// Maskiert das Passwort in der URI-Userinfo (`schema://user:passwort@host/…`).
+///
+/// Schließt die Lücke, die weder `looks_like_url_with_query` (verlangt ein `?`)
+/// noch `looks_opaque` (bricht bei `:` und `/` ab) abdeckt. Kein Randfall: das
+/// mitgelieferte `postgres`-Preset erzeugt genau dieses Muster
+/// (`postgresql://user:geheim@host/db`), und Server geben ihre Connection-URL
+/// gern nach stderr aus. Gibt (maskiert, wurde_maskiert) zurück; Schema, Nutzer
+/// und Host bleiben lesbar, damit die Zeile diagnostisch brauchbar bleibt.
+fn mask_uri_userinfo(token: &str) -> (String, bool) {
+    let Some(sep) = token.find("://") else {
+        return (token.to_string(), false);
+    };
+    let auth_start = sep + 3;
+    // Die Authority endet beim ersten Pfad-/Query-/Fragment-Trenner.
+    let auth_end = token[auth_start..]
+        .find(['/', '?', '#'])
+        .map(|i| auth_start + i)
+        .unwrap_or(token.len());
+    let authority = &token[auth_start..auth_end];
+    // Userinfo ist alles vor dem LETZTEN `@` der Authority.
+    let Some(at) = authority.rfind('@') else {
+        return (token.to_string(), false);
+    };
+    let userinfo = &authority[..at];
+    let Some(colon) = userinfo.find(':') else {
+        return (token.to_string(), false); // nur Nutzername, kein Passwort
+    };
+    if userinfo[colon + 1..].is_empty() {
+        return (token.to_string(), false); // leeres Passwort -> nichts zu maskieren
+    }
+    let masked = format!(
+        "{}{}:{MASK}{}",
+        &token[..auth_start],
+        &userinfo[..colon],
+        &token[auth_start + at..]
+    );
+    (masked, true)
+}
+
+/// Maskiert beide Secret-Stellen einer URL: Userinfo-Passwort und geheime
+/// Query-Parameter. Gemeinsamer Eingang für args, `entry.url` und Freitext.
+fn mask_url_secrets(token: &str) -> (String, bool) {
+    let (mut out, mut changed) = mask_uri_userinfo(token);
+    if looks_like_url_with_query(&out) {
+        let (q, q_changed) = mask_url_query(&out);
+        if q_changed {
+            out = q;
+            changed = true;
+        }
+    }
+    (out, changed)
+}
+
 /// Maskiert den Wertteil eines `KEY=VALUE`-Arguments, wenn der Schlüssel geheim wirkt.
 /// Gibt (maskiertes_arg, war_geheim) zurück.
 fn mask_kv_arg(arg: &str) -> (String, bool) {
-    // URL mit geheimem Query-Anteil? -> Query-Werte maskieren, Basis behalten.
-    if looks_like_url_with_query(arg) {
-        let (masked, changed) = mask_url_query(arg);
-        if changed {
-            return (masked, true);
-        }
+    // Ganzes Argument ist eine URL mit Credentials/geheimem Query-Anteil?
+    let (masked, changed) = mask_url_secrets(arg);
+    if changed {
+        return (masked, true);
     }
     if let Some(eq) = arg.find('=') {
         let (key, val) = arg.split_at(eq);
         let val = &val[1..];
-        if !val.is_empty() && (key_looks_secret(key) || value_looks_secret(val)) {
-            return (format!("{key}={MASK}"), true);
+        if !val.is_empty() {
+            if key_looks_secret(key) || value_looks_secret(val) {
+                return (format!("{key}={MASK}"), true);
+            }
+            // Der WERT ist eine URL mit Credentials/Query-Secret, der Schlüssel
+            // aber unauffällig (`DATABASE_URL=postgresql://user:geheim@host/db`).
+            let (masked_val, val_changed) = mask_url_secrets(val);
+            if val_changed {
+                return (format!("{key}={masked_val}"), true);
+            }
         }
     }
     if value_looks_secret(arg) {
@@ -145,7 +204,48 @@ fn mask_kv_arg(arg: &str) -> (String, bool) {
     (arg.to_string(), false)
 }
 
-/// Enthält die Definition Geheimnisse (env/headers/verdächtige args)?
+/// Länge, ab der ein bekannter Klartext-Wert literal aus Logs entfernt wird.
+/// Kurze Werte (`1`, `true`, `info`, `debug`) würden sonst überall im Text
+/// getroffen und die Diagnose unlesbar machen.
+const LITERAL_MIN_LEN: usize = 8;
+
+/// Sammelt die Klartext-Werte aus `env` und `headers` einer Definition.
+///
+/// Diese Werte kennt das Backend beim Starten des Prozesses ohnehin – sie
+/// zusätzlich LITERAL aus stderr/Logs zu entfernen macht die Redaktion
+/// unabhängig davon, ob die Heuristik den Wert als Secret erkennt.
+pub fn secret_literals(entry: &ServerEntry) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for map in [entry.env.as_ref(), entry.headers.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        for v in map.values() {
+            let t = v.trim();
+            if t.len() >= LITERAL_MIN_LEN {
+                out.push(t.to_string());
+            }
+        }
+    }
+    // Längste zuerst: sonst zerschneidet der Treffer eines kurzen Werts einen
+    // längeren, der ihn enthält.
+    out.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    out.dedup();
+    out
+}
+
+/// Ersetzt bekannte Klartext-Werte (aus [`secret_literals`]) literal durch `MASK`.
+pub fn redact_literals(text: &str, literals: &[String]) -> String {
+    let mut out = text.to_string();
+    for lit in literals {
+        if out.contains(lit.as_str()) {
+            out = out.replace(lit.as_str(), MASK);
+        }
+    }
+    out
+}
+
+/// Enthält die Definition Geheimnisse (env/headers/verdächtige args/URL)?
 pub fn entry_has_secrets(entry: &ServerEntry) -> bool {
     if entry.env.as_ref().is_some_and(|m| !m.is_empty()) {
         return true;
@@ -157,6 +257,11 @@ pub fn entry_has_secrets(entry: &ServerEntry) -> bool {
         if args.iter().any(|a| mask_kv_arg(a).1) {
             return true;
         }
+    }
+    // Remote-Endpunkte tragen Tokens gern in der URL selbst (Query-Parameter
+    // oder Userinfo) – sonst fehlte für sie das Secret-Badge.
+    if entry.url.as_deref().is_some_and(|u| mask_url_secrets(u).1) {
+        return true;
     }
     false
 }
@@ -181,6 +286,12 @@ pub fn mask_entry(entry: &ServerEntry, reveal: bool) -> ServerEntry {
         for a in args.iter_mut() {
             *a = mask_kv_arg(a).0;
         }
+    }
+    // Auch die URL selbst kann Secrets tragen (`?api_key=…`, `user:pw@host`).
+    // Ohne diesen Schritt stünde derselbe Wert, den die Listenzeile über
+    // `mask_summary` maskiert, in Detail-Ansicht und Formular im Klartext.
+    if let Some(url) = out.url.as_deref().map(|u| mask_url_secrets(u).0) {
+        out.url = Some(url);
     }
     out
 }
@@ -325,6 +436,100 @@ pub fn summarize_entry(entry: &ServerEntry) -> String {
     parts.join(" ")
 }
 
+/// Ersetzt große Binärinhalte (base64) durch eine kurze Zusammenfassung, damit
+/// das UI nicht mit Megabyte-Blobs geflutet wird und `redact_json` nicht sinnlos
+/// über riesige Datenstrings läuft. Betrifft MCP-`content`-Items vom Typ
+/// `image`/`audio` (Feld `data`) sowie Resource-`blob`-Felder.
+pub fn summarize_blobs(value: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+
+    /// Ersetzt `map[key]` durch die Größenangabe, falls dort ein String steht.
+    fn summarize(map: &mut serde_json::Map<String, Value>, key: &str) {
+        if let Some(Value::String(s)) = map.get(key) {
+            let kb = (s.len() as f64 / 1024.0).round() as u64;
+            let summary = format!("<Binärdaten, ~{kb} KB (nicht angezeigt)>");
+            map.insert(key.to_string(), Value::String(summary));
+        }
+    }
+
+    match value {
+        Value::Object(mut map) => {
+            // `data` nur bei image/audio – bei anderen content-Typen ist es Nutztext.
+            let is_binary = matches!(
+                map.get("type").and_then(|t| t.as_str()),
+                Some("image") | Some("audio")
+            );
+            if is_binary {
+                summarize(&mut map, "data");
+            }
+            // `blob` (resources/read) ist per Definition binär.
+            summarize(&mut map, "blob");
+            Value::Object(map.into_iter().map(|(k, v)| (k, summarize_blobs(v))).collect())
+        }
+        Value::Array(arr) => Value::Array(arr.into_iter().map(summarize_blobs).collect()),
+        other => other,
+    }
+}
+
+/// Redigiert ein Playground-Ergebnis vor Verlassen des Backends: Ergebnis-JSON
+/// (String-Blätter) via `redact_json`, große Blob-/Bild-Inhalte werden
+/// zusammengefasst; Fehler/Logs/Notizen via `redact_secrets`.
+pub fn mask_playground(r: &mut PlaygroundResult) {
+    if let Some(v) = r.result.take() {
+        r.result = Some(redact_json(&summarize_blobs(v)));
+    }
+    if let Some(e) = &r.error {
+        r.error = Some(redact_secrets(e));
+    }
+    if let Some(l) = &r.logs {
+        r.logs = Some(redact_secrets(l));
+    }
+    for n in &mut r.notes {
+        *n = redact_secrets(n);
+    }
+}
+
+/// Maskiert geheim aussehende Werte in Tool-Schemata, Beschreibungen und Notizen,
+/// bevor das Introspektions-Ergebnis das Backend verlässt.
+pub fn mask_introspection(intro: &mut Introspection) {
+    for t in &mut intro.tools {
+        t.name = redact_secrets(&t.name);
+        if let Some(d) = t.description.as_mut() {
+            *d = redact_secrets(d);
+        }
+        if let Some(schema) = t.input_schema.take() {
+            t.input_schema = Some(redact_json(&schema));
+        }
+    }
+    for r in &mut intro.resources {
+        // uri kann geheime Query-Parameter enthalten (z. B. ?token=…).
+        r.uri = redact_secrets(&r.uri);
+        if let Some(n) = r.name.as_mut() {
+            *n = redact_secrets(n);
+        }
+        if let Some(d) = r.description.as_mut() {
+            *d = redact_secrets(d);
+        }
+    }
+    for p in &mut intro.prompts {
+        p.name = redact_secrets(&p.name);
+        if let Some(d) = p.description.as_mut() {
+            *d = redact_secrets(d);
+        }
+    }
+    for n in &mut intro.notes {
+        *n = redact_secrets(n);
+    }
+    // Erfasster stderr und Fehlermeldung können Tokens enthalten (z. B. „auth token
+    // expired: ghp_…" oder ein geechotes Config-JSON) – vor dem UI redigieren.
+    if let Some(l) = intro.logs.as_mut() {
+        *l = redact_secrets(l);
+    }
+    if let Some(e) = intro.error.as_mut() {
+        *e = redact_secrets(e);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,5 +588,102 @@ mod tests {
         assert!(s.contains("properties"));
         assert!(s.contains("/home/user/data"));
         assert!(s.contains("object"));
+    }
+
+    /// Regression P3-8: Credentials in der URI-Userinfo (`user:passwort@host`)
+    /// wurden von keinem Zweig erfasst – das `postgres`-Preset erzeugt genau
+    /// dieses Muster.
+    #[test]
+    fn userinfo_passwort_wird_maskiert() {
+        let url = "postgresql://appuser:s3hrGeheim@db.example:5432/kunden";
+        let (masked, changed) = mask_kv_arg(url);
+        assert!(changed, "Userinfo muss als geheim gelten");
+        assert!(!masked.contains("s3hrGeheim"), "Passwort durchgerutscht: {masked}");
+        assert_eq!(masked, format!("postgresql://appuser:{MASK}@db.example:5432/kunden"));
+
+        // Auch als Wertteil eines unauffälligen KEY=VALUE-Arguments.
+        let kv = "DATABASE_URL=mysql://root:hunter2xyz@localhost/db";
+        let (m2, c2) = mask_kv_arg(kv);
+        assert!(c2);
+        assert!(!m2.contains("hunter2xyz"), "Passwort durchgerutscht: {m2}");
+
+        // Und in freiem stderr-Text (Server echot seine Connection-URL).
+        let log = "connecting to postgresql://appuser:s3hrGeheim@db.example/kunden …";
+        let red = redact_secrets(log);
+        assert!(!red.contains("s3hrGeheim"), "Passwort durchgerutscht: {red}");
+
+        // Ohne Passwort bzw. ohne Userinfo bleibt alles unverändert.
+        for harmlos in [
+            "postgresql://appuser@db.example/kunden",
+            "https://api.example.com:443/mcp",
+            "mcp/grafana:latest",
+        ] {
+            assert_eq!(mask_kv_arg(harmlos).0, harmlos, "unverändert erwartet: {harmlos}");
+        }
+    }
+
+    /// Regression P3-7: `entry.url` lief unmaskiert ins Webview und zählte auch
+    /// nicht als Secret (kein Badge).
+    #[test]
+    fn entry_url_wird_maskiert_und_zaehlt_als_secret() {
+        let entry = ServerEntry {
+            transport: Some("http".into()),
+            url: Some("https://api.example/mcp?api_key=EXAMPLEexample1234567890".into()),
+            ..Default::default()
+        };
+        assert!(entry_has_secrets(&entry), "Secret-Badge fehlt");
+        let masked = mask_entry(&entry, false);
+        let url = masked.url.as_deref().unwrap();
+        assert!(!url.contains("EXAMPLEexample1234567890"), "Token durchgerutscht: {url}");
+        assert!(url.starts_with("https://api.example/mcp?api_key="));
+        // Mit reveal bleibt der Klartext erhalten.
+        assert_eq!(mask_entry(&entry, true).url, entry.url);
+
+        // Userinfo in der URL ebenso.
+        let creds = ServerEntry {
+            url: Some("https://nutzer:geheimwort@remote.example/mcp".into()),
+            ..Default::default()
+        };
+        assert!(entry_has_secrets(&creds));
+        let m = mask_entry(&creds, false);
+        assert!(!m.url.as_deref().unwrap().contains("geheimwort"));
+    }
+
+    /// Literale Redaktion: die echten env-Werte kennt das Backend beim Start –
+    /// sie fliegen unabhängig von der Heuristik aus stderr/Logs.
+    #[test]
+    fn literale_env_werte_fliegen_aus_logs() {
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("PGPASSWORD".to_string(), "korrekt-pferd-batterie".to_string());
+        env.insert("LOG_LEVEL".to_string(), "debug".to_string()); // zu kurz -> bleibt
+        let entry = ServerEntry { env: Some(env), ..Default::default() };
+        let lits = secret_literals(&entry);
+        assert_eq!(lits, vec!["korrekt-pferd-batterie".to_string()]);
+
+        let text = "psql: FATAL: password 'korrekt-pferd-batterie' rejected (debug)";
+        let red = redact_literals(text, &lits);
+        assert!(!red.contains("korrekt-pferd-batterie"), "Wert durchgerutscht: {red}");
+        assert!(red.contains("debug"), "kurze Werte dürfen nicht maskiert werden: {red}");
+    }
+
+    #[test]
+    fn summarize_blobs_replaces_binary_keeps_text() {
+        use serde_json::json;
+        let input = json!({
+            "content": [
+                { "type": "text", "text": "hallo" },
+                { "type": "image", "data": "AAAABBBBCCCC", "mimeType": "image/png" }
+            ],
+            "contents": [ { "uri": "file://x", "blob": "ZZZZZZZZ" } ]
+        });
+        let out = summarize_blobs(input);
+        // Text bleibt erhalten.
+        assert_eq!(out["content"][0]["text"], json!("hallo"));
+        // Bild-`data` und Resource-`blob` sind zusammengefasst (kein Roh-base64).
+        let img = out["content"][1]["data"].as_str().unwrap();
+        assert!(img.starts_with("<Binärdaten"), "data nicht zusammengefasst: {img}");
+        assert_eq!(out["content"][1]["mimeType"], json!("image/png"));
+        let blob = out["contents"][0]["blob"].as_str().unwrap();
+        assert!(blob.starts_with("<Binärdaten"), "blob nicht zusammengefasst: {blob}");
     }
 }

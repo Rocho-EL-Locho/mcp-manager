@@ -1,0 +1,33 @@
+// Gemeinsame Frontend-Konstanten.
+//
+// TIMEOUT_MIN/MAX spiegeln nur die Anzeige (Feld-`min`/`max`, Hinweistext) wider.
+// **Maßgeblich ist das Backend** (`settings.rs::validate`): dort wird der Bereich
+// erzwungen und eine klare Fehlermeldung geliefert. Das Frontend prüft daher
+// clientseitig nur die Basissanität (ganze Zahl > 0) und lässt die exakte
+// Bereichsprüfung dem Backend – so können Front-/Backend nicht in Annahme/
+// Ablehnung auseinanderlaufen (ein veralteter Hinweistext bliebe rein kosmetisch).
+
+/** Untergrenze der konfigurierbaren Timeouts (Sekunden) – Anzeige. */
+export const TIMEOUT_MIN = 5;
+/** Obergrenze der konfigurierbaren Timeouts (Sekunden) – Anzeige. */
+export const TIMEOUT_MAX = 600;
+
+/** Obergrenze für das Auto-Refresh-Intervall (Minuten, = 1 Woche). Clientseitig
+ *  geklemmt, weil `auto_refresh_minutes` als u32 serialisiert wird und ein
+ *  Überlauf sonst nur einen kryptischen Deserialisierungsfehler erzeugte. */
+export const AUTO_REFRESH_MAX = 10080;
+
+/** Grenzen der Snapshot-Aufbewahrung – Anzeige. Maßgeblich ist das Backend
+ *  (`settings.rs::validate`, `RETENTION_MIN`/`RETENTION_MAX`). */
+export const RETENTION_MIN = 1;
+export const RETENTION_MAX = 500;
+
+/** Obergrenze des Log-Puffers im Diagnose-Panel (Zeilen).
+ *
+ *  **Spiegelt `RING_CAPACITY` in `src-tauri/src/logview.rs`.** Das Backend
+ *  deckelt nur seinen Ring – emittiert wird aber jede Zeile, `BATCH_INTERVAL`
+ *  ist eine maximale Wartezeit, keine Mindestpause. Ohne diesen Deckel wüchsen
+ *  `lines`/`seen` und die DOM-Knoten des Panels bei einem Server in der
+ *  stderr-Schleife unbegrenzt (1000 Zeilen/s × bis zu 15 min SESSION_TIMEOUT).
+ *  Mehr als `RING_CAPACITY` liefert auch der Backfill (`logSessionBuffer`) nie. */
+export const LOG_RING_CAPACITY = 2000;

@@ -38,11 +38,22 @@ pub fn home_dir() -> Option<PathBuf> {
 
 /// Ermittelt den absoluten Pfad zur `claude`-CLI.
 ///
-/// Reihenfolge: expliziter Override > `which` > gängige Installationspfade.
-/// Der absolute Pfad ist wichtig, weil die App aus einem Desktop-Eintrag ohne
-/// vollständiges Shell-PATH gestartet werden kann.
-pub fn resolve_claude() -> Option<PathBuf> {
+/// Reihenfolge: Env-Var (`MCP_MANAGER_CLAUDE_PATH`, stärkster Override, wichtig
+/// für Tests/Scripting) > `configured` (Einstellung) > `which` > gängige
+/// Installationspfade. Der absolute Pfad ist wichtig, weil die App aus einem
+/// Desktop-Eintrag ohne vollständiges Shell-PATH gestartet werden kann.
+pub fn resolve_claude(configured: Option<&str>) -> Option<PathBuf> {
     if let Ok(p) = std::env::var("MCP_MANAGER_CLAUDE_PATH") {
+        let pb = PathBuf::from(p);
+        if pb.is_file() {
+            return Some(pb);
+        }
+    }
+
+    // Konfigurierter Pfad aus den Einstellungen. Ist er gesetzt, aber (z. B. nach
+    // Löschen des Binaries) ungültig, fällt die Kette bewusst auf die automatische
+    // Auflösung zurück, statt hart zu scheitern.
+    if let Some(p) = configured.map(str::trim).filter(|p| !p.is_empty()) {
         let pb = PathBuf::from(p);
         if pb.is_file() {
             return Some(pb);
@@ -153,4 +164,50 @@ pub fn run_claude(
         stdout,
         stderr,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Opt-in: verifiziert die Auflösungskette Env-Var > Einstellung > Auto.
+    /// Mutiert die Prozess-Env (`MCP_MANAGER_CLAUDE_PATH`) -> `#[ignore]`, damit es
+    /// nicht mit parallelen Tests kollidiert. Läuft mit `-- --ignored`.
+    /// Nutzt `/bin/sh` und `/usr/bin/env` als garantiert existierende Dateien.
+    #[test]
+    #[ignore]
+    fn resolve_claude_precedence() {
+        const ENV: &str = "MCP_MANAGER_CLAUDE_PATH";
+        let sh = PathBuf::from("/bin/sh");
+        let env_bin = PathBuf::from("/usr/bin/env");
+        assert!(sh.is_file() && env_bin.is_file(), "Testvoraussetzung: /bin/sh und /usr/bin/env existieren");
+
+        // 1. Env-Var gewinnt, selbst wenn eine (andere, gültige) Einstellung gesetzt ist.
+        std::env::set_var(ENV, &env_bin);
+        assert_eq!(
+            resolve_claude(Some("/bin/sh")),
+            Some(env_bin.clone()),
+            "gültige Env-Var hat Vorrang vor der Einstellung"
+        );
+
+        // 2. Ungültige Env-Var wird übersprungen -> Einstellung greift.
+        std::env::set_var(ENV, "/nicht/vorhanden/mcpmgr-xyz");
+        assert_eq!(
+            resolve_claude(Some("/bin/sh")),
+            Some(sh.clone()),
+            "ungültige Env-Var fällt auf die Einstellung zurück"
+        );
+
+        // 3. Ohne Env-Var greift die Einstellung.
+        std::env::remove_var(ENV);
+        assert_eq!(
+            resolve_claude(Some("/bin/sh")),
+            Some(sh),
+            "ohne Env-Var wird die Einstellung genutzt"
+        );
+
+        // 4. Leere Einstellung wird ignoriert (fällt auf Auto-Auflösung; Ergebnis
+        //    hängt von der Maschine ab, daher nur: nicht /bin/sh).
+        assert_ne!(resolve_claude(Some("   ")), Some(PathBuf::from("/bin/sh")));
+    }
 }

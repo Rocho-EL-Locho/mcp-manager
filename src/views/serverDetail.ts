@@ -1,13 +1,15 @@
-import { h, clear } from "../dom";
+import { h, clear, svgEl } from "../dom";
 import { icon, setIcon } from "../icons";
-import type { MergedServer, ServerEntry, Scope, Introspection, ServerStatus, RuntimePreflight } from "../ipc";
-import { revealServerEntry, setScope, introspectServer, peekIntrospection, healthCheck, preflightServer } from "../ipc";
+import type { MergedServer, ServerEntry, Scope, Introspection, ServerStatus, RuntimePreflight, MetricPoint } from "../ipc";
+import { revealServerEntry, setScope, introspectServer, peekIntrospection, healthCheck, preflightServer, getMetrics } from "../ipc";
 import { openModal } from "../modal";
 import { openConfirm } from "../confirm";
 import { toast } from "../toast";
 import { statusMeta, formatLatency } from "./serverList";
-
-const ALL_SCOPES: Scope[] = ["user", "local", "project"];
+import { ALL_SCOPES, scopeSelect } from "../scope";
+import { openDuplicateModal } from "./serverDuplicate";
+import { openToolPlayground, openResourcePlayground, openPromptPlayground } from "./playground";
+import { createLogView } from "./logView";
 
 function row(label: string, value: Node | string): HTMLElement {
   return h(
@@ -61,6 +63,8 @@ function definitionBody(entry: ServerEntry): HTMLElement {
 interface CapItem {
   title: string;
   desc?: string;
+  /// Optionaler Aktions-Button (Playground: Testen/Lesen/Abrufen).
+  action?: HTMLElement | null;
 }
 
 /// Eine aufklappbare Gruppe (Tools/Ressourcen/Prompts) mit Namen + Beschreibung.
@@ -71,7 +75,12 @@ function capsGroup(label: string, items: CapItem[]): HTMLElement {
       h(
         "div",
         { class: "caps-item" },
-        h("div", { class: "mono caps-item-name", text: it.title }),
+        h(
+          "div",
+          { class: "caps-item-head" },
+          h("div", { class: "mono caps-item-name", text: it.title }),
+          it.action ?? null,
+        ),
         it.desc ? h("div", { class: "muted caps-item-desc", text: it.desc }) : null,
       ),
     );
@@ -84,11 +93,21 @@ function capsGroup(label: string, items: CapItem[]): HTMLElement {
   );
 }
 
+/// Kleiner Playground-Aktions-Button (nur wenn der Server aktiviert ist).
+function playgroundBtn(label: string, onClick: () => void): HTMLElement {
+  const btn = h("button", { class: "btn btn-small", type: "button" }, label);
+  btn.addEventListener("click", onClick);
+  return btn;
+}
+
 /// Rendert das Introspektions-Ergebnis: bei Erfolg Zähler/Server-Info/Listen,
 /// bei Fehler ein Banner. Notizen und ein erfasster stderr-Log-Block (falls
 /// vorhanden) werden in beiden Fällen angehängt.
-function renderIntrospection(intro: Introspection): HTMLElement {
+function renderIntrospection(intro: Introspection, server: MergedServer): HTMLElement {
   const wrap = h("div", { class: "caps" });
+  // Playground-Aktionen nur für aktivierte Server (kein heimlicher Start eines
+  // deaktivierten Servers).
+  const canRun = server.enabled;
 
   if (intro.error) {
     wrap.append(h("p", { class: "form-status error", text: intro.error }));
@@ -128,18 +147,40 @@ function renderIntrospection(intro: Introspection): HTMLElement {
 
     const groups = h("div", { class: "caps-groups" });
     if (intro.tools.length) {
-      groups.append(capsGroup("Tools", intro.tools.map((t) => ({ title: t.name, desc: t.description }))));
+      groups.append(
+        capsGroup(
+          "Tools",
+          intro.tools.map((t) => ({
+            title: t.name,
+            desc: t.description,
+            action: canRun ? playgroundBtn("Testen…", () => openToolPlayground(server, t)) : null,
+          })),
+        ),
+      );
     }
     if (intro.resources.length) {
       groups.append(
         capsGroup(
           "Ressourcen",
-          intro.resources.map((r) => ({ title: r.name ?? r.uri, desc: r.description ?? r.uri })),
+          intro.resources.map((r) => ({
+            title: r.name ?? r.uri,
+            desc: r.description ?? r.uri,
+            action: canRun ? playgroundBtn("Lesen…", () => openResourcePlayground(server, r)) : null,
+          })),
         ),
       );
     }
     if (intro.prompts.length) {
-      groups.append(capsGroup("Prompts", intro.prompts.map((p) => ({ title: p.name, desc: p.description }))));
+      groups.append(
+        capsGroup(
+          "Prompts",
+          intro.prompts.map((p) => ({
+            title: p.name,
+            desc: p.description,
+            action: canRun ? playgroundBtn("Abrufen…", () => openPromptPlayground(server, p)) : null,
+          })),
+        ),
+      );
     }
     if (groups.childElementCount) wrap.append(groups);
   }
@@ -223,6 +264,95 @@ function runtimeSection(server: MergedServer): HTMLElement | null {
 
 /// Abschnitt „Fähigkeiten": On-Demand-Introspektion mit Laden/Aktualisieren-Button.
 /// Beim Öffnen wird ein bereits gecachtes Ergebnis (ohne Prozessstart) vorgeladen.
+/// Mini-Sparkline der Status-/Latenz-Historie: farbige Punkte je Messung
+/// (Verfügbarkeit), plus eine Latenzlinie über die Punkte mit `connectMs`.
+function renderSparkline(points: MetricPoint[]): HTMLElement {
+  if (points.length < 2) {
+    return h("p", { class: "muted", text: "Noch keine Historie – nach ein paar Aktualisierungen." });
+  }
+  const W = 260;
+  const H = 44;
+  const pad = 5;
+  const n = points.length;
+  const xAt = (i: number) => pad + (i / (n - 1)) * (W - 2 * pad);
+
+  const svg = svgEl("svg", {
+    viewBox: `0 0 ${W} ${H}`,
+    class: "sparkline",
+    preserveAspectRatio: "none",
+    role: "img",
+  });
+
+  // Latenzlinie (nur Punkte mit connectMs; braucht mind. 2).
+  const lat = points
+    .map((p, i) => ({ i, v: p.connectMs }))
+    .filter((o): o is { i: number; v: number } => typeof o.v === "number");
+  if (lat.length >= 2) {
+    const vals = lat.map((o) => o.v);
+    const max = Math.max(...vals);
+    const min = Math.min(...vals);
+    const range = max - min || 1;
+    const yAt = (v: number) => H - pad - ((v - min) / range) * (H - 2 * pad - 6);
+    const pts = lat.map((o) => `${xAt(o.i).toFixed(1)},${yAt(o.v).toFixed(1)}`).join(" ");
+    svg.append(svgEl("polyline", { points: pts, class: "sparkline-line", fill: "none" }));
+  }
+
+  // Status-Punkte auf der Grundlinie.
+  points.forEach((p, i) => {
+    svg.append(
+      svgEl("circle", {
+        cx: xAt(i).toFixed(1),
+        cy: H - pad,
+        r: 2.2,
+        class: `spark-dot spark-${p.statusKind}`,
+      }),
+    );
+  });
+
+  const latestLatency = lat.length ? lat[lat.length - 1].v : undefined;
+  const caption =
+    `letzte ${n} Messungen` + (latestLatency !== undefined ? ` · zuletzt ${formatLatency(latestLatency)}` : "");
+  return h("div", { class: "sparkline-wrap" }, svg, h("div", { class: "muted sparkline-caption", text: caption }));
+}
+
+/// Abschnitt „Verlauf" im Detail-Modal: lädt die Historie und rendert die
+/// Sparkline. Nur für Server mit Scope (externe haben keine Historie).
+function metricsSection(server: MergedServer): HTMLElement | null {
+  const scope = server.scope;
+  if (!scope) return null;
+  const box = h("div", { class: "detail-metrics" }, h("p", { class: "muted", text: "Verlauf wird geladen…" }));
+  void getMetrics(server.name, scope, server.project_path ?? undefined)
+    .then((pts) => {
+      if (!box.isConnected) return;
+      clear(box);
+      box.append(renderSparkline(pts));
+    })
+    .catch(() => {
+      if (!box.isConnected) return;
+      clear(box);
+      box.append(h("p", { class: "muted", text: "Keine Historie verfügbar." }));
+    });
+  return h("div", { class: "detail-section" }, h("h3", { text: "Verlauf" }), box);
+}
+
+/// „Logs"-Sektion: Live-Diagnose nur für stdio-Server. Gibt das
+/// Element + eine `dispose`-Funktion zurück (Listener beim Modal-Schließen abmelden).
+function logsSection(
+  server: MergedServer,
+  opts: DetailOptions,
+): { element: HTMLElement; dispose: () => void } | null {
+  const scope = server.scope;
+  // Nur stdio-Server (lokaler Prozess) und mit bekanntem Scope.
+  if (!scope || !server.entry?.command) return null;
+
+  const view = createLogView(server, scope, opts.activeLogSession ?? null, {
+    onStarted: (id) => opts.onLogSessionChange?.(server, id),
+    onStopped: () => opts.onLogSessionChange?.(server, null),
+  });
+  const element = h("div", { class: "detail-section" }, h("h3", { text: "Logs (Diagnose)" }), view.element);
+  return { element, dispose: view.dispose };
+}
+
 function capabilitiesSection(server: MergedServer, opts: DetailOptions): HTMLElement | null {
   // Nur für Server mit lokaler Definition (Scope bekannt) sinnvoll.
   if (!server.entry || !server.scope) return null;
@@ -244,7 +374,7 @@ function capabilitiesSection(server: MergedServer, opts: DetailOptions): HTMLEle
     // nichts mehr rendern oder als Seiteneffekt die Liste neu zeichnen.
     if (!content.isConnected) return;
     clear(content);
-    content.append(renderIntrospection(intro));
+    content.append(renderIntrospection(intro, server));
     loadedOnce = true;
     btnLabel.textContent = "Aktualisieren";
     // Liste nur bei erfolgreicher Introspektion über die Zähler informieren –
@@ -298,6 +428,10 @@ export interface DetailOptions {
   /// Wird nach einem erneuten Health-Check aufgerufen, damit die Liste den neuen
   /// Status ohne teuren Full-Refresh übernehmen kann.
   onRechecked?: (server: MergedServer, status: ServerStatus) => void;
+  /// Aktive Live-Diagnose-Session-Id für DIESEN Server, falls eine läuft.
+  activeLogSession?: string | null;
+  /// Meldet Start (Id) / Stop (null) einer Log-Session – für das Listen-Badge.
+  onLogSessionChange?: (server: MergedServer, id: string | null) => void;
 }
 
 export function openDetail(server: MergedServer, opts: DetailOptions = {}): void {
@@ -405,20 +539,31 @@ export function openDetail(server: MergedServer, opts: DetailOptions = {}): void
   let scopeSection: HTMLElement | null = null;
   if (server.editable && server.scope) {
     const currentScope = server.scope;
-    const select = h(
-      "select",
-      { class: "inp" },
-      ...ALL_SCOPES.filter((s) => s !== currentScope).map((s) => h("option", { value: s }, s)),
-    ) as HTMLSelectElement;
+    // Nur die Scopes anbieten, in die verschoben werden KANN – der aktuelle
+    // fällt raus. Beschriftung wie überall sonst über `scopeSelect`.
+    const select = scopeSelect(
+      undefined,
+      ALL_SCOPES.filter((s) => s !== currentScope),
+    );
     const moveBtn = h("button", { class: "btn btn-small" }, "Verschieben");
     moveBtn.addEventListener("click", () => {
       const target = select.value as Scope;
+      // Verschoben wird innerhalb DESSELBEN Projekts: der Zielpfad muss
+      // mitgegeben werden. Ohne ihn lief `claude mcp add-json` im Backend mit
+      // cwd = Home und schrieb z. B. ~/.mcp.json statt <projekt>/.mcp.json –
+      // der Server verschwand aus dem Projekt und lag unbemerkt im Home.
+      const projectPath = server.project_path ?? undefined;
+      const toProject = target === "user" ? undefined : projectPath;
+      const zielText =
+        target === "user"
+          ? "user (global, ~/.claude.json)"
+          : `${target} in ${toProject ?? "Standard-Projekt (Home-Verzeichnis)"}`;
       openConfirm({
         title: `Scope ändern: ${server.name}`,
-        message: `„${server.name}" von ${currentScope} nach ${target} verschieben? Zuerst im Ziel anlegen, dann aus der Quelle entfernen.`,
+        message: `„${server.name}" von ${currentScope} nach ${zielText} verschieben? Zuerst im Ziel anlegen, dann aus der Quelle entfernen.`,
         confirmLabel: "Verschieben",
         onConfirm: async () => {
-          await setScope(server.name, currentScope, target, server.project_path ?? undefined, undefined);
+          await setScope(server.name, currentScope, target, projectPath, toProject);
         },
         onDone: () => {
           toast(`Scope → ${target}`);
@@ -427,14 +572,29 @@ export function openDetail(server: MergedServer, opts: DetailOptions = {}): void
         },
       });
     });
+    const dupBtn = h("button", { class: "btn btn-small" }, "Duplizieren");
+    dupBtn.addEventListener("click", () => {
+      openDuplicateModal(server, () => {
+        modal.close();
+        opts.onChanged?.();
+      });
+    });
     scopeSection = h(
       "div",
       { class: "detail-scope" },
       h("h3", { text: "Scope ändern" }),
       h("div", { class: "scope-row" }, select, moveBtn),
+      h("h3", { text: "Duplizieren" }),
+      h(
+        "div",
+        { class: "scope-row" },
+        h("span", { class: "muted", text: "Kopie in einen anderen Scope / ein anderes Projekt anlegen." }),
+        dupBtn,
+      ),
     );
   }
 
+  const logs = logsSection(server, opts);
   const body = h(
     "div",
     { class: "detail" },
@@ -451,8 +611,11 @@ export function openDetail(server: MergedServer, opts: DetailOptions = {}): void
     defWrap,
     runtimeSection(server),
     capabilitiesSection(server, opts),
+    logs?.element ?? null,
+    metricsSection(server),
     scopeSection,
   );
 
-  const modal = openModal(server.name, body);
+  // Beim Schließen den Log-Event-Listener abmelden (Session läuft weiter).
+  const modal = openModal(server.name, body, undefined, () => logs?.dispose());
 }

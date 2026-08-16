@@ -1,69 +1,27 @@
 import { h } from "../dom";
+import { field, kvEditor } from "../form";
 import { icon } from "../icons";
 import type { MergedServer, Scope, ServerEntry } from "../ipc";
 import { addServer, updateServer, revealServerEntry } from "../ipc";
 import { openModal } from "../modal";
+import type { ServerPreset } from "../presets";
 import { toast } from "../toast";
+import { scopeSelect } from "../scope";
+import { transportOfEntry, type Transport } from "../transport";
 
 export interface ServerFormOptions {
   mode: "add" | "edit";
   server?: MergedServer;
-  prefill?: { name?: string; entry?: ServerEntry };
+  prefill?: { name?: string; entry?: ServerEntry; secretKeys?: string[] };
+  /// Gewähltes Preset (Add-Modus) – reine Metadaten-Quelle: Doku-Kopf,
+  /// Platzhalter-Validierung und `secretKeys`-Fallback. Die Vorbelegung selbst
+  /// kommt immer über `prefill` (so ruft `serverPicker.ts` auf).
+  preset?: ServerPreset;
   /// Zielprojekt für local/project-Scope (Add-Modus).
   projectPath?: string;
   /// Vorbelegter Scope im Add-Modus.
   defaultScope?: Scope;
   onSaved: () => void;
-}
-
-interface KvEditor {
-  el: HTMLElement;
-  getValues: () => Record<string, string>;
-}
-
-function kvEditor(initial?: Record<string, string>): KvEditor {
-  const rows = h("div", { class: "kv-editor" });
-
-  const addRow = (k = "", v = "") => {
-    const kIn = h("input", { class: "inp mono", placeholder: "KEY" }) as HTMLInputElement;
-    const vIn = h("input", { class: "inp mono", placeholder: "Wert" }) as HTMLInputElement;
-    kIn.value = k;
-    vIn.value = v;
-    const rm = h("button", { class: "btn btn-icon", type: "button", title: "Zeile entfernen" }, icon("x"));
-    const row = h("div", { class: "kv-editrow" }, kIn, vIn, rm);
-    rm.addEventListener("click", () => row.remove());
-    rows.append(row);
-  };
-
-  for (const [k, v] of Object.entries(initial ?? {})) addRow(k, v);
-
-  const addBtn = h(
-    "button",
-    { class: "btn btn-small", type: "button", onclick: () => addRow() },
-    "+ Zeile",
-  );
-
-  const el = h("div", {}, rows, addBtn);
-  const getValues = (): Record<string, string> => {
-    const out: Record<string, string> = {};
-    rows.querySelectorAll(".kv-editrow").forEach((r) => {
-      const inputs = r.querySelectorAll("input");
-      const key = (inputs[0] as HTMLInputElement).value.trim();
-      if (key) out[key] = (inputs[1] as HTMLInputElement).value;
-    });
-    return out;
-  };
-  return { el, getValues };
-}
-
-export function field(label: string, control: HTMLElement, hint?: string): HTMLElement {
-  return h(
-    "div",
-    { class: "field" },
-    h("label", { class: "field-label", text: label }),
-    control,
-    hint ? h("div", { class: "field-hint", text: hint }) : null,
-  );
 }
 
 export async function openServerForm(opts: ServerFormOptions): Promise<void> {
@@ -107,33 +65,29 @@ export async function openServerForm(opts: ServerFormOptions): Promise<void> {
     }
   } else {
     if (opts.prefill) {
-      name = opts.prefill.name ?? "";
-      initEntry = opts.prefill.entry ?? {};
+      name = opts.prefill.name ?? name;
+      initEntry = opts.prefill.entry ?? initEntry;
     }
     if (opts.defaultScope) scope = opts.defaultScope;
   }
 
+  const secretKeys = opts.prefill?.secretKeys ?? opts.preset?.secretKeys ?? [];
+
   // Ursprüngliches type merken, um bei stdio keinen "type"-Key neu hinzuzufügen.
   const hadType = initEntry.type != null;
-  // type normalisieren: nur stdio/http/sse sind gültige Optionen, sonst aus url ableiten.
-  const initTransport = ["stdio", "http", "sse"].includes(initEntry.type ?? "")
-    ? (initEntry.type as string)
-    : (initEntry.url ? "http" : "stdio");
+  // Transport über die gemeinsame Ableitung bestimmen (nicht lokal nachbauen):
+  // eine eigene Regel ohne den „/sse"-Fall belegte einen sse-Server als http vor,
+  // und da buildEntry() für Nicht-stdio immer `type` schreibt, kippte schon ein
+  // unbeteiligter Edit den Server dauerhaft und stillschweigend auf http.
+  const initTransport: Transport = transportOfEntry(initEntry);
 
   // Felder
   const nameInput = h("input", { class: "inp" }) as HTMLInputElement;
   nameInput.value = name;
   if (isEdit) nameInput.disabled = true;
 
-  const scopeSelect = h(
-    "select",
-    { class: "inp" },
-    h("option", { value: "user" }, "user (global)"),
-    h("option", { value: "local" }, "local (projekt-privat)"),
-    h("option", { value: "project" }, "project (.mcp.json)"),
-  ) as HTMLSelectElement;
-  scopeSelect.value = scope;
-  if (isEdit) scopeSelect.disabled = true;
+  const scopeSel = scopeSelect(scope);
+  if (isEdit) scopeSel.disabled = true;
 
   const transportSelect = h(
     "select",
@@ -149,7 +103,7 @@ export async function openServerForm(opts: ServerFormOptions): Promise<void> {
   commandInput.value = initEntry.command ?? "";
   const argsArea = h("textarea", { class: "inp mono", rows: "4", placeholder: "ein Argument pro Zeile" }) as HTMLTextAreaElement;
   argsArea.value = (initEntry.args ?? []).join("\n");
-  const envEd = kvEditor(initEntry.env);
+  const envEd = kvEditor(initEntry.env, secretKeys);
   const stdioSection = h(
     "div",
     {},
@@ -161,7 +115,7 @@ export async function openServerForm(opts: ServerFormOptions): Promise<void> {
   // http/sse-Felder
   const urlInput = h("input", { class: "inp mono", placeholder: "https://…" }) as HTMLInputElement;
   urlInput.value = initEntry.url ?? "";
-  const headersEd = kvEditor(initEntry.headers);
+  const headersEd = kvEditor(initEntry.headers, secretKeys);
   const remoteSection = h("div", {}, field("URL", urlInput), field("Headers", headersEd.el));
 
   const applyTransport = () => {
@@ -174,13 +128,30 @@ export async function openServerForm(opts: ServerFormOptions): Promise<void> {
 
   const status = h("div", { class: "form-status" });
 
+  // Preset-Kopf: Beschreibung + prominenter Link auf die offizielle Doku
+  // (Presets veralten; die Doku ist die maßgebliche Quelle).
+  const presetHead = opts.preset
+    ? h(
+        "div",
+        { class: "preset-head" },
+        h("div", { class: "preset-head-desc", text: opts.preset.description }),
+        h(
+          "a",
+          { class: "preset-head-docs", href: opts.preset.docsUrl, target: "_blank", rel: "noreferrer noopener" },
+          icon("globe"),
+          "Offizielle Doku",
+        ),
+      )
+    : null;
+
   const body = h(
     "div",
     { class: "server-form" },
+    presetHead,
     field("Name", nameInput, isEdit ? "Name unveränderlich (zum Umbenennen: entfernen + neu anlegen)." : undefined),
     field(
       "Scope",
-      scopeSelect,
+      scopeSel,
       isEdit
         ? "Scope-Wechsel folgt separat."
         : opts.projectPath
@@ -226,7 +197,26 @@ export async function openServerForm(opts: ServerFormOptions): Promise<void> {
     const t = transportSelect.value;
     if (t === "stdio" && !entry.command) return "Command darf nicht leer sein.";
     if (t !== "stdio" && !entry.url) return "URL darf nicht leer sein.";
+    // Unersetzte Preset-Platzhalter (<PFAD>, <CONNECTION_STRING>, …) blockieren
+    // das Speichern – sonst würde ein unbrauchbarer Server angelegt. Nur im
+    // Preset-Fall, damit ein echtes „<…>" in manuell/edit gepflegten Args
+    // nicht fälschlich blockiert wird.
+    if (opts.preset) {
+      const placeholders = [...(entry.args ?? []), entry.url ?? ""]
+        .flatMap((s) => s.match(/<[^>]+>/g) ?? []);
+      if (placeholders.length) {
+        const uniq = [...new Set(placeholders)];
+        return `Platzhalter noch ersetzen: ${uniq.join(", ")}`;
+      }
+    }
     return null;
+  };
+
+  /// Vom Preset als erforderlich markierte Secret-Keys, die leer geblieben sind.
+  const emptySecretKeys = (entry: ServerEntry): string[] => {
+    if (!secretKeys.length) return [];
+    const values = { ...(entry.env ?? {}), ...(entry.headers ?? {}) };
+    return secretKeys.filter((k) => !(values[k] ?? "").trim());
   };
 
   saveBtn.addEventListener("click", async () => {
@@ -238,7 +228,7 @@ export async function openServerForm(opts: ServerFormOptions): Promise<void> {
       return;
     }
     const finalName = isEdit ? name : nameInput.value.trim();
-    const finalScope = (isEdit ? scope : (scopeSelect.value as Scope));
+    const finalScope = (isEdit ? scope : (scopeSel.value as Scope));
     saveBtn.disabled = true;
     cancelBtn.disabled = true;
     status.className = "form-status";
@@ -247,6 +237,9 @@ export async function openServerForm(opts: ServerFormOptions): Promise<void> {
       if (isEdit) await updateServer(finalName, finalScope, entry, opts.server?.project_path ?? undefined);
       else await addServer(finalName, finalScope, entry, opts.projectPath);
       toast(isEdit ? "Server gespeichert" : "Server hinzugefügt");
+      // Nicht blockierend: leere Secret-Keys als Hinweis nachreichen.
+      const empty = emptySecretKeys(entry);
+      if (empty.length) toast(`Hinweis: leer gelassen – ${empty.join(", ")}`);
       modal.close();
       opts.onSaved();
     } catch (e) {

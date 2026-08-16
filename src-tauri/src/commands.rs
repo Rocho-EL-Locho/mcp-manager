@@ -2,34 +2,37 @@
 //! claude_cli / config_read / mask / parse.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 
-use tauri::State;
+use tauri::{Emitter, State};
 
 use crate::claude_cli::{home_dir, resolve_claude, run_claude};
 use crate::config_read::{
     claude_json_path, collect_definitions, collect_disabled, default_project_path,
-    project_settings_local_path, read_json_value, settings_local_path,
+    project_settings_local_path, read_json_value, settings_local_path, ScopedEntry,
 };
 use crate::mask::{
-    entry_has_secrets, mask_entry, mask_summary, redact_json, redact_secrets, summarize_entry,
+    entry_has_secrets, mask_entry, mask_introspection, mask_playground, mask_summary,
+    redact_secrets, summarize_entry,
 };
 use crate::models::{
-    AppError, ClaudeInfo, Introspection, MergedServer, ProjectInfo, Scope, ServerEntry,
-    ServerStatus,
+    AppError, ClaudeInfo, ConflictInfo, Introspection, MergedServer,
+    PlaygroundRequest, PlaygroundResult, ProjectInfo, Scope, ServerEntry, ServerStatus,
 };
 use crate::parse::{failure_detail, parse_list, status_from_text};
 use crate::preflight::RuntimePreflight;
+use crate::settings::AppSettings;
 
-const LIST_TIMEOUT: Duration = Duration::from_secs(45);
 const GET_TIMEOUT: Duration = Duration::from_secs(20);
-const MUT_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(180);
 /// Zeitbudget für den Introspektions-Handshake. Großzügig, weil der erste
 /// `npx`/`uvx`-Start (Download/Cold-Start) spürbar dauern kann.
 const INTROSPECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// Zeitbudget für einen Playground-Aufruf (Handshake + ein Request). Länger als
+/// INTROSPECT_TIMEOUT, da ein `tools/call` echte Arbeit verrichten darf.
+const PLAYGROUND_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Zuletzt bekannter Status + Kurzbeschreibung eines Servers (für den Cache).
 #[derive(Clone)]
@@ -46,22 +49,198 @@ type StatusCache = Mutex<HashMap<String, HashMap<String, CachedItem>>>;
 /// Wird nur auf ausdrückliche Nutzer-Aktion befüllt (startet den Server-Prozess).
 type IntrospectionCache = Mutex<HashMap<String, Introspection>>;
 
-#[derive(Default)]
 pub struct AppState {
     status_cache: StatusCache,
     introspection_cache: IntrospectionCache,
+    /// Persistente App-Einstellungen, beim Start geladen und im Speicher gecacht.
+    settings: RwLock<AppSettings>,
+    /// Status-/Latenz-Historie pro Server (`metrics.rs`), beim Start geladen.
+    metrics: Mutex<crate::metrics::Metrics>,
+    /// Laufende Live-Diagnose-Sessions (`logview.rs`). Max. eine gleichzeitig.
+    log_sessions: Mutex<HashMap<String, crate::logview::LogSessionHandle>>,
+    /// Registry-Suche (`registry.rs`): Ergebnisseiten mit 5-min-TTL, Key
+    /// "query\0cursor". Spart wiederholte Netz-Abfragen beim Blättern/Tippen.
+    registry_cache: Mutex<HashMap<String, (u64, crate::registry::RegistrySearchPage)>>,
 }
 
-/// Stabiler Cache-Schlüssel für die Introspektion eines Servers.
-fn introspection_key(scope: Scope, name: &str, project_path: &Option<String>) -> String {
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            status_cache: Mutex::new(HashMap::new()),
+            introspection_cache: Mutex::new(HashMap::new()),
+            // Einstellungen beim Start laden (fehlend/korrupt -> Defaults, nie Fehler).
+            settings: RwLock::new(crate::settings::load()),
+            metrics: Mutex::new(crate::metrics::load()),
+            log_sessions: Mutex::new(HashMap::new()),
+            registry_cache: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl AppState {
+    /// Kopie der aktuellen Einstellungen (Lese-Snapshot; Guard wird sofort frei).
+    fn settings(&self) -> AppSettings {
+        self.settings
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Verwirft die gecachten Erkenntnisse zu EINEM Server.
+    ///
+    /// Muss nach jeder Mutation laufen, die Definition oder Existenz eines
+    /// Servers ändert (update/remove/rename/set_scope/clone/toggle): sonst
+    /// zeigen Liste und Detail-Modal weiter Tool-/Ressourcen-Zähler, Latenz und
+    /// Fähigkeiten des ALTEN Stands – etwa nachdem `command`/`args` auf einen
+    /// völlig anderen Server geändert wurden.
+    ///
+    /// Bei Umbenennungen/Scope-Wechseln jeweils für Quell- UND Zielschlüssel
+    /// aufrufen, sonst bleibt der alte Key dauerhaft im Speicher liegen.
+    fn invalidate(&self, scope: Scope, name: &str, project_path: &Option<String>) {
+        self.introspection_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&server_key(scope, name, project_path));
+        // Der Status-Cache ist nicht scope-aware (Projektpfad -> Name); den
+        // Namen konservativ für den ganzen Projektkontext verwerfen.
+        let dir_key = resolve_project_dir(project_path.clone())
+            .to_string_lossy()
+            .to_string();
+        if let Some(map) = self
+            .status_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&dir_key)
+        {
+            map.remove(name);
+        }
+    }
+
+    /// Verwirft beide Caches vollständig – für Aktionen, die alle Definitionen
+    /// auf einmal ersetzen können (Restore eines Snapshots).
+    fn clear_caches(&self) {
+        self.introspection_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.status_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    /// Beendet alle laufenden Log-Sessions (killpg). Für den App-Exit-Hook.
+    pub fn kill_all_log_sessions(&self) {
+        let mut s = self.log_sessions.lock().unwrap_or_else(|e| e.into_inner());
+        for (_, h) in s.drain() {
+            h.kill();
+        }
+    }
+}
+
+/// Ermittelt den Transport eines Servers – spiegelt `src/transport.ts`:
+/// explizites `type` gewinnt, sonst aus der URL (`…/sse` ⇒ sse, sonst http),
+/// sonst `command` ⇒ stdio (Default stdio).
+fn transport_of(entry: &ServerEntry) -> &'static str {
+    match entry.transport.as_deref() {
+        Some("stdio") => return "stdio",
+        Some("http") => return "http",
+        Some("sse") => return "sse",
+        _ => {}
+    }
+    // Ein leerer bzw. nur aus Whitespace bestehender `url`-Wert zählt NICHT als
+    // URL: eine handgepflegte `.mcp.json` mit `"url": ""` und ohne `type` lief
+    // sonst in den HTTP-Pfad („Keine URL für HTTP-Introspektion"), während das
+    // Frontend (`e.url` ist falsy) denselben Server unter „stdio" führte.
+    if let Some(url) = entry.url.as_deref().filter(|u| !u.trim().is_empty()) {
+        if url.trim_end_matches('/').ends_with("/sse") {
+            return "sse";
+        }
+        return "http";
+    }
+    "stdio"
+}
+
+/// Löst die **unmaskierte** Definition eines Servers in bereits gelesenen
+/// Definitionen auf: zuerst die aktive Config, sonst – nur bei `Scope::User` –
+/// der Stash. Diese Sonderregel ist die zentrale Invariante: deaktivierte
+/// user-Server stehen NICHT in `~/.claude.json`, sondern ausschließlich im Stash.
+///
+/// Das `bool` im Ergebnis meldet, ob die Definition aus dem Stash kam. Aufrufer,
+/// die den Server bewegen (umbenennen), müssen ihn dann deaktiviert lassen.
+fn resolve_entry_in(defs: &[ScopedEntry], scope: Scope, name: &str) -> Option<(ServerEntry, bool)> {
+    if let Some(d) = defs.iter().find(|d| d.scope == scope && d.name == name) {
+        return Some((d.entry.clone(), false));
+    }
+    if scope == Scope::User {
+        if let Some(item) = crate::stash::peek(name) {
+            return Some((item.entry, true));
+        }
+    }
+    None
+}
+
+/// Wie `resolve_entry_in`, liest die Definitionen aber selbst ein. Der
+/// Handshake/Playground braucht die echten env/args/headers. Fehlt sie, `AppError`.
+fn resolve_entry(
+    scope: Scope,
+    name: &str,
+    project_path: &Option<String>,
+) -> Result<ServerEntry, AppError> {
+    let dir = resolve_project_dir(project_path.clone());
+    resolve_entry_in(&collect_definitions(&dir), scope, name)
+        .map(|(entry, _)| entry)
+        .ok_or_else(|| AppError::Io("Server-Definition nicht gefunden".into()))
+}
+
+/// Stellt sicher, dass `name` im Ziel-Scope noch frei ist – **inklusive Stash**,
+/// weil deaktivierte user-Server nur dort liegen und ein späteres Reaktivieren
+/// eine dort ignorierte Kollision sonst lautlos überschreiben würde.
+fn ensure_name_free(defs: &[ScopedEntry], scope: Scope, name: &str) -> Result<(), AppError> {
+    let in_config = defs.iter().any(|d| d.scope == scope && d.name == name);
+    let in_stash = scope == Scope::User && crate::stash::peek(name).is_some();
+    if !in_config && !in_stash {
+        return Ok(());
+    }
+    let suffix = if in_stash && !in_config {
+        " (aktuell deaktiviert)"
+    } else {
+        ""
+    };
+    Err(AppError::Io(format!(
+        "Ein Server namens „{}“ existiert im Ziel-Scope ({}) bereits{}",
+        name,
+        scope.cli_value(),
+        suffix
+    )))
+}
+
+/// Ob Quell- und Zielverzeichnis dasselbe Projekt meinen – auch bei
+/// unterschiedlicher Schreibweise (Symlink, Trailing-Slash) via Kanonisierung.
+/// Trifft es zu, können bereits gelesene Definitionen wiederverwendet werden
+/// statt dieselben Dateien ein zweites Mal zu lesen.
+fn same_project_dir(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(x), Ok(y)) if x == y
+        )
+}
+
+/// Stabiler Identitätsschlüssel eines Servers (`scope::name::projektpfad`),
+/// genutzt für den Introspektions-Cache, die Metrik-Historie und als Präfix der
+/// Log-Session-Id. **Das Format wird nach `metrics.json` persistiert** – eine
+/// Änderung entwertet die gespeicherte Historie aller Server.
+fn server_key(scope: Scope, name: &str, project_path: &Option<String>) -> String {
     let dir = resolve_project_dir(project_path.clone());
     format!("{}::{}::{}", scope.cli_value(), name, dir.to_string_lossy())
 }
 
 /// Prüft beim Start, ob die claude-CLI verfügbar ist, und liefert ihre Version.
 #[tauri::command]
-pub async fn check_claude() -> Result<ClaudeInfo, AppError> {
-    let Some(path) = resolve_claude() else {
+pub async fn check_claude(state: State<'_, AppState>) -> Result<ClaudeInfo, AppError> {
+    let settings = state.settings();
+    let Some(path) = resolve_claude(settings.claude_path()) else {
         return Ok(ClaudeInfo {
             path: String::new(),
             version: String::new(),
@@ -127,7 +306,9 @@ pub async fn list_servers(
     reveal: bool,
     with_status: bool,
 ) -> Result<Vec<MergedServer>, AppError> {
-    let mut servers = gather_servers(&state.status_cache, project_path, reveal, with_status)?;
+    let settings = state.settings();
+    let mut servers =
+        gather_servers(&state.status_cache, &settings, project_path, reveal, with_status)?;
     // Zähler aus bereits vorhandenen Introspektions-Ergebnissen anreichern.
     let cache = state
         .introspection_cache
@@ -135,7 +316,7 @@ pub async fn list_servers(
         .unwrap_or_else(|e| e.into_inner());
     for s in &mut servers {
         if let Some(scope) = s.scope {
-            if let Some(intro) = cache.get(&introspection_key(scope, &s.name, &s.project_path)) {
+            if let Some(intro) = cache.get(&server_key(scope, &s.name, &s.project_path)) {
                 // Ein gecachter Fehlversuch (error gesetzt, leere Listen) darf kein
                 // irreführendes „0·0·0"-Badge erzeugen.
                 if intro.error.is_none() {
@@ -147,11 +328,41 @@ pub async fn list_servers(
             }
         }
     }
+    drop(cache);
+
+    // Status-/Verfügbarkeits-Historie fortschreiben – nur bei echtem Health-Check
+    // (with_status), ein Batch-Write pro Refresh. Externe Server (scope=None)
+    // werden übersprungen. Bewusst OHNE connect_ms: Latenz wird nur bei einer
+    // echten Introspektion gemessen (siehe introspect_server) – hier würde sonst
+    // der gecachte Wert als Scheinmessung wiederholt. Fehler blockieren nie.
+    if with_status {
+        let now = crate::util::unix_now();
+        let batch: Vec<(String, crate::metrics::MetricPoint)> = servers
+            .iter()
+            .filter_map(|s| {
+                let scope = s.scope?;
+                Some((
+                    server_key(scope, &s.name, &s.project_path),
+                    crate::metrics::MetricPoint {
+                        ts: now,
+                        status_kind: crate::metrics::status_kind(&s.status).to_string(),
+                        connect_ms: None,
+                    },
+                ))
+            })
+            .collect();
+        if !batch.is_empty() {
+            let mut m = state.metrics.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = crate::metrics::record(&mut m, now, batch);
+        }
+    }
+
     Ok(servers)
 }
 
 fn gather_servers(
     cache: &StatusCache,
+    settings: &AppSettings,
     project_path: Option<String>,
     reveal: bool,
     with_status: bool,
@@ -172,8 +383,8 @@ fn gather_servers(
     let mut status_map: HashMap<String, ServerStatus> = HashMap::new();
     let mut list_summaries: HashMap<String, String> = HashMap::new();
     if with_status {
-        if let Some(claude) = resolve_claude() {
-            if let Ok(out) = run_claude(&claude, &["mcp", "list"], Some(&dir), LIST_TIMEOUT) {
+        if let Some(claude) = resolve_claude(settings.claude_path()) {
+            if let Ok(out) = run_claude(&claude, &["mcp", "list"], Some(&dir), settings.list_timeout()) {
                 for item in parse_list(&out.stdout) {
                     list_summaries
                         .entry(item.name.clone())
@@ -360,11 +571,12 @@ fn scope_rank(scope: Option<Scope>) -> u8 {
 /// Einzelnen Server neu health-checken via `claude mcp get <name>`.
 #[tauri::command]
 pub async fn health_check(
+    state: State<'_, AppState>,
     name: String,
     project_path: Option<String>,
 ) -> Result<ServerStatus, AppError> {
     let dir = resolve_project_dir(project_path);
-    let Some(claude) = resolve_claude() else {
+    let Some(claude) = resolve_claude(state.settings().claude_path()) else {
         return Err(AppError::ClaudeNotFound);
     };
     let out = run_claude(&claude, &["mcp", "get", &name], Some(&dir), GET_TIMEOUT)?;
@@ -412,7 +624,7 @@ pub async fn introspect_server(
     project_path: Option<String>,
     refresh: bool,
 ) -> Result<Introspection, AppError> {
-    let key = introspection_key(scope, &name, &project_path);
+    let key = server_key(scope, &name, &project_path);
 
     if !refresh {
         if let Some(cached) = state
@@ -426,44 +638,31 @@ pub async fn introspect_server(
         }
     }
 
-    // Unmaskierte Definition auflösen (wie reveal_server_entry): der Handshake
-    // braucht die echten env/args, um den Prozess zu starten.
-    let dir = resolve_project_dir(project_path.clone());
-    let entry = collect_definitions(&dir)
-        .into_iter()
-        .find(|d| d.scope == scope && d.name == name)
-        .map(|d| d.entry)
-        .or_else(|| {
-            (scope == Scope::User)
-                .then(|| crate::stash::peek(&name).map(|i| i.entry))
-                .flatten()
-        })
-        .ok_or_else(|| AppError::Io("Server-Definition nicht gefunden".into()))?;
+    // Unmaskierte Definition auflösen: der Handshake braucht die echten env/args.
+    let entry = resolve_entry(scope, &name, &project_path)?;
 
-    let mut introspection = if entry.command.is_some() {
-        // Gibt immer eine Introspection zurück; Start-/Handshake-Fehler stehen in
-        // `error`/`logs` (statt als Err), damit die Detail-Ansicht sie zeigen kann.
-        crate::introspect::introspect_stdio(&entry, INTROSPECT_TIMEOUT)
-    } else {
-        // HTTP/SSE: in dieser Version nicht unterstützt (kein Prozess-Start).
-        Introspection {
-            tools: Vec::new(),
-            resources: Vec::new(),
-            prompts: Vec::new(),
-            server_name: None,
-            server_version: None,
-            notes: vec![
-                "Introspektion wird derzeit nur für stdio-Server unterstützt (HTTP/SSE folgt)."
-                    .into(),
-            ],
-            logs: None,
-            error: None,
-            connect_ms: None,
-            introspected_at: crate::introspect::unix_now(),
-        }
+    // Beide Zweige geben immer eine Introspection zurück; Start-/Handshake-Fehler
+    // stehen in `error`/`logs` (statt als Err), damit die Detail-Ansicht sie zeigt.
+    let mut introspection = match transport_of(&entry) {
+        "stdio" => crate::introspect::introspect_stdio(&entry, INTROSPECT_TIMEOUT),
+        _ => crate::introspect::introspect_http(&entry, INTROSPECT_TIMEOUT),
     };
 
     mask_introspection(&mut introspection);
+
+    // Echter Latenz-Messpunkt für die Historie (nur bei erfolgreicher
+    // Introspektion mit gemessener connect_ms) – so trägt die Sparkline echte
+    // Messungen statt wiederholter Cache-Werte. Best effort.
+    if introspection.error.is_none() && introspection.connect_ms.is_some() {
+        let now = crate::util::unix_now();
+        let point = crate::metrics::MetricPoint {
+            ts: now,
+            status_kind: "connected".to_string(),
+            connect_ms: introspection.connect_ms,
+        };
+        let mut m = state.metrics.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = crate::metrics::record(&mut m, now, vec![(key.clone(), point)]);
+    }
 
     state
         .introspection_cache
@@ -472,6 +671,29 @@ pub async fn introspect_server(
         .insert(key, introspection.clone());
 
     Ok(introspection)
+}
+
+/// Führt eine testweise Playground-Operation aus (`tools/call`, `resources/read`,
+/// `prompts/get`). One-shot: Server frisch starten, Handshake, EIN Request,
+/// beenden. **Kein Cache** – jeder Aufruf wird ausgeführt.
+///
+/// `async`, obwohl der Rumpf blockierend ist (wie `introspect_server`): nur
+/// async-Commands laufen in Tauri v2 im Thread-Pool. Synchron würde der Aufruf
+/// bis zu PLAYGROUND_TIMEOUT den Event-Loop blockieren – das Fenster fröre ein.
+#[tauri::command]
+pub async fn playground_call(
+    name: String,
+    scope: Scope,
+    project_path: Option<String>,
+    request: PlaygroundRequest,
+) -> Result<PlaygroundResult, AppError> {
+    let entry = resolve_entry(scope, &name, &project_path)?;
+    let mut result = match transport_of(&entry) {
+        "stdio" => crate::introspect::playground_stdio(&entry, &request, PLAYGROUND_TIMEOUT),
+        _ => crate::introspect::playground_http(&entry, &request, PLAYGROUND_TIMEOUT),
+    };
+    mask_playground(&mut result);
+    Ok(result)
 }
 
 /// Liefert das bereits gecachte Introspektions-Ergebnis eines Servers – **ohne**
@@ -484,13 +706,100 @@ pub fn peek_introspection(
     scope: Scope,
     project_path: Option<String>,
 ) -> Result<Option<Introspection>, AppError> {
-    let key = introspection_key(scope, &name, &project_path);
+    let key = server_key(scope, &name, &project_path);
     Ok(state
         .introspection_cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&key)
         .cloned())
+}
+
+/// Liefert die Status-/Latenz-Historie eines Servers (aus dem Speicher-Cache).
+#[tauri::command]
+pub fn get_metrics(
+    state: State<'_, AppState>,
+    name: String,
+    scope: Scope,
+    project_path: Option<String>,
+) -> Vec<crate::metrics::MetricPoint> {
+    let key = server_key(scope, &name, &project_path);
+    let m = state.metrics.lock().unwrap_or_else(|e| e.into_inner());
+    crate::metrics::points_for(&m, &key)
+}
+
+/// Startet eine Live-Diagnose-Session (`logview.rs`) für einen stdio-Server:
+/// eigene, langlebige Instanz, deren stderr + JSON-RPC live als `mcp-log`-Events
+/// gestreamt werden. Beendet eine evtl. laufende Session (max. eine). Liefert die
+/// Session-Id (für stop/buffer); jedes Event trägt sie im Feld `session`.
+#[tauri::command]
+pub fn start_log_session(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    name: String,
+    scope: Scope,
+    project_path: Option<String>,
+) -> Result<String, AppError> {
+    let entry = resolve_entry(scope, &name, &project_path)?;
+    if transport_of(&entry) != "stdio" {
+        return Err(AppError::Io(
+            "Diagnose-Session wird nur für stdio-Server unterstützt.".into(),
+        ));
+    }
+    let key = server_key(scope, &name, &project_path);
+    let id = format!("logsess::{}::{}", key, crate::util::unix_now());
+
+    let mut sessions = state.log_sessions.lock().unwrap_or_else(|e| e.into_inner());
+    // Jede gebatchte Zeilengruppe als `mcp-log`-Event ans Webview. Die Session-Id
+    // MUSS mit: der Monitor-Thread einer soeben gekillten Session schickt ihre
+    // `closed`-Zeile über denselben Kanal, nachdem die neue Session schon läuft.
+    // Ohne Id hielte das Frontend das für sein eigenes Ende – Badge weg, Prozess
+    // läuft weiter und wäre über die UI nicht mehr stoppbar.
+    //
+    // Das Handle bleibt beim `closed` bewusst im State stehen (früher wurde es
+    // hier abgeräumt): stirbt der Prozess bei geschlossenem Modal – Crash oder
+    // SESSION_TIMEOUT –, lieferte `log_session_buffer` beim Wieder-Öffnen sonst
+    // ein leeres Array, und genau die Absturzzeilen samt `closed`-Meldung, also
+    // der eigentliche Diagnosewert, wären verloren. Gefahrlos, weil `kill()`
+    // nach dem Ernten kein Signal mehr schickt (siehe `logview::Reaped`).
+    let session_id = id.clone();
+    let handle = crate::logview::start(&entry, move |lines| {
+        let _ = app.emit(
+            crate::logview::EVENT_NAME,
+            serde_json::json!({ "session": session_id.as_str(), "lines": lines }),
+        );
+    })?;
+    // Erst NACH dem erfolgreichen Start die laufende Session beenden – nur eine
+    // gleichzeitig. Andersherum (früher) riss ein fehlgeschlagener Start die
+    // alte Session mit: ihr Handle war weg, das Frontend bekam weder `closed`
+    // für die alte noch eine Id für die neue und behauptete weiter „Diagnose
+    // läuft". Hier (und NUR hier) werden auch die Handles bereits beendeter
+    // Sessions verworfen: bis dahin halten sie ihren Ring für den Backfill.
+    for (_, h) in sessions.drain() {
+        h.kill();
+    }
+    sessions.insert(id.clone(), handle);
+    Ok(id)
+}
+
+/// Beendet eine Diagnose-Session (killpg der Prozessgruppe).
+#[tauri::command]
+pub fn stop_log_session(state: State<'_, AppState>, id: String) -> Result<(), AppError> {
+    let mut sessions = state.log_sessions.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(h) = sessions.remove(&id) {
+        h.kill();
+    }
+    Ok(())
+}
+
+/// Aktueller Ring-Puffer einer Session (Backfill beim Wieder-Öffnen der Ansicht).
+#[tauri::command]
+pub fn log_session_buffer(
+    state: State<'_, AppState>,
+    id: String,
+) -> Vec<crate::logview::LogLine> {
+    let sessions = state.log_sessions.lock().unwrap_or_else(|e| e.into_inner());
+    sessions.get(&id).map(|h| h.buffer()).unwrap_or_default()
 }
 
 /// Laufzeit-Preflight für einen Server: prüft, ob der benötigte Befehl
@@ -529,47 +838,6 @@ pub async fn preflight_server(
     Ok(preflight)
 }
 
-/// Maskiert geheim aussehende Werte in Tool-Schemata, Beschreibungen und Notizen,
-/// bevor das Ergebnis das Backend verlässt.
-fn mask_introspection(intro: &mut Introspection) {
-    for t in &mut intro.tools {
-        t.name = redact_secrets(&t.name);
-        if let Some(d) = t.description.as_mut() {
-            *d = redact_secrets(d);
-        }
-        if let Some(schema) = t.input_schema.take() {
-            t.input_schema = Some(redact_json(&schema));
-        }
-    }
-    for r in &mut intro.resources {
-        // uri kann geheime Query-Parameter enthalten (z. B. ?token=…).
-        r.uri = redact_secrets(&r.uri);
-        if let Some(n) = r.name.as_mut() {
-            *n = redact_secrets(n);
-        }
-        if let Some(d) = r.description.as_mut() {
-            *d = redact_secrets(d);
-        }
-    }
-    for p in &mut intro.prompts {
-        p.name = redact_secrets(&p.name);
-        if let Some(d) = p.description.as_mut() {
-            *d = redact_secrets(d);
-        }
-    }
-    for n in &mut intro.notes {
-        *n = redact_secrets(n);
-    }
-    // Erfasster stderr und Fehlermeldung können Tokens enthalten (z. B. „auth token
-    // expired: ghp_…" oder ein geechotes Config-JSON) – vor dem UI redigieren.
-    if let Some(l) = intro.logs.as_mut() {
-        *l = redact_secrets(l);
-    }
-    if let Some(e) = intro.error.as_mut() {
-        *e = redact_secrets(e);
-    }
-}
-
 /// Arbeitsverzeichnis für einen Scope: user = Home, local/project = Projektpfad.
 fn cwd_for(scope: Scope, project_path: &Option<String>) -> Option<PathBuf> {
     match scope {
@@ -579,8 +847,13 @@ fn cwd_for(scope: Scope, project_path: &Option<String>) -> Option<PathBuf> {
 }
 
 /// Führt eine mutierende claude-Operation aus und mappt Nicht-Null-Exit auf CliFailed.
-fn run_mut(args: &[&str], cwd: Option<PathBuf>, timeout: Duration) -> Result<(), AppError> {
-    let claude = resolve_claude().ok_or(AppError::ClaudeNotFound)?;
+fn run_mut(
+    claude_path: Option<&str>,
+    args: &[&str],
+    cwd: Option<PathBuf>,
+    timeout: Duration,
+) -> Result<(), AppError> {
+    let claude = resolve_claude(claude_path).ok_or(AppError::ClaudeNotFound)?;
     let out = run_claude(&claude, args, cwd.as_deref(), timeout)?;
     if out.success() {
         Ok(())
@@ -602,15 +875,29 @@ fn run_mut(args: &[&str], cwd: Option<PathBuf>, timeout: Duration) -> Result<(),
 /// Fügt via `claude mcp add-json` einen Server hinzu (upsert nicht garantiert).
 #[tauri::command]
 pub async fn add_server(
+    state: State<'_, AppState>,
     name: String,
     scope: Scope,
     project_path: Option<String>,
     entry: ServerEntry,
 ) -> Result<(), AppError> {
-    add_server_impl(name, scope, project_path, entry)
+    let result = add_server_impl(
+        &state.settings(),
+        name.clone(),
+        scope,
+        project_path.clone(),
+        entry,
+    );
+    // Ein neu angelegter Name könnte auf einen alten Cache-Eintrag desselben
+    // Namens treffen (z. B. nach externem Löschen) – vorsorglich verwerfen.
+    // Bewusst unabhängig vom Ergebnis: ein Cache-Miss kostet nur eine erneute
+    // Introspektion, ein veralteter Treffer zeigt falsche Fähigkeiten an.
+    state.invalidate(scope, &name, &project_path);
+    result
 }
 
 fn add_server_impl(
+    settings: &AppSettings,
     name: String,
     scope: Scope,
     project_path: Option<String>,
@@ -619,51 +906,82 @@ fn add_server_impl(
     let json = serde_json::to_string(&entry).map_err(|e| AppError::Parse(e.to_string()))?;
     let cwd = cwd_for(scope, &project_path);
     run_mut(
+        settings.claude_path(),
         &["mcp", "add-json", "-s", scope.cli_value(), &name, &json],
         cwd,
-        MUT_TIMEOUT,
+        settings.mut_timeout(),
     )
 }
 
 /// Bearbeitet einen Server: alten Stand sichern -> entfernen -> neu anlegen.
 /// Schlägt das Neu-Anlegen fehl, wird der alte Stand zurückgerollt.
+///
+/// Sonderfall deaktivierter user-Server: dessen Definition liegt nur im Stash,
+/// die neue Fassung wird dort ersetzt – Bearbeiten aktiviert ihn NICHT.
 #[tauri::command]
 pub async fn update_server(
+    state: State<'_, AppState>,
     name: String,
     scope: Scope,
     project_path: Option<String>,
     entry: ServerEntry,
 ) -> Result<(), AppError> {
-    update_server_impl(name, scope, project_path, entry)
+    let result = update_server_impl(
+        &state.settings(),
+        name.clone(),
+        scope,
+        project_path.clone(),
+        entry,
+    );
+    // Auch bei Fehler (Rollback greift evtl. nicht sauber) lieber verwerfen als
+    // veraltete Fähigkeiten weiterzeigen.
+    state.invalidate(scope, &name, &project_path);
+    result
 }
 
 fn update_server_impl(
+    settings: &AppSettings,
     name: String,
     scope: Scope,
     project_path: Option<String>,
     entry: ServerEntry,
 ) -> Result<(), AppError> {
     let dir = resolve_project_dir(project_path.clone());
-    let old = collect_definitions(&dir)
-        .into_iter()
-        .find(|d| d.scope == scope && d.name == name)
-        .map(|d| d.entry);
+    let defs = collect_definitions(&dir);
+
+    // Alten Stand über `resolve_entry_in` auflösen – NICHT über die reine
+    // Config-Suche: ein deaktivierter user-Server steht ausschließlich im Stash.
+    let resolved = resolve_entry_in(&defs, scope, &name);
+
+    if matches!(resolved, Some((_, true))) {
+        // Deaktivierten Server bearbeiten: die neue Definition zurück in den
+        // Stash schreiben, kein `claude`-Aufruf. Ohne diesen Zweig legte
+        // `add-json` den Server in `~/.claude.json` an – Bearbeiten hätte ihn
+        // also nebenbei AKTIVIERT (und der alte Stash-Eintrag bliebe als Leiche
+        // zurück, weil `gather_servers` ihn nur wegen `existing_user` ausblendet).
+        return crate::stash::upsert(&name, entry);
+    }
+    let old = resolved.map(|(e, _)| e);
 
     let cwd = cwd_for(scope, &project_path);
+    let timeout = settings.mut_timeout();
+    let claude_path = settings.claude_path();
     let new_json = serde_json::to_string(&entry).map_err(|e| AppError::Parse(e.to_string()))?;
 
     // Alten Eintrag entfernen (falls vorhanden).
     let _ = run_mut(
+        claude_path,
         &["mcp", "remove", "-s", scope.cli_value(), &name],
         cwd.clone(),
-        MUT_TIMEOUT,
+        timeout,
     );
 
     // Neuen Eintrag anlegen.
     match run_mut(
+        claude_path,
         &["mcp", "add-json", "-s", scope.cli_value(), &name, &new_json],
         cwd.clone(),
-        MUT_TIMEOUT,
+        timeout,
     ) {
         Ok(()) => Ok(()),
         Err(err) => {
@@ -671,9 +989,10 @@ fn update_server_impl(
             if let Some(old_entry) = old {
                 if let Ok(old_json) = serde_json::to_string(&old_entry) {
                     let _ = run_mut(
+                        claude_path,
                         &["mcp", "add-json", "-s", scope.cli_value(), &name, &old_json],
                         cwd,
-                        MUT_TIMEOUT,
+                        timeout,
                     );
                 }
             }
@@ -682,93 +1001,201 @@ fn update_server_impl(
     }
 }
 
-/// Entfernt einen Server via `claude mcp remove`.
+/// Legt einen Auto-Snapshot an, sofern `note` gesetzt ist (`None` überspringt –
+/// z. B. wenn der Aufrufer für eine Bulk-Aktion bereits einen gemeinsamen
+/// Snapshot angelegt hat). Schlägt die Sicherung fehl, bricht die aufrufende
+/// destruktive Aktion ab (lieber nicht ändern als ungesichert ändern).
+///
+/// Bewusst OHNE Rollback: der Aufrufer legt den Snapshot erst NACH allen
+/// billigen Vorbedingungsprüfungen an (kein Waisen-Snapshot bei „nicht
+/// gefunden") und unmittelbar VOR der ersten Mutation. Einen einmal angelegten
+/// Snapshot wieder zu löschen wäre gefährlich: Schlägt eine mehrstufige Aktion
+/// nach einer Teil-Mutation fehl (z. B. set_scope: im Ziel angelegt, aus der
+/// Quelle-Entfernen scheitert), ist genau dieser Snapshot die einzige
+/// Wiederherstellungsmöglichkeit.
+fn auto_snapshot(settings: &AppSettings, note: Option<String>) -> Result<(), AppError> {
+    if let Some(n) = note {
+        crate::snapshot::create(Some(n), true, settings.snapshot_retention)?;
+    }
+    Ok(())
+}
+
+/// Entfernt einen Server via `claude mcp remove`. `skip_snapshot` unterdrückt den
+/// automatischen Snapshot (Bulk-Aktionen sichern einmalig vorab).
 #[tauri::command]
 pub async fn remove_server(
+    state: State<'_, AppState>,
     name: String,
     scope: Scope,
     project_path: Option<String>,
+    skip_snapshot: Option<bool>,
 ) -> Result<(), AppError> {
-    remove_server_impl(name, scope, project_path)
+    let result = remove_server_impl(
+        &state.settings(),
+        name.clone(),
+        scope,
+        project_path.clone(),
+        !skip_snapshot.unwrap_or(false),
+    );
+    state.invalidate(scope, &name, &project_path);
+    result
 }
 
 fn remove_server_impl(
+    settings: &AppSettings,
     name: String,
     scope: Scope,
     project_path: Option<String>,
+    snapshot: bool,
 ) -> Result<(), AppError> {
+    // Deaktivierte user-scope Server liegen ausschließlich im Stash und nicht
+    // in ~/.claude.json – `claude mcp remove` würde sie nicht finden. Solche
+    // Einträge direkt aus dem Stash löschen. Steht der Server (kaputte
+    // Invariante) trotzdem auch aktiv in ~/.claude.json, NICHT kurzschließen.
+    if scope == Scope::User && crate::stash::peek(&name).is_some() {
+        let active = collect_definitions(&default_project_path())
+            .into_iter()
+            .any(|d| d.scope == Scope::User && d.name == name);
+        if !active {
+            // Reine Stash-Mutation -> vorher sichern, dann entfernen.
+            auto_snapshot(settings, snapshot.then(|| format!("auto: remove_server {name}")))?;
+            return crate::stash::remove(&name);
+        }
+    }
+    // Auto-Snapshot unmittelbar vor der Mutation (schlägt er fehl, wird nichts
+    // entfernt). Kein nachträgliches Löschen – siehe auto_snapshot.
+    auto_snapshot(settings, snapshot.then(|| format!("auto: remove_server {name}")))?;
     let cwd = cwd_for(scope, &project_path);
     run_mut(
+        settings.claude_path(),
         &["mcp", "remove", "-s", scope.cli_value(), &name],
         cwd,
-        MUT_TIMEOUT,
-    )
+        settings.mut_timeout(),
+    )?;
+    // Verwaisten Stash-Eintrag mitentfernen (defensiv; no-op ohne Eintrag).
+    if scope == Scope::User {
+        let _ = crate::stash::remove(&name);
+    }
+    // Verwaisten Toggle-Eintrag mitentfernen (nur project scope; siehe dort).
+    forget_mcpjson_toggle(scope, &name, &project_path);
+    Ok(())
 }
 
 /// OAuth-Anmeldung für HTTP/SSE-Server bzw. Connectoren. Öffnet ggf. den Browser.
 #[tauri::command]
-pub async fn login_server(name: String) -> Result<(), AppError> {
-    run_mut(&["mcp", "login", &name], None, LOGIN_TIMEOUT)
+pub async fn login_server(state: State<'_, AppState>, name: String) -> Result<(), AppError> {
+    // Login-Timeout bleibt großzügig (Browser-Flow) und ist bewusst nicht konfigurierbar.
+    run_mut(state.settings().claude_path(), &["mcp", "login", &name], None, LOGIN_TIMEOUT)
 }
 
 /// Gespeicherte OAuth-Credentials eines Servers löschen.
 #[tauri::command]
-pub async fn logout_server(name: String) -> Result<(), AppError> {
-    run_mut(&["mcp", "logout", &name], None, MUT_TIMEOUT)
+pub async fn logout_server(state: State<'_, AppState>, name: String) -> Result<(), AppError> {
+    let settings = state.settings();
+    run_mut(settings.claude_path(), &["mcp", "logout", &name], None, settings.mut_timeout())
 }
 
 /// Setzt Freigabe-/Ablehnungs-Entscheidungen für .mcp.json-Server im Projekt zurück.
 #[tauri::command]
-pub async fn reset_project_choices(project_path: Option<String>) -> Result<(), AppError> {
+pub async fn reset_project_choices(
+    state: State<'_, AppState>,
+    project_path: Option<String>,
+) -> Result<(), AppError> {
     let cwd = Some(resolve_project_dir(project_path));
-    run_mut(&["mcp", "reset-project-choices"], cwd, MUT_TIMEOUT)
+    let settings = state.settings();
+    run_mut(settings.claude_path(), &["mcp", "reset-project-choices"], cwd, settings.mut_timeout())
 }
 
 /// Aktiviert/deaktiviert einen .mcp.json-Server (project scope) über die
 /// settings.local.json-Arrays.
 #[tauri::command]
 pub fn toggle_mcpjson_server(
+    state: State<'_, AppState>,
     name: String,
     project_path: Option<String>,
     enabled: bool,
 ) -> Result<(), AppError> {
-    // Mit gesetztem project_path pro-Projekt in <projekt>/.claude/settings.local.json
-    // schreiben; sonst global in ~/.claude/settings.local.json.
-    let target = match project_path.filter(|p| !p.is_empty()) {
+    let result = toggle_mcpjson_server_impl(name.clone(), project_path.clone(), enabled);
+    state.invalidate(Scope::Project, &name, &project_path);
+    result
+}
+
+fn toggle_mcpjson_server_impl(
+    name: String,
+    project_path: Option<String>,
+    enabled: bool,
+) -> Result<(), AppError> {
+    crate::toggles::toggle_mcpjson(&mcpjson_settings_target(&project_path), &name, enabled)
+}
+
+/// Zieldatei der enable/disable-Arrays für `.mcp.json`-Server: mit gesetztem
+/// `project_path` pro Projekt in `<projekt>/.claude/settings.local.json`, sonst
+/// global in `~/.claude/settings.local.json`.
+fn mcpjson_settings_target(project_path: &Option<String>) -> PathBuf {
+    match project_path.as_ref().filter(|p| !p.is_empty()) {
         Some(p) => project_settings_local_path(&PathBuf::from(p)),
         None => settings_local_path(),
-    };
-    crate::toggles::toggle_mcpjson(&target, &name, enabled)
+    }
+}
+
+/// Streicht einen `.mcp.json`-Server aus BEIDEN Toggle-Arrays.
+///
+/// Die Arrays sind rein namensbasiert. Verschwindet ein project-scope Server
+/// (entfernt, umbenannt, in einen anderen Scope verschoben), bliebe sein Name
+/// sonst als Leiche stehen und würde einen später gleichnamig angelegten Server
+/// ungefragt vor-aktivieren oder vor-deaktivieren. Best effort: ein Fehler beim
+/// Aufräumen darf die bereits erfolgreiche Mutation nicht scheitern lassen.
+fn forget_mcpjson_toggle(scope: Scope, name: &str, project_path: &Option<String>) {
+    if scope != Scope::Project {
+        return;
+    }
+    let _ = crate::toggles::forget_mcpjson(&mcpjson_settings_target(project_path), name);
 }
 
 /// Aktiviert/deaktiviert einen user-scope Server per Stash-and-restore.
 #[tauri::command]
 pub async fn toggle_user_server(
+    state: State<'_, AppState>,
     name: String,
     enabled: bool,
     entry: Option<ServerEntry>,
+    skip_snapshot: Option<bool>,
 ) -> Result<(), AppError> {
-    toggle_user_server_impl(name, enabled, entry)
+    let result = toggle_user_server_impl(
+        &state.settings(),
+        name.clone(),
+        enabled,
+        entry,
+        !skip_snapshot.unwrap_or(false),
+    );
+    // user-scope liegt im Home-Kontext (project_path = None).
+    state.invalidate(Scope::User, &name, &None);
+    result
 }
 
 fn toggle_user_server_impl(
+    settings: &AppSettings,
     name: String,
     enabled: bool,
     entry: Option<ServerEntry>,
+    snapshot: bool,
 ) -> Result<(), AppError> {
     if enabled {
         // Reaktivieren: Definition aus dem Stash zurückspielen.
         let item = crate::stash::peek(&name).ok_or(AppError::StashMissing)?;
         let json = serde_json::to_string(&item.entry).map_err(|e| AppError::Parse(e.to_string()))?;
         run_mut(
+            settings.claude_path(),
             &["mcp", "add-json", "-s", "user", &name, &json],
             None,
-            MUT_TIMEOUT,
+            settings.mut_timeout(),
         )?;
         crate::stash::remove(&name)?; // erst nach Erfolg
         Ok(())
     } else {
-        // Deaktivieren: aktuelle Definition sichern, DANN entfernen.
+        // Deaktivieren: erst die Definition ermitteln (Vorbedingung – erzeugt
+        // noch keinen Snapshot, falls nicht gefunden), dann sichern, dann
+        // mutieren. Kein Rollback: ab stash::upsert wurde bereits geschrieben.
         let dir = default_project_path();
         let current = collect_definitions(&dir)
             .into_iter()
@@ -776,26 +1203,80 @@ fn toggle_user_server_impl(
             .map(|d| d.entry)
             .or(entry)
             .ok_or_else(|| AppError::Io("Server-Definition nicht gefunden".into()))?;
+        auto_snapshot(settings, snapshot.then(|| format!("auto: disable {name}")))?;
         crate::stash::upsert(&name, current)?;
-        run_mut(&["mcp", "remove", "-s", "user", &name], None, MUT_TIMEOUT)?;
+        run_mut(
+            settings.claude_path(),
+            &["mcp", "remove", "-s", "user", &name],
+            None,
+            settings.mut_timeout(),
+        )?;
         Ok(())
     }
+}
+
+/// Kopiert eine Server-Definition verifiziert in einen Ziel-Scope: via
+/// `claude mcp add-json` anlegen, danach über `collect_definitions` bestätigen.
+/// Gemeinsame Basis für `set_scope` (Verschieben) und `clone_server` (Duplizieren) –
+/// der Aufrufer entscheidet, ob die Quelle danach entfernt wird.
+fn copy_definition(
+    settings: &AppSettings,
+    entry: &ServerEntry,
+    name: &str,
+    to_scope: Scope,
+    to_project: &Option<String>,
+) -> Result<(), AppError> {
+    let json = serde_json::to_string(entry).map_err(|e| AppError::Parse(e.to_string()))?;
+
+    // 1. Im Ziel-Scope anlegen.
+    run_mut(
+        settings.claude_path(),
+        &["mcp", "add-json", "-s", to_scope.cli_value(), name, &json],
+        cwd_for(to_scope, to_project),
+        settings.mut_timeout(),
+    )?;
+
+    // 2. Erfolg verifizieren.
+    let to_dir = resolve_project_dir(to_project.clone());
+    let landed = collect_definitions(&to_dir)
+        .into_iter()
+        .any(|d| d.scope == to_scope && d.name == name);
+    if !landed {
+        return Err(AppError::Io(
+            "Anlegen im Ziel-Scope wurde nicht bestätigt.".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Verschiebt einen Server in einen anderen Scope: verifiziertes Anlegen im
 /// Ziel-Scope, danach Entfernen aus dem Quell-Scope (nie umgekehrt).
 #[tauri::command]
 pub async fn set_scope(
+    state: State<'_, AppState>,
     name: String,
     from_scope: Scope,
     to_scope: Scope,
     from_project: Option<String>,
     to_project: Option<String>,
 ) -> Result<(), AppError> {
-    set_scope_impl(name, from_scope, to_scope, from_project, to_project)
+    let result = set_scope_impl(
+        &state.settings(),
+        name.clone(),
+        from_scope,
+        to_scope,
+        from_project.clone(),
+        to_project.clone(),
+    );
+    // Quell- UND Zielschlüssel: der Server ist im Ziel neu und in der Quelle weg
+    // (bei Teil-Erfolg evtl. in beiden) – beide Stände sind nicht mehr gültig.
+    state.invalidate(from_scope, &name, &from_project);
+    state.invalidate(to_scope, &name, &to_project);
+    result
 }
 
 fn set_scope_impl(
+    settings: &AppSettings,
     name: String,
     from_scope: Scope,
     to_scope: Scope,
@@ -808,36 +1289,51 @@ fn set_scope_impl(
 
     let from_dir = resolve_project_dir(from_project.clone());
     let to_dir = resolve_project_dir(to_project.clone());
+    let timeout = settings.mut_timeout();
+    let claude_path = settings.claude_path();
 
-    let entry = collect_definitions(&from_dir)
-        .into_iter()
-        .find(|d| d.scope == from_scope && d.name == name)
-        .map(|d| d.entry)
+    // Vorbedingungen zuerst (erzeugt noch keinen Snapshot, falls etwas fehlt).
+    let from_defs = collect_definitions(&from_dir);
+    let (entry, from_stash) = resolve_entry_in(&from_defs, from_scope, &name)
         .ok_or_else(|| AppError::Io("Quell-Definition nicht gefunden".into()))?;
-    let json = serde_json::to_string(&entry).map_err(|e| AppError::Parse(e.to_string()))?;
 
-    // 1. Im Ziel-Scope anlegen.
-    run_mut(
-        &["mcp", "add-json", "-s", to_scope.cli_value(), &name, &json],
-        cwd_for(to_scope, &to_project),
-        MUT_TIMEOUT,
-    )?;
-
-    // 2. Erfolg verifizieren.
-    let landed = collect_definitions(&to_dir)
-        .into_iter()
-        .any(|d| d.scope == to_scope && d.name == name);
-    if !landed {
+    // Bewusste Einschränkung: ein DEAKTIVIERTER user-Server liegt nur im Stash,
+    // nicht in `~/.claude.json`. Ihn zu verschieben hieße, ihn im Ziel-Scope
+    // aktiv anzulegen (Schritt 1) – das Entfernen in der Quelle (Schritt 3)
+    // müsste dann scheitern und ließe den Server doppelt zurück. Deshalb hier
+    // ablehnen statt heimlich zu aktivieren.
+    if from_stash {
         return Err(AppError::Io(
-            "Anlegen im Ziel-Scope wurde nicht bestätigt – Quelle bleibt unangetastet.".into(),
+            "Deaktivierte Server können den Scope nicht wechseln – erst aktivieren".into(),
         ));
     }
 
+    // Zielname darf im Ziel-Scope nicht existieren (inkl. Stash bei user) –
+    // dieselbe Regel wie bei clone_server/rename_server, sonst überschriebe der
+    // Umzug eine fremde Definition und die Quelle würde danach gelöscht.
+    let to_defs = if same_project_dir(&from_dir, &to_dir) {
+        from_defs
+    } else {
+        collect_definitions(&to_dir)
+    };
+    ensure_name_free(&to_defs, to_scope, &name)?;
+
+    // Auto-Snapshot unmittelbar vor der ersten Mutation. NICHT nachträglich
+    // löschen: schlägt Schritt 3 (Entfernen aus der Quelle) nach erfolgreichem
+    // Anlegen im Ziel fehl, ist der Server dupliziert – dann ist genau dieser
+    // Snapshot die einzige Möglichkeit, den sauberen Vorher-Zustand
+    // wiederherzustellen.
+    auto_snapshot(settings, Some(format!("auto: set_scope {name}")))?;
+
+    // 1.+2. Verifiziert im Ziel-Scope anlegen (Quelle bleibt bei Fehler unberührt).
+    copy_definition(settings, &entry, &name, to_scope, &to_project)?;
+
     // 3. Erst jetzt aus dem Quell-Scope entfernen.
     if let Err(e) = run_mut(
+        claude_path,
         &["mcp", "remove", "-s", from_scope.cli_value(), &name],
         cwd_for(from_scope, &from_project),
-        MUT_TIMEOUT,
+        timeout,
     ) {
         return Err(AppError::Io(format!(
             "In Ziel-Scope kopiert, aber alte Kopie ({}) konnte nicht entfernt werden: {}",
@@ -845,7 +1341,211 @@ fn set_scope_impl(
             e
         )));
     }
+    // Beim Weg aus dem project scope den Namen aus den Toggle-Arrays streichen –
+    // sonst bliebe dort eine Leiche für einen später gleichnamigen .mcp.json-Server.
+    forget_mcpjson_toggle(from_scope, &name, &from_project);
+    Ok(())
+}
 
+/// Dupliziert einen Server in einen (ggf. anderen) Scope/ein anderes Projekt.
+/// Die Quelle bleibt bestehen. Secrets werden backend-seitig aufgelöst und
+/// wandern nicht durchs Webview.
+#[tauri::command]
+pub async fn clone_server(
+    state: State<'_, AppState>,
+    name: String,
+    from_scope: Scope,
+    from_project: Option<String>,
+    new_name: String,
+    to_scope: Scope,
+    to_project: Option<String>,
+) -> Result<(), AppError> {
+    let result = clone_server_impl(
+        &state.settings(),
+        name.clone(),
+        from_scope,
+        from_project.clone(),
+        new_name.clone(),
+        to_scope,
+        to_project.clone(),
+    );
+    // Quelle bleibt bestehen, wird aber neu eingelesen; das Ziel ist neu.
+    state.invalidate(from_scope, &name, &from_project);
+    state.invalidate(to_scope, new_name.trim(), &to_project);
+    result
+}
+
+fn clone_server_impl(
+    settings: &AppSettings,
+    name: String,
+    from_scope: Scope,
+    from_project: Option<String>,
+    new_name: String,
+    to_scope: Scope,
+    to_project: Option<String>,
+) -> Result<(), AppError> {
+    let new_name = new_name.trim().to_string();
+    if new_name.is_empty() {
+        return Err(AppError::Io("Neuer Name darf nicht leer sein".into()));
+    }
+
+    let from_dir = resolve_project_dir(from_project.clone());
+    let to_dir = resolve_project_dir(to_project.clone());
+
+    // Ziel-Projektverzeichnis muss existieren – sonst könnte die CLI die Definition
+    // ins Leere schreiben. User-Scope braucht kein Projektverzeichnis.
+    if matches!(to_scope, Scope::Local | Scope::Project) && !to_dir.is_dir() {
+        return Err(AppError::Io(format!(
+            "Zielprojekt existiert nicht: {}",
+            to_dir.display()
+        )));
+    }
+
+    // 1. Unmaskierte Quell-Definition auflösen (Config zuerst, dann Stash für
+    //    deaktivierte User-Server – analog zu reveal_server_entry). Ob die Quelle
+    //    deaktiviert war, ist beim Klonen bewusst egal: der Klon entsteht aktiv.
+    let from_defs = collect_definitions(&from_dir);
+    let (entry, _from_stash) = resolve_entry_in(&from_defs, from_scope, &name)
+        .ok_or_else(|| AppError::Io("Quell-Definition nicht gefunden".into()))?;
+
+    // 2. Kollision im Ziel prüfen – niemals überschreiben (siehe ensure_name_free).
+    let to_defs = if same_project_dir(&from_dir, &to_dir) {
+        from_defs
+    } else {
+        collect_definitions(&to_dir)
+    };
+    ensure_name_free(&to_defs, to_scope, &new_name)?;
+
+    // 3. Verifiziert im Ziel anlegen.
+    copy_definition(settings, &entry, &new_name, to_scope, &to_project)
+}
+
+/// Findet Namenskonflikte: Server, deren Name in mehreren Scopes definiert ist.
+/// Bezieht deaktivierte user-scope Server aus dem Stash mit ein (sonst entsteht
+/// der Konflikt beim Reaktivieren überraschend). Fachlogik in `conflicts.rs`.
+///
+/// **Bewusst pro Projekt-Kontext** (`project_path` bzw. Home): geprüft wird
+/// user + local/project GENAU dieses Kontexts – so, wie Claude Code beim
+/// Arbeiten in genau diesem Verzeichnis auflöst. Ein „globaler" Konflikt über
+/// mehrere Projekte hinweg wäre nicht sinnvoll darstellbar, weil der effektive
+/// Scope kontextabhängig ist (local von Projekt A vs. local von Projekt B haben
+/// keinen gemeinsamen Gewinner). Konflikte anderer Projekte erscheinen daher
+/// erst beim Öffnen des jeweiligen Projekts.
+#[tauri::command]
+pub fn list_conflicts(project_path: Option<String>) -> Result<Vec<ConflictInfo>, AppError> {
+    let dir = resolve_project_dir(project_path);
+    let mut defs = collect_definitions(&dir);
+
+    // Stash (deaktivierte user-scope Server) ergänzen, sofern nicht schon aktiv.
+    let active_user: std::collections::HashSet<String> = defs
+        .iter()
+        .filter(|d| d.scope == Scope::User)
+        .map(|d| d.name.clone())
+        .collect();
+    for (name, item) in crate::stash::all().user {
+        if !active_user.contains(&name) {
+            defs.push(ScopedEntry {
+                scope: Scope::User,
+                name,
+                entry: item.entry,
+                project_path: None,
+            });
+        }
+    }
+
+    Ok(crate::conflicts::find(&defs))
+}
+
+/// Benennt einen Server innerhalb desselben Scopes um: Kopie unter dem neuen
+/// Namen verifiziert anlegen, dann das Original entfernen (Muster wie
+/// `clone_server`/`set_scope`). Lehnt ab, wenn der Zielname im selben Scope
+/// bereits existiert.
+#[tauri::command]
+pub async fn rename_server(
+    state: State<'_, AppState>,
+    name: String,
+    scope: Scope,
+    project_path: Option<String>,
+    new_name: String,
+) -> Result<(), AppError> {
+    let result = rename_server_impl(
+        &state.settings(),
+        name.clone(),
+        scope,
+        project_path.clone(),
+        new_name.clone(),
+    );
+    // Alten UND neuen Schlüssel verwerfen – sonst bliebe der alte Key dauerhaft
+    // im Cache liegen und der neue Name erbte nichts.
+    state.invalidate(scope, &name, &project_path);
+    state.invalidate(scope, new_name.trim(), &project_path);
+    result
+}
+
+fn rename_server_impl(
+    settings: &AppSettings,
+    name: String,
+    scope: Scope,
+    project_path: Option<String>,
+    new_name: String,
+) -> Result<(), AppError> {
+    let new_name = new_name.trim().to_string();
+    if new_name.is_empty() {
+        return Err(AppError::Io("Neuer Name darf nicht leer sein".into()));
+    }
+    if new_name == name {
+        return Ok(()); // No-op
+    }
+
+    let dir = resolve_project_dir(project_path.clone());
+    let defs = collect_definitions(&dir);
+
+    // Quell-Definition auflösen. `from_stash` merkt sich, dass die Quelle
+    // deaktiviert war – dann bleibt der umbenannte Server ebenfalls deaktiviert
+    // (er wird NICHT durch das Umbenennen unbeabsichtigt aktiviert).
+    let (entry, from_stash) = resolve_entry_in(&defs, scope, &name)
+        .ok_or_else(|| AppError::Io("Quell-Definition nicht gefunden".into()))?;
+
+    // Zielname darf im selben Scope nicht existieren (inkl. Stash bei user).
+    ensure_name_free(&defs, scope, &new_name)?;
+
+    // Auto-Snapshot vor der Mutation (kein Rollback – siehe auto_snapshot).
+    auto_snapshot(
+        settings,
+        Some(format!("auto: rename_server {name} -> {new_name}")),
+    )?;
+
+    if from_stash {
+        // Deaktivierten Server umbenennen: unter neuem Namen wieder in den Stash
+        // legen und den alten Eintrag entfernen – kein claude-Aufruf, kein
+        // Aktivieren. Erst upsert, dann remove (Reihenfolge wie beim Deaktivieren).
+        crate::stash::upsert(&new_name, entry)?;
+        crate::stash::remove(&name)?;
+        return Ok(());
+    }
+
+    // Der enable/disable-Zustand von .mcp.json-Servern hängt am NAMEN. Vor der
+    // Mutation ablesen: nach dem Entfernen der alten Definition ist er nicht
+    // mehr rekonstruierbar.
+    let war_aktiviert = (scope == Scope::Project)
+        .then(|| crate::config_read::collect_disabled(&dir).is_enabled(&name));
+
+    // Aktiver Server: verifiziert unter neuem Namen anlegen, dann Original
+    // entfernen (Snapshot wurde bereits angelegt -> hier überspringen).
+    copy_definition(settings, &entry, &new_name, scope, &project_path)?;
+    remove_server_impl(settings, name.clone(), scope, project_path.clone(), false)?;
+
+    // Zustand auf den neuen Namen übertragen und den alten aus beiden Arrays
+    // streichen. Ohne das stünde der neue Name in keinem Array – und ein
+    // aktivierter Server wäre allein durchs Umbenennen deaktiviert.
+    if let Some(enabled) = war_aktiviert {
+        let _ = crate::toggles::rename_mcpjson(
+            &mcpjson_settings_target(&project_path),
+            &name,
+            &new_name,
+            enabled,
+        );
+    }
     Ok(())
 }
 
@@ -885,10 +1585,30 @@ pub fn list_projects() -> Result<Vec<ProjectInfo>, AppError> {
 /// Entfernt einen Projekteintrag aus ~/.claude.json (inkl. dessen local-scope
 /// Server und Verlauf). Direkter, atomarer Edit mit vorheriger Sicherung –
 /// es gibt keinen CLI-Befehl dafür.
+///
+/// `async` wie `create_snapshot`/`restore_snapshot`: der verpflichtende
+/// Auto-Snapshot kopiert `~/.claude.json` (real ~170 kB), Stash, beide
+/// settings-Dateien und je zwei Dateien pro bekanntem Projekt – das gehört
+/// nicht auf den Event-Loop-Thread, sonst friert das Fenster ein.
 #[tauri::command]
-pub fn delete_project(path: String) -> Result<(), AppError> {
+pub async fn delete_project(state: State<'_, AppState>, path: String) -> Result<(), AppError> {
+    let result = delete_project_impl(&state.settings(), path);
+    // Mit dem Projekteintrag verschwinden ALLE local-scope Server dieses
+    // Projekts auf einen Schlag. Introspektions- und Status-Cache komplett
+    // verwerfen (Muster wie `restore_snapshot`): sonst zeigt die Liste Zähler
+    // und Latenz der gelöschten Definitionen, sobald Claude Code das Projekt
+    // später neu registriert und dort wieder ein gleichnamiger Server steht.
+    // Auch im Fehlerfall – der Schreibvorgang kann teilweise gewirkt haben.
+    state.clear_caches();
+    result
+}
+
+fn delete_project_impl(settings: &AppSettings, path: String) -> Result<(), AppError> {
+    // Erst in-memory prüfen und entfernen (noch keine Platte berührt): so wird
+    // bei „Projekt nicht gefunden" kein Waisen-Snapshot angelegt.
     let cj = claude_json_path();
-    let mut root = read_json_value(&cj).ok_or_else(|| AppError::Io("~/.claude.json nicht lesbar".into()))?;
+    let mut root =
+        read_json_value(&cj).ok_or_else(|| AppError::Io("~/.claude.json nicht lesbar".into()))?;
     let obj = root
         .as_object_mut()
         .ok_or_else(|| AppError::Parse("unerwartetes Format in ~/.claude.json".into()))?;
@@ -900,11 +1620,12 @@ pub fn delete_project(path: String) -> Result<(), AppError> {
     if !removed {
         return Err(AppError::Io("Projekt nicht gefunden".into()));
     }
-    // Sicherung ist verpflichtend: scheitert sie, wird NICHT geschrieben.
-    // (Die Race gegen ein laufendes Claude Code bleibt inhärent – ein Lock ist
-    // hier nicht möglich.)
-    let bak = cj.with_file_name(".claude.json.mcpmgr.bak");
-    std::fs::copy(&cj, &bak).map_err(|e| AppError::Io(format!("Backup fehlgeschlagen: {e}")))?;
+
+    // Verpflichtender Auto-Snapshot als Sicherung unmittelbar vor dem Schreiben
+    // (löst das frühere einzelne .claude.json.mcpmgr.bak ab, da der Snapshot
+    // vollständig und selbst wiederherstellbar ist); schlägt er fehl, wird NICHT
+    // geschrieben. Die Race gegen ein laufendes Claude Code bleibt inhärent.
+    auto_snapshot(settings, Some(format!("auto: delete_project {path}")))?;
     crate::toggles::atomic_write_json(&cj, &root)
 }
 
@@ -912,22 +1633,168 @@ pub fn delete_project(path: String) -> Result<(), AppError> {
 /// erzeugt. Schreibt nichts – der Vorschlag geht ans Formular.
 #[tauri::command]
 pub async fn run_claude_assistant(
+    state: State<'_, AppState>,
     url: String,
     extra_context: Option<String>,
 ) -> Result<crate::assistant::AssistantResult, AppError> {
-    crate::assistant::run_assistant(&url, extra_context.as_deref())
+    crate::assistant::run_assistant(
+        &url,
+        extra_context.as_deref(),
+        state.settings().claude_path(),
+    )
+}
+
+/// Durchsucht die offizielle MCP-Registry (`registry.rs`). Ergebnisse werden 5
+/// Minuten pro (Query, Cursor) gecacht; das blockierende `ureq` läuft im
+/// Command-Thread-Pool (nicht dem UI-Thread), analog `run_claude_assistant`.
+#[tauri::command]
+pub async fn search_registry(
+    state: State<'_, AppState>,
+    query: String,
+    cursor: Option<String>,
+) -> Result<crate::registry::RegistrySearchPage, AppError> {
+    const TTL_SECS: u64 = 300;
+    // Obergrenze, damit viele unterschiedliche Suchen/Cursor den Cache nicht
+    // unbegrenzt wachsen lassen (stale Einträge werden sonst nie entfernt).
+    const MAX_ENTRIES: usize = 64;
+    let key = format!("{}\u{0}{}", query.trim(), cursor.as_deref().unwrap_or(""));
+    let now = crate::util::unix_now();
+
+    // Cache-Treffer (frisch genug)?
+    {
+        let cache = state.registry_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((ts, page)) = cache.get(&key) {
+            if now.saturating_sub(*ts) < TTL_SECS {
+                return Ok(page.clone());
+            }
+        }
+    }
+
+    let page = crate::registry::fetch(query.trim(), cursor.as_deref())?;
+    let mut cache = state.registry_cache.lock().unwrap_or_else(|e| e.into_inner());
+    // Stale Einträge aufräumen; wenn danach noch zu viele, komplett leeren.
+    if cache.len() >= MAX_ENTRIES {
+        cache.retain(|_, (ts, _)| now.saturating_sub(*ts) < TTL_SECS);
+        if cache.len() >= MAX_ENTRIES {
+            cache.clear();
+        }
+    }
+    cache.insert(key, (now, page.clone()));
+    Ok(page)
+}
+
+/// Liefert die aktuellen App-Einstellungen (aus dem Speicher-Cache).
+#[tauri::command]
+pub fn get_settings(state: State<'_, AppState>) -> AppSettings {
+    state.settings()
+}
+
+/// Validiert und persistiert neue Einstellungen, aktualisiert den Cache und
+/// gibt die (normalisierten) Einstellungen zurück.
+#[tauri::command]
+pub fn set_settings(
+    state: State<'_, AppState>,
+    settings: AppSettings,
+) -> Result<AppSettings, AppError> {
+    let settings = crate::settings::normalize(settings);
+    crate::settings::validate(&settings)?;
+    crate::settings::save(&settings)?;
+    *state.settings.write().unwrap_or_else(|e| e.into_inner()) = settings.clone();
+    Ok(settings)
+}
+
+/// Erstellt einen Snapshot der aktuellen MCP-Konfiguration. `auto=false`
+/// (Default) = manueller Snapshot (bleibt erhalten); `auto=true` = automatische
+/// Sicherung (unterliegt der Retention) – z. B. der eine Sammel-Snapshot vor
+/// einer Bulk-Aktion.
+/// `async`: kopiert synchron `~/.claude.json` plus alle Projekt-`.mcp.json` –
+/// das gehört nicht auf den Event-Loop-Thread.
+#[tauri::command]
+pub async fn create_snapshot(
+    state: State<'_, AppState>,
+    note: Option<String>,
+    auto: Option<bool>,
+) -> Result<crate::snapshot::SnapshotManifest, AppError> {
+    crate::snapshot::create(note, auto.unwrap_or(false), state.settings().snapshot_retention)
+}
+
+/// Listet alle vorhandenen Snapshots, neueste zuerst. `async`: liest das
+/// gesamte Snapshot-Verzeichnis (Dateisystem-I/O, nicht auf den Event-Loop).
+#[tauri::command]
+pub async fn list_snapshots() -> Result<Vec<crate::snapshot::SnapshotManifest>, AppError> {
+    crate::snapshot::list()
+}
+
+/// Stellt einen Snapshot wieder her (optional nur ausgewählte Dateien). Legt
+/// vorher selbst einen Auto-Snapshot des Ist-Zustands an. `async`: schreibt
+/// mehrere Konfigurationsdateien – nicht auf dem Event-Loop-Thread.
+#[tauri::command]
+pub async fn restore_snapshot(
+    state: State<'_, AppState>,
+    id: String,
+    only_paths: Option<Vec<String>>,
+) -> Result<(), AppError> {
+    let result = crate::snapshot::restore(&id, only_paths, state.settings().snapshot_retention);
+    // Nach einem Restore kann sich JEDE Definition geändert haben – Introspektions-
+    // und Status-Cache komplett verwerfen, sonst zeigt die Liste Fähigkeiten und
+    // Stati von Servern, die es so nicht mehr gibt. Auch im Fehlerfall: die
+    // Commit-Phase kann mitten in den Renames abbrechen.
+    state.clear_caches();
+    result
+}
+
+/// Löscht einen Snapshot.
+#[tauri::command]
+pub async fn delete_snapshot(id: String) -> Result<(), AppError> {
+    crate::snapshot::delete(&id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Die Commands sind jetzt async; die Tests rufen die synchronen `_impl`-
-    // Funktionen auf. Diese Aliase überschatten die (async) Glob-Importe.
-    use super::{
-        add_server_impl as add_server, remove_server_impl as remove_server,
-        set_scope_impl as set_scope, toggle_user_server_impl as toggle_user_server,
-        update_server_impl as update_server,
-    };
+
+    // Die Commands sind jetzt async und brauchen einen Settings-Snapshot; die
+    // Tests rufen die synchronen `_impl`-Funktionen mit Default-Einstellungen auf.
+    // Diese Hüllen überschatten die (async) Glob-Importe und halten die vielen
+    // Aufrufstellen unverändert.
+    fn cfg() -> AppSettings {
+        AppSettings::default()
+    }
+    fn add_server(name: String, scope: Scope, pp: Option<String>, entry: ServerEntry) -> Result<(), AppError> {
+        add_server_impl(&cfg(), name, scope, pp, entry)
+    }
+    fn remove_server(name: String, scope: Scope, pp: Option<String>) -> Result<(), AppError> {
+        remove_server_impl(&cfg(), name, scope, pp, true)
+    }
+    fn update_server(name: String, scope: Scope, pp: Option<String>, entry: ServerEntry) -> Result<(), AppError> {
+        update_server_impl(&cfg(), name, scope, pp, entry)
+    }
+    fn toggle_user_server(name: String, enabled: bool, entry: Option<ServerEntry>) -> Result<(), AppError> {
+        toggle_user_server_impl(&cfg(), name, enabled, entry, true)
+    }
+    fn set_scope(
+        name: String,
+        from_scope: Scope,
+        to_scope: Scope,
+        from_project: Option<String>,
+        to_project: Option<String>,
+    ) -> Result<(), AppError> {
+        set_scope_impl(&cfg(), name, from_scope, to_scope, from_project, to_project)
+    }
+    fn delete_project(path: String) -> Result<(), AppError> {
+        delete_project_impl(&cfg(), path)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn clone_server(
+        name: String,
+        from_scope: Scope,
+        from_project: Option<String>,
+        new_name: String,
+        to_scope: Scope,
+        to_project: Option<String>,
+    ) -> Result<(), AppError> {
+        clone_server_impl(&cfg(), name, from_scope, from_project, new_name, to_scope, to_project)
+    }
 
     /// Opt-in-Integrationstest: ruft echtes `claude mcp list` auf (health-checkt
     /// alle Server, ~langsam) und prüft, dass Merge, Maskierung und Extern-
@@ -936,7 +1803,7 @@ mod tests {
     #[ignore]
     fn list_servers_end_to_end() {
         let servers =
-            gather_servers(&Mutex::new(HashMap::new()), None, false, true).expect("list_servers");
+            gather_servers(&Mutex::new(HashMap::new()), &cfg(), None, false, true).expect("list_servers");
         for s in &servers {
             let env_preview = s
                 .entry
@@ -1008,6 +1875,166 @@ mod tests {
         eprintln!("Roundtrip OK (add/update/remove)");
     }
 
+    /// Opt-in: remove_server legt automatisch einen Snapshot an. Nutzt einen
+    /// Wegwerf-Server und räumt die dabei erzeugten Snapshots wieder auf.
+    /// Nur mit `-- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn remove_server_creates_auto_snapshot() {
+        let name = "mcpmgr-snaptest".to_string();
+        let _ = remove_server(name.clone(), Scope::User, None);
+
+        let before: Vec<String> = crate::snapshot::list()
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+
+        let e = ServerEntry {
+            transport: Some("stdio".into()),
+            command: Some("echo".into()),
+            args: Some(vec!["x".into()]),
+            ..Default::default()
+        };
+        add_server(name.clone(), Scope::User, None, e).expect("add");
+        remove_server(name.clone(), Scope::User, None).expect("remove");
+
+        let created: Vec<_> = crate::snapshot::list()
+            .unwrap()
+            .into_iter()
+            .filter(|m| !before.contains(&m.id))
+            .collect();
+        assert!(
+            created.iter().any(|m| m.auto),
+            "remove_server sollte einen Auto-Snapshot erzeugen"
+        );
+
+        // Aufräumen.
+        for m in &created {
+            let _ = crate::snapshot::delete(&m.id);
+        }
+        eprintln!("Auto-Snapshot OK ({} neu)", created.len());
+    }
+
+    /// Opt-in: legt denselben Server in user- und local-Scope an, prüft, dass
+    /// `list_conflicts` ihn findet (effective_scope=Local, identical=true), und
+    /// räumt wieder auf. Nur mit `-- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn list_conflicts_finds_cross_scope_duplicate() {
+        let tmp = std::path::PathBuf::from("/tmp/mcpmgr-conflicttest");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let proj = tmp.to_string_lossy().to_string();
+        let name = "mcpmgr-conflictsrv".to_string();
+
+        let _ = remove_server(name.clone(), Scope::User, None);
+        let _ = remove_server(name.clone(), Scope::Local, Some(proj.clone()));
+
+        let e = ServerEntry {
+            transport: Some("stdio".into()),
+            command: Some("echo".into()),
+            args: Some(vec!["x".into()]),
+            ..Default::default()
+        };
+        add_server(name.clone(), Scope::User, None, e.clone()).expect("add user");
+        add_server(name.clone(), Scope::Local, Some(proj.clone()), e).expect("add local");
+
+        let conflicts = list_conflicts(Some(proj.clone())).expect("list_conflicts");
+        let c = conflicts
+            .iter()
+            .find(|c| c.name == name)
+            .expect("Konflikt gefunden");
+        assert!(c.definitions.len() >= 2, "mindestens zwei Definitionen");
+        assert_eq!(c.effective_scope, Scope::Local, "local gewinnt");
+        assert!(c.identical, "gleiche Definition -> identical");
+
+        // Aufräumen.
+        let _ = remove_server(name.clone(), Scope::User, None);
+        let _ = remove_server(name.clone(), Scope::Local, Some(proj));
+        eprintln!("list_conflicts OK");
+    }
+
+    /// Opt-in: Umbenennen eines DEAKTIVIERTEN user-Servers hält ihn deaktiviert
+    /// (bleibt im Stash, wird nicht aktiviert). Nur mit `-- --ignored`.
+    #[test]
+    #[ignore]
+    fn rename_disabled_user_server_stays_disabled() {
+        let name = "mcpmgr-renametest".to_string();
+        let new_name = "mcpmgr-renametest2".to_string();
+        let _ = remove_server(name.clone(), Scope::User, None);
+        let _ = crate::stash::remove(&name);
+        let _ = crate::stash::remove(&new_name);
+
+        let e = ServerEntry {
+            transport: Some("stdio".into()),
+            command: Some("echo".into()),
+            args: Some(vec!["x".into()]),
+            ..Default::default()
+        };
+        add_server(name.clone(), Scope::User, None, e).expect("add");
+        toggle_user_server(name.clone(), false, None).expect("disable"); // -> Stash
+        assert!(crate::stash::peek(&name).is_some(), "vor Rename im Stash");
+
+        rename_server_impl(&cfg(), name.clone(), Scope::User, None, new_name.clone())
+            .expect("rename");
+
+        assert!(crate::stash::peek(&name).is_none(), "alter Stash-Eintrag entfernt");
+        assert!(
+            crate::stash::peek(&new_name).is_some(),
+            "neuer Name bleibt deaktiviert im Stash"
+        );
+        let active = collect_definitions(&default_project_path())
+            .into_iter()
+            .any(|d| d.scope == Scope::User && d.name == new_name);
+        assert!(!active, "neuer Name darf NICHT aktiv in der Config sein");
+
+        let _ = crate::stash::remove(&new_name);
+        eprintln!("rename disabled OK");
+    }
+
+    /// Opt-in: Bearbeiten eines DEAKTIVIERTEN user-Servers hält ihn deaktiviert
+    /// (die neue Definition landet im Stash, nicht in `~/.claude.json`).
+    /// Nur mit `-- --ignored`.
+    #[test]
+    #[ignore]
+    fn update_disabled_user_server_stays_disabled() {
+        let name = "mcpmgr-updatestash".to_string();
+        let _ = remove_server(name.clone(), Scope::User, None);
+        let _ = crate::stash::remove(&name);
+
+        let e = ServerEntry {
+            transport: Some("stdio".into()),
+            command: Some("echo".into()),
+            args: Some(vec!["alt".into()]),
+            ..Default::default()
+        };
+        add_server(name.clone(), Scope::User, None, e).expect("add");
+        toggle_user_server(name.clone(), false, None).expect("disable"); // -> Stash
+        assert!(crate::stash::peek(&name).is_some(), "vor Update im Stash");
+
+        let neu = ServerEntry {
+            transport: Some("stdio".into()),
+            command: Some("echo".into()),
+            args: Some(vec!["neu".into()]),
+            ..Default::default()
+        };
+        update_server(name.clone(), Scope::User, None, neu).expect("update");
+
+        let item = crate::stash::peek(&name).expect("bleibt im Stash");
+        assert_eq!(
+            item.entry.args.as_deref(),
+            Some(&["neu".to_string()][..]),
+            "neue Definition im Stash"
+        );
+        let aktiv = collect_definitions(&default_project_path())
+            .into_iter()
+            .any(|d| d.scope == Scope::User && d.name == name);
+        assert!(!aktiv, "Bearbeiten darf den Server NICHT aktivieren");
+
+        let _ = crate::stash::remove(&name);
+        eprintln!("update disabled OK");
+    }
+
     /// Opt-in: mcpjson-Toggle schreibt korrekt in settings.local.json.
     #[test]
     #[ignore]
@@ -1016,13 +2043,22 @@ mod tests {
         let name = "mcpmgr-toggletest";
         let dir = default_project_path();
 
-        toggle_mcpjson_server(name.into(), None, false).expect("disable");
+        toggle_mcpjson_server_impl(name.into(), None, false).expect("disable");
         assert!(collect_disabled(&dir).disabled.contains(name), "in disabled");
 
-        toggle_mcpjson_server(name.into(), None, true).expect("enable");
+        toggle_mcpjson_server_impl(name.into(), None, true).expect("enable");
         let d = collect_disabled(&dir);
         assert!(!d.disabled.contains(name), "nicht mehr disabled");
         assert!(d.enabled.contains(name), "jetzt enabled");
+
+        // Aufräumen ist zugleich der Test für die Toggle-Bereinigung: nach dem
+        // Entfernen eines project-scope Servers darf sein Name in KEINEM der
+        // beiden Arrays zurückbleiben (sonst belegt er einen späteren
+        // gleichnamigen Server vor).
+        forget_mcpjson_toggle(Scope::Project, name, &None);
+        let d = collect_disabled(&dir);
+        assert!(!d.enabled.contains(name), "verwaister enabled-Eintrag");
+        assert!(!d.disabled.contains(name), "verwaister disabled-Eintrag");
         eprintln!("toggle_mcpjson OK");
     }
 
@@ -1055,7 +2091,7 @@ mod tests {
         assert!(crate::stash::peek(&name).is_some(), "im stash");
 
         let servers =
-            gather_servers(&Mutex::new(HashMap::new()), None, false, true).expect("list");
+            gather_servers(&Mutex::new(HashMap::new()), &cfg(), None, false, true).expect("list");
         let found = servers
             .iter()
             .find(|s| s.name == name && s.scope == Some(Scope::User));
@@ -1104,6 +2140,187 @@ mod tests {
         eprintln!("set_scope OK");
     }
 
+    /// Dasselbe Verzeichnis in unterschiedlicher Schreibweise muss als gleich
+    /// erkannt werden – sonst lesen `clone_server`/`set_scope` die Definitionen
+    /// des Ziels ein zweites Mal und prüfen die Kollision auf einer anderen
+    /// Momentaufnahme als der, aus der die Quelle stammt.
+    #[test]
+    fn same_project_dir_erkennt_gleiche_pfade() {
+        let dir = std::env::temp_dir();
+        assert!(same_project_dir(&dir, &dir), "identischer Pfad");
+        assert!(
+            same_project_dir(&dir, &dir.join(".")),
+            "„.“ muss wegkanonisiert werden"
+        );
+        assert!(
+            !same_project_dir(&dir, &dir.join("mcpmgr-gibt-es-garantiert-nicht")),
+            "verschiedene Pfade sind nicht gleich"
+        );
+    }
+
+    /// Ein Scope-Wechsel auf denselben Scope ist ein No-op und darf die Umgebung
+    /// nicht anfassen (kein Snapshot, kein claude-Aufruf).
+    #[test]
+    fn set_scope_same_scope_is_noop() {
+        set_scope("egal".into(), Scope::User, Scope::User, None, None).expect("No-op");
+    }
+
+    /// Leerer Zielname wird abgelehnt, bevor irgendetwas an der Umgebung passiert.
+    #[test]
+    fn clone_server_rejects_empty_name() {
+        let err = clone_server(
+            "irgendwas".into(),
+            Scope::User,
+            None,
+            "   ".into(),
+            Scope::User,
+            None,
+        )
+        .expect_err("leerer Name muss abgelehnt werden");
+        assert!(matches!(err, AppError::Io(_)));
+    }
+
+    /// Opt-in: Duplizieren user -> local. Quelle bleibt bestehen, Klon entsteht
+    /// unter neuem Namen.
+    #[test]
+    #[ignore]
+    fn clone_server_roundtrip() {
+        let name = "mcpmgr-clonetest".to_string();
+        let clone_name = "mcpmgr-clonetest-kopie".to_string();
+        let dir = default_project_path();
+        let proj = dir.to_string_lossy().to_string();
+
+        let _ = remove_server(name.clone(), Scope::User, None);
+        let _ = remove_server(clone_name.clone(), Scope::Local, Some(proj.clone()));
+
+        let e = ServerEntry {
+            transport: Some("stdio".into()),
+            command: Some("echo".into()),
+            args: Some(vec!["x".into()]),
+            ..Default::default()
+        };
+        add_server(name.clone(), Scope::User, None, e).expect("add");
+
+        clone_server(
+            name.clone(),
+            Scope::User,
+            None,
+            clone_name.clone(),
+            Scope::Local,
+            Some(proj.clone()),
+        )
+        .expect("clone_server");
+
+        let defs = collect_definitions(&dir);
+        let src_stays = defs.iter().any(|d| d.scope == Scope::User && d.name == name);
+        let clone_here = defs.iter().any(|d| d.scope == Scope::Local && d.name == clone_name);
+        assert!(src_stays, "Quelle bleibt in user");
+        assert!(clone_here, "Klon liegt in local");
+
+        // Kollision: erneutes Klonen auf denselben Zielnamen muss scheitern.
+        let dup = clone_server(
+            name.clone(),
+            Scope::User,
+            None,
+            clone_name.clone(),
+            Scope::Local,
+            Some(proj.clone()),
+        );
+        assert!(dup.is_err(), "Kollision wird abgelehnt");
+
+        remove_server(name, Scope::User, None).expect("cleanup src");
+        remove_server(clone_name, Scope::Local, Some(proj)).expect("cleanup clone");
+        eprintln!("clone_server OK");
+    }
+
+    /// Opt-in: Klonen auf den Namen eines nur deaktivierten (im Stash liegenden)
+    /// User-Servers muss als Kollision abgelehnt werden – sonst würde der Klon
+    /// den deaktivierten Eintrag beim nächsten Deaktivieren lautlos überschreiben.
+    #[test]
+    #[ignore]
+    fn clone_rejects_stashed_name_collision() {
+        let src = "mcpmgr-clonesrc".to_string();
+        let target = "mcpmgr-clonestash".to_string();
+        let e = ServerEntry {
+            transport: Some("stdio".into()),
+            command: Some("echo".into()),
+            ..Default::default()
+        };
+
+        let _ = remove_server(src.clone(), Scope::User, None);
+        let _ = crate::stash::remove(&target);
+
+        add_server(src.clone(), Scope::User, None, e.clone()).expect("add src");
+        crate::stash::upsert(&target, e).expect("stash target");
+
+        let res = clone_server(src.clone(), Scope::User, None, target.clone(), Scope::User, None);
+        assert!(res.is_err(), "Kollision mit Stash-Eintrag muss abgelehnt werden");
+
+        remove_server(src, Scope::User, None).expect("cleanup src");
+        crate::stash::remove(&target).expect("cleanup stash");
+        eprintln!("clone_rejects_stashed_name_collision OK");
+    }
+
+    /// Opt-in: Ein nur deaktivierter (im Stash liegender) User-Server darf den
+    /// Scope NICHT wechseln. Sonst entstünde im Ziel eine aktive Kopie, während
+    /// das Entfernen in der Quelle scheitern müsste – der Server läge doppelt vor.
+    #[test]
+    #[ignore]
+    fn set_scope_rejects_stashed_source() {
+        let name = "mcpmgr-setscope-stash".to_string();
+        let e = ServerEntry {
+            transport: Some("stdio".into()),
+            command: Some("echo".into()),
+            ..Default::default()
+        };
+        let _ = crate::stash::remove(&name);
+        crate::stash::upsert(&name, e).expect("stash");
+
+        let res = set_scope(name.clone(), Scope::User, Scope::Local, None, None);
+        assert!(
+            res.is_err(),
+            "deaktivierter Server darf den Scope nicht wechseln"
+        );
+
+        crate::stash::remove(&name).expect("cleanup stash");
+        eprintln!("set_scope_rejects_stashed_source OK");
+    }
+
+    /// Opt-in: Ein Umzug auf einen im Ziel-Scope bereits vergebenen Namen muss
+    /// abgelehnt werden – sonst überschriebe `claude mcp add` die fremde
+    /// Definition und die Quelle würde anschließend gelöscht.
+    #[test]
+    #[ignore]
+    fn set_scope_rejects_existing_target_name() {
+        let name = "mcpmgr-setscope-collision".to_string();
+        let e = ServerEntry {
+            transport: Some("stdio".into()),
+            command: Some("echo".into()),
+            ..Default::default()
+        };
+        let proj = home_dir().expect("home").to_string_lossy().to_string();
+
+        let _ = remove_server(name.clone(), Scope::User, None);
+        let _ = remove_server(name.clone(), Scope::Local, Some(proj.clone()));
+
+        add_server(name.clone(), Scope::User, None, e.clone()).expect("add user");
+        add_server(name.clone(), Scope::Local, Some(proj.clone()), e).expect("add local");
+
+        let res = set_scope(
+            name.clone(),
+            Scope::User,
+            Scope::Local,
+            None,
+            Some(proj.clone()),
+        );
+        assert!(res.is_err(), "belegter Zielname muss abgelehnt werden");
+
+        // Beide Definitionen müssen unverändert dastehen.
+        remove_server(name.clone(), Scope::User, None).expect("cleanup user");
+        remove_server(name, Scope::Local, Some(proj)).expect("cleanup local");
+        eprintln!("set_scope_rejects_existing_target_name OK");
+    }
+
     /// Opt-in: echter Assistent-Aufruf gegen einen bekannten MCP-Server (ruft
     /// `claude -p`, netzabhängig, kostet Tokens). Nur mit `-- --ignored --nocapture`.
     #[test]
@@ -1112,6 +2329,7 @@ mod tests {
         let res = crate::assistant::run_assistant(
             "https://www.npmjs.com/package/@modelcontextprotocol/server-filesystem",
             Some("stdio server, started via npx"),
+            None,
         )
         .expect("assistant call");
         eprintln!("name={:?}", res.name);

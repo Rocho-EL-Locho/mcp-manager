@@ -2,17 +2,28 @@ mod assistant;
 mod claude_cli;
 mod commands;
 mod config_read;
+mod conflicts;
 mod introspect;
+mod logview;
 mod mask;
+mod metrics;
 mod models;
 mod parse;
 mod preflight;
+mod registry;
+mod settings;
+mod snapshot;
 mod stash;
 mod toggles;
+mod util;
+
+use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Desktop-Benachrichtigungen bei Statusverschlechterung.
+        .plugin(tauri_plugin_notification::init())
         .manage(commands::AppState::default())
         .invoke_handler(tauri::generate_handler![
             commands::check_claude,
@@ -23,6 +34,11 @@ pub fn run() {
             commands::reveal_server_entry,
             commands::introspect_server,
             commands::peek_introspection,
+            commands::playground_call,
+            commands::get_metrics,
+            commands::start_log_session,
+            commands::stop_log_session,
+            commands::log_session_buffer,
             commands::preflight_server,
             commands::add_server,
             commands::update_server,
@@ -33,8 +49,25 @@ pub fn run() {
             commands::toggle_mcpjson_server,
             commands::toggle_user_server,
             commands::set_scope,
+            commands::clone_server,
+            commands::list_conflicts,
+            commands::rename_server,
             commands::run_claude_assistant,
+            commands::search_registry,
+            commands::get_settings,
+            commands::set_settings,
+            commands::create_snapshot,
+            commands::list_snapshots,
+            commands::restore_snapshot,
+            commands::delete_snapshot,
         ])
-        .run(tauri::generate_context!())
-        .expect("Fehler beim Starten der Tauri-Anwendung");
+        .build(tauri::generate_context!())
+        .expect("Fehler beim Starten der Tauri-Anwendung")
+        // Beim App-Exit alle laufenden Diagnose-Sessions hart beenden (kein
+        // zurückbleibender npx-/Serverprozess); siehe `logview.rs`.
+        .run(|app, event| {
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                app.state::<commands::AppState>().kill_all_log_sessions();
+            }
+        });
 }

@@ -2,7 +2,8 @@ import { h, clear } from "../dom";
 import { runClaudeAssistant } from "../ipc";
 import type { AssistantResult, Scope } from "../ipc";
 import { openModal } from "../modal";
-import { openServerForm, field } from "./serverForm";
+import { field } from "../form";
+import { openServerForm } from "./serverForm";
 
 export interface AssistantContext {
   projectPath?: string;
