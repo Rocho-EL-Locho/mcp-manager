@@ -1,16 +1,19 @@
-//! Minimaler MCP-Client für die **Introspektion** eines stdio-Servers.
+//! Minimaler MCP-Client für die **Introspektion** eines Servers (stdio + HTTP/SSE).
 //!
 //! Das Backend spricht sonst kein MCP – es delegiert an die `claude`-CLI. Für
-//! Issue #7 (anzeigen, was ein Server bereitstellt) genügt ein kurzer,
-//! handgeschriebener JSON-RPC-2.0-Handshake über stdin/stdout, ganz ohne neue
-//! Abhängigkeiten:
+//! „anzeigen, was ein Server bereitstellt" genügt ein kurzer, handgeschriebener
+//! JSON-RPC-2.0-Handshake:
 //!   initialize -> notifications/initialized -> tools/list / resources/list /
 //!   prompts/list.
 //!
-//! Prozess-Handling analog zu `claude_cli.rs`: eigene Prozessgruppe (killpg beim
-//! Aufräumen/Timeout), stderr wird nebenläufig geleert (kein Pipe-Deadlock),
-//! stdout wird zeilenweise über einen Channel gelesen. Nur stdio wird
-//! unterstützt; HTTP/SSE behandelt der Command-Layer separat.
+//! Die Handshake-/Auswertungslogik ist transportneutral (`RpcTransport`-Trait);
+//! es gibt zwei Transporte:
+//!   - **stdio** (`StdioTransport`/`introspect_stdio`): Subprozess, eigene
+//!     Prozessgruppe (killpg beim Aufräumen/Timeout), stderr nebenläufig geleert
+//!     (kein Pipe-Deadlock), stdout zeilenweise über einen Channel.
+//!   - **HTTP/SSE** (`HttpTransport`/`introspect_http`, Feature 06): Streamable
+//!     HTTP gemäß MCP-Spec 2025-06-18 (POST je Nachricht, JSON- oder SSE-Antwort,
+//!     `Mcp-Session-Id`), synchron via `ureq`.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::CommandExt;
@@ -20,7 +23,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::models::{Introspection, McpPrompt, McpResource, McpTool, ServerEntry};
+use crate::models::{
+    AppError, Introspection, McpPrompt, McpResource, McpTool, PlaygroundRequest, PlaygroundResult,
+    ServerEntry,
+};
 
 /// Protokoll-Version, die wir im Handshake anbieten. Server, die eine andere
 /// Version fahren, antworten dennoch auf die read-only Listen-Aufrufe.
@@ -47,21 +53,75 @@ enum RpcOutcome {
     RpcError(String),
 }
 
-/// Introspiziert einen stdio-Server. `entry.command` muss gesetzt sein.
-///
-/// Gibt IMMER eine `Introspection` zurück: Start-/Handshake-Fehler landen in
-/// `error` (und ggf. erfasster stderr in `logs`), statt als `Err` verloren zu
-/// gehen. So kann die Detail-Ansicht den echten Fehlergrund zeigen.
-pub fn introspect_stdio(entry: &ServerEntry, timeout: Duration) -> Introspection {
+/// Transport eines JSON-RPC-Austauschs. Damit sind Handshake und Auswertung
+/// (initialize, Listen, Pagination) für stdio und HTTP/SSE identisch – eine
+/// Quelle der Wahrheit. `dyn`-tauglich (nur `&mut self`-Methoden).
+trait RpcTransport {
+    /// Sendet ein Request-Objekt und liefert die Antwort mit passender `id`.
+    fn exchange(
+        &mut self,
+        msg: &Value,
+        id: i64,
+        deadline: &Instant,
+    ) -> Result<RpcOutcome, AppError>;
+    /// Sendet eine Notification (kein `id`, keine Antwort erwartet).
+    fn notification(&mut self, msg: &Value) -> Result<(), AppError>;
+}
+
+/// Wertet ein JSON-RPC-Antwortobjekt aus (result vs. error) – transportneutral.
+fn parse_rpc_response(val: &Value) -> RpcOutcome {
+    if let Some(err) = val.get("error") {
+        let msg = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unbekannter RPC-Fehler")
+            .to_string();
+        return RpcOutcome::RpcError(msg);
+    }
+    RpcOutcome::Result(val.get("result").cloned().unwrap_or(Value::Null))
+}
+
+/// Ergebnis eines Transport-Treiberlaufs: das Callback-Resultat plus die
+/// gesammelten Nebeninfos (stderr-Logs nur bei stdio, Verbindungszeit, Notizen).
+struct DriverRun<R> {
+    result: Result<R, AppError>,
+    logs: Option<String>,
+    connect_ms: Option<u64>,
+    notes: Vec<String>,
+}
+
+/// stdio-Treiber: startet den Subprozess, baut den `StdioTransport`, führt `f`
+/// aus (Handshake + beliebige Operationen) und räumt hart auf (killpg). Kapselt
+/// die heiklen Details (eigene Prozessgruppe, stderr-Drain gegen Backpressure,
+/// zeilenweiser stdout-Reader mit Byte-Limit) EINMAL – geteilt von Introspektion
+/// und Playground.
+fn run_stdio<R>(
+    entry: &ServerEntry,
+    timeout: Duration,
+    f: impl FnOnce(
+        &mut dyn RpcTransport,
+        &Instant,
+        Instant,
+        &mut Option<u64>,
+        &mut Vec<String>,
+    ) -> Result<R, AppError>,
+) -> DriverRun<R> {
     let mut notes: Vec<String> = Vec::new();
+    let mut connect_ms: Option<u64> = None;
+    let fail = |msg: String, notes: Vec<String>| DriverRun {
+        result: Err(AppError::Io(msg)),
+        logs: None,
+        connect_ms: None,
+        notes,
+    };
+
     let Some(command) = entry.command.as_ref() else {
-        return error_introspection("Kein command für stdio-Introspektion".into(), None, notes);
+        return fail("Kein command für stdio-Introspektion".into(), notes);
     };
 
     let started = Instant::now();
     let deadline = started + timeout;
 
-    // --- Prozess starten -----------------------------------------------------
     let mut cmd = Command::new(command);
     if let Some(args) = &entry.args {
         cmd.args(args);
@@ -85,13 +145,13 @@ pub fn introspect_stdio(entry: &ServerEntry, timeout: Duration) -> Introspection
             } else {
                 e.to_string()
             };
-            return error_introspection(msg, None, notes);
+            return fail(msg, notes);
         }
     };
 
-    let Some(mut stdin) = child.stdin.take() else {
+    let Some(stdin) = child.stdin.take() else {
         cleanup(&mut child);
-        return error_introspection("stdin nicht verfügbar".into(), None, notes);
+        return fail("stdin nicht verfügbar".into(), notes);
     };
 
     // stderr nebenläufig lesen und einmalig über einen Channel bereitstellen.
@@ -139,7 +199,7 @@ pub fn introspect_stdio(entry: &ServerEntry, timeout: Duration) -> Introspection
     // deckelt den Gesamtspeicher (OOM-Schutz gegen riesige/zeilenlose Ausgaben).
     let Some(stdout) = child.stdout.take() else {
         cleanup(&mut child);
-        return error_introspection("stdout nicht verfügbar".into(), None, notes);
+        return fail("stdout nicht verfügbar".into(), notes);
     };
     let (tx, rx) = mpsc::channel::<String>();
     // Bewusst NICHT gejoint (detached): killpg schließt zwar die Pipe, aber ein
@@ -162,46 +222,68 @@ pub fn introspect_stdio(entry: &ServerEntry, timeout: Duration) -> Introspection
         }
     });
 
-    // --- Handshake -----------------------------------------------------------
-    // `connect_ms` wird im Handshake gesetzt, sobald `initialize` beantwortet ist
-    // (Prozessstart bis initialize = echte Verbindungs-/Startzeit).
-    let mut connect_ms: Option<u64> = None;
-    let result = run_handshake(&mut stdin, &rx, &deadline, started, &mut connect_ms, &mut notes);
+    let result = {
+        // stdin + rx in den Transport verschieben; am Blockende wird er gedroppt
+        // -> stdin schließt (EOF ans Kind), rx fällt weg.
+        let mut transport = StdioTransport { stdin, rx };
+        f(
+            &mut transport,
+            &deadline,
+            started,
+            &mut connect_ms,
+            &mut notes,
+        )
+    };
 
-    // stdin schließen, Prozessgruppe hart beenden. Der Reader-Thread wird nicht
-    // gejoint (siehe oben); rx fällt beim Verlassen der Funktion weg.
-    drop(stdin);
+    // Prozessgruppe hart beenden. Der Reader-Thread wird nicht gejoint (siehe oben).
     cleanup(&mut child);
 
     // Erfassten stderr einsammeln: killpg hat die Pipe geschlossen -> der Reader
     // sieht EOF und sendet. Kurzer, gedeckelter Wait; hält ein Kindeskind die Pipe
     // offen, gibt es eben keine Logs (best effort). Roh belassen – die zentrale
-    // Maskierung (`mask_introspection`) redigiert vor Verlassen des Backends.
+    // Maskierung redigiert vor Verlassen des Backends.
     let logs = err_rx
         .recv_timeout(Duration::from_millis(300))
         .ok()
         .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
         .filter(|s| !s.is_empty());
 
-    match result {
+    DriverRun {
+        result,
+        logs,
+        connect_ms,
+        notes,
+    }
+}
+
+/// Introspiziert einen stdio-Server. `entry.command` muss gesetzt sein.
+///
+/// Gibt IMMER eine `Introspection` zurück: Start-/Handshake-Fehler landen in
+/// `error` (und ggf. erfasster stderr in `logs`), statt als `Err` verloren zu
+/// gehen. So kann die Detail-Ansicht den echten Fehlergrund zeigen.
+pub fn introspect_stdio(entry: &ServerEntry, timeout: Duration) -> Introspection {
+    let run = run_stdio(entry, timeout, |t, deadline, started, cm, notes| {
+        run_handshake(t, deadline, started, cm, notes)
+    });
+    match run.result {
         Ok((tools, resources, prompts, server_name, server_version)) => Introspection {
             tools,
             resources,
             prompts,
             server_name,
             server_version,
-            notes,
-            logs,
+            notes: run.notes,
+            logs: run.logs,
             error: None,
-            connect_ms,
+            connect_ms: run.connect_ms,
             introspected_at: unix_now(),
         },
         Err(e) => {
             // `initialize` kann bereits gelungen sein (connect_ms gesetzt), bevor ein
             // späterer Listen-Aufruf scheiterte. Messung erhalten – gerade langsame
-            // Server (Issue-Use-Case) laufen so ggf. erst nach dem Handshake ins Timeout.
-            let mut intro = error_introspection(e.to_string(), logs, notes);
-            intro.connect_ms = connect_ms;
+            // Server laufen so ggf. erst nach dem Handshake ins Timeout.
+            let mut intro = error_introspection(e.to_string(), run.logs, run.notes);
+            intro.connect_ms = run.connect_ms;
             intro
         }
     }
@@ -235,28 +317,26 @@ type HandshakeData = (
 /// Führt initialize + Listen-Aufrufe durch. Nutzt `notes` für nicht-fatale Hinweise.
 /// `started`/`connect_ms`: sobald `initialize` beantwortet ist, wird die bis dahin
 /// verstrichene Zeit (Prozessstart bis initialize) als Verbindungs-/Startzeit gesetzt.
-fn run_handshake(
-    stdin: &mut ChildStdin,
-    rx: &Receiver<String>,
+/// Führt `initialize` + `notifications/initialized` aus (der gemeinsame Prefix
+/// für Introspektion UND Playground). Setzt `connect_ms` (Prozessstart bis
+/// initialize-Antwort) und liefert serverInfo name/version. `next_id` wird
+/// weitergezählt, sodass Folge-Requests eindeutige ids bekommen.
+fn initialize(
+    transport: &mut dyn RpcTransport,
+    next_id: &mut i64,
     deadline: &Instant,
     started: Instant,
     connect_ms: &mut Option<u64>,
-    notes: &mut Vec<String>,
-) -> Result<HandshakeData, crate::models::AppError> {
-    let mut next_id: i64 = 1;
-
-    // 1) initialize
+) -> Result<(Option<String>, Option<String>), AppError> {
     let init_params = json!({
         "protocolVersion": PROTOCOL_VERSION,
         "capabilities": {},
         "clientInfo": { "name": "mcp-manager", "version": env!("CARGO_PKG_VERSION") },
     });
-    let init = match request(stdin, rx, &mut next_id, deadline, "initialize", init_params)? {
+    let init = match request(transport, next_id, deadline, "initialize", init_params)? {
         RpcOutcome::Result(v) => v,
         RpcOutcome::RpcError(msg) => {
-            return Err(crate::models::AppError::Io(format!(
-                "initialize fehlgeschlagen: {msg}"
-            )))
+            return Err(AppError::Io(format!("initialize fehlgeschlagen: {msg}")))
         }
     };
     // Verbindungs-/Startzeit: Prozessstart bis erfolgreiche initialize-Antwort.
@@ -273,8 +353,23 @@ fn run_handshake(
         .and_then(|n| n.as_str())
         .map(str::to_string);
 
-    // 2) notifications/initialized (Notification, ohne id)
-    notify(stdin, "notifications/initialized")?;
+    // notifications/initialized (Notification, ohne id)
+    notify(transport, "notifications/initialized")?;
+    Ok((server_name, server_version))
+}
+
+fn run_handshake(
+    transport: &mut dyn RpcTransport,
+    deadline: &Instant,
+    started: Instant,
+    connect_ms: &mut Option<u64>,
+    notes: &mut Vec<String>,
+) -> Result<HandshakeData, AppError> {
+    let mut next_id: i64 = 1;
+
+    // 1) + 2) initialize + notifications/initialized (gemeinsamer Prefix)
+    let (server_name, server_version) =
+        initialize(transport, &mut next_id, deadline, started, connect_ms)?;
 
     // 3) Listen abrufen. Wir fragen bewusst alle drei ab (statt uns nur auf die
     //    angekündigten capabilities zu verlassen) – reale Server deklarieren nicht
@@ -284,39 +379,61 @@ fn run_handshake(
     let mut resources = Vec::new();
     let mut prompts = Vec::new();
 
-    collect_pages(stdin, rx, &mut next_id, deadline, "tools/list", "tools", notes, |item| {
-        tools.push(parse_tool(item));
-    })?;
-    collect_pages(stdin, rx, &mut next_id, deadline, "resources/list", "resources", notes, |item| {
-        resources.push(parse_resource(item));
-    })?;
-    collect_pages(stdin, rx, &mut next_id, deadline, "prompts/list", "prompts", notes, |item| {
-        prompts.push(parse_prompt(item));
-    })?;
+    collect_pages(
+        transport,
+        &mut next_id,
+        deadline,
+        "tools/list",
+        "tools",
+        notes,
+        |item| {
+            tools.push(parse_tool(item));
+        },
+    )?;
+    collect_pages(
+        transport,
+        &mut next_id,
+        deadline,
+        "resources/list",
+        "resources",
+        notes,
+        |item| {
+            resources.push(parse_resource(item));
+        },
+    )?;
+    collect_pages(
+        transport,
+        &mut next_id,
+        deadline,
+        "prompts/list",
+        "prompts",
+        notes,
+        |item| {
+            prompts.push(parse_prompt(item));
+        },
+    )?;
 
     Ok((tools, resources, prompts, server_name, server_version))
 }
 
 /// Ruft eine Listen-Methode ggf. über mehrere `nextCursor`-Seiten ab und reicht
 /// jedes Element an `sink`. RPC-Fehler werden als Notiz vermerkt (nicht fatal).
-#[allow(clippy::too_many_arguments)]
 fn collect_pages(
-    stdin: &mut ChildStdin,
-    rx: &Receiver<String>,
+    transport: &mut dyn RpcTransport,
     next_id: &mut i64,
     deadline: &Instant,
     method: &str,
     field: &str,
     notes: &mut Vec<String>,
     mut sink: impl FnMut(&Value),
-) -> Result<(), crate::models::AppError> {
+) -> Result<(), AppError> {
     let mut cursor: Option<String> = None;
     for _ in 0..MAX_PAGES {
         let params = match &cursor {
             Some(c) => json!({ "cursor": c }),
             None => json!({}),
         };
-        match request(stdin, rx, next_id, deadline, method, params)? {
+        match request(transport, next_id, deadline, method, params)? {
             RpcOutcome::Result(res) => {
                 if let Some(arr) = res.get(field).and_then(|v| v.as_array()) {
                     for item in arr {
@@ -337,41 +454,67 @@ fn collect_pages(
             }
         }
     }
-    notes.push(format!("{method}: Paginierung nach {MAX_PAGES} Seiten abgebrochen."));
+    notes.push(format!(
+        "{method}: Paginierung nach {MAX_PAGES} Seiten abgebrochen."
+    ));
     Ok(())
 }
 
-/// Sendet einen Request und wartet (bis `deadline`) auf die Antwort mit passender id.
+/// Baut ein Request-Objekt (mit fortlaufender id) und führt den Austausch über
+/// den Transport aus.
 fn request(
-    stdin: &mut ChildStdin,
-    rx: &Receiver<String>,
+    transport: &mut dyn RpcTransport,
     next_id: &mut i64,
     deadline: &Instant,
     method: &str,
     params: Value,
-) -> Result<RpcOutcome, crate::models::AppError> {
+) -> Result<RpcOutcome, AppError> {
     let id = *next_id;
     *next_id += 1;
     let msg = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    send(stdin, &msg)?;
-    read_response(rx, id, deadline)
+    transport.exchange(&msg, id, deadline)
 }
 
 /// Sendet eine Notification (kein `id`, keine Antwort erwartet).
-fn notify(stdin: &mut ChildStdin, method: &str) -> Result<(), crate::models::AppError> {
+fn notify(transport: &mut dyn RpcTransport, method: &str) -> Result<(), AppError> {
     let msg = json!({ "jsonrpc": "2.0", "method": method });
-    send(stdin, &msg)
+    transport.notification(&msg)
 }
 
-fn send(stdin: &mut ChildStdin, msg: &Value) -> Result<(), crate::models::AppError> {
-    let mut line = serde_json::to_string(msg).map_err(|e| crate::models::AppError::Parse(e.to_string()))?;
+// ---------------------------------------------------------------------------
+// stdio-Transport
+// ---------------------------------------------------------------------------
+
+/// stdio-Transport: newline-delimited JSON über stdin/stdout des Subprozesses.
+/// Besitzt stdin und den stdout-Zeilen-Receiver; beim Drop schließt stdin (EOF).
+struct StdioTransport {
+    stdin: ChildStdin,
+    rx: Receiver<String>,
+}
+
+impl RpcTransport for StdioTransport {
+    fn exchange(
+        &mut self,
+        msg: &Value,
+        id: i64,
+        deadline: &Instant,
+    ) -> Result<RpcOutcome, AppError> {
+        send(&mut self.stdin, msg)?;
+        read_response(&self.rx, id, deadline)
+    }
+
+    fn notification(&mut self, msg: &Value) -> Result<(), AppError> {
+        send(&mut self.stdin, msg)
+    }
+}
+
+fn send(stdin: &mut ChildStdin, msg: &Value) -> Result<(), AppError> {
+    let mut line = serde_json::to_string(msg).map_err(|e| AppError::Parse(e.to_string()))?;
     line.push('\n');
     stdin
         .write_all(line.as_bytes())
-        .map_err(|e| crate::models::AppError::Io(e.to_string()))?;
-    stdin
-        .flush()
-        .map_err(|e| crate::models::AppError::Io(e.to_string()))
+        .map_err(|e| AppError::Io(e.to_string()))?;
+    stdin.flush().map_err(|e| AppError::Io(e.to_string()))
 }
 
 /// Liest Zeilen bis zur Antwort mit `id`; überspringt Nicht-JSON, Notifications
@@ -380,11 +523,11 @@ fn read_response(
     rx: &Receiver<String>,
     id: i64,
     deadline: &Instant,
-) -> Result<RpcOutcome, crate::models::AppError> {
+) -> Result<RpcOutcome, AppError> {
     loop {
         let now = Instant::now();
         if now >= *deadline {
-            return Err(crate::models::AppError::Timeout);
+            return Err(AppError::Timeout);
         }
         match rx.recv_timeout(*deadline - now) {
             Ok(line) => {
@@ -398,19 +541,11 @@ fn read_response(
                 if !id_matches(val.get("id"), id) {
                     continue; // Notification oder fremde Antwort.
                 }
-                if let Some(err) = val.get("error") {
-                    let msg = err
-                        .get("message")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("unbekannter RPC-Fehler")
-                        .to_string();
-                    return Ok(RpcOutcome::RpcError(msg));
-                }
-                return Ok(RpcOutcome::Result(val.get("result").cloned().unwrap_or(Value::Null)));
+                return Ok(parse_rpc_response(&val));
             }
-            Err(RecvTimeoutError::Timeout) => return Err(crate::models::AppError::Timeout),
+            Err(RecvTimeoutError::Timeout) => return Err(AppError::Timeout),
             Err(RecvTimeoutError::Disconnected) => {
-                return Err(crate::models::AppError::Io(
+                return Err(AppError::Io(
                     "MCP-Server hat die Verbindung geschlossen".into(),
                 ))
             }
@@ -436,6 +571,419 @@ fn cleanup(child: &mut Child) {
         libc::killpg(pgid, libc::SIGKILL);
     }
     let _ = child.wait();
+}
+
+// ---------------------------------------------------------------------------
+// HTTP/SSE-Transport (Streamable HTTP, MCP-Spec 2025-06-18)
+// ---------------------------------------------------------------------------
+
+/// HTTP-Transport: jede JSON-RPC-Nachricht ist ein POST an den MCP-Endpoint.
+/// Antworten kommen als einzelnes JSON-Objekt oder als SSE-Stream zurück.
+struct HttpTransport {
+    agent: ureq::Agent,
+    url: String,
+    /// Zusätzliche, vom Nutzer konfigurierte Header (z. B. Authorization).
+    headers: Vec<(String, String)>,
+    /// Vom Server bei `initialize` vergebene Session-Id (danach mitgesendet).
+    session_id: Option<String>,
+}
+
+impl HttpTransport {
+    /// Setzt Protokoll-Version, Session-Id (falls vorhanden) und die
+    /// konfigurierten Header auf einen Request.
+    fn apply_headers(&self, mut req: ureq::Request) -> ureq::Request {
+        req = req.set("MCP-Protocol-Version", PROTOCOL_VERSION);
+        if let Some(sid) = &self.session_id {
+            req = req.set("Mcp-Session-Id", sid);
+        }
+        for (k, v) in &self.headers {
+            req = req.set(k, v);
+        }
+        req
+    }
+
+    /// Session am Ende best effort schließen (Server darf 405 antworten).
+    fn close_session(&self) {
+        if self.session_id.is_none() {
+            return;
+        }
+        let req = self.apply_headers(self.agent.delete(&self.url));
+        let _ = req.call();
+    }
+}
+
+impl RpcTransport for HttpTransport {
+    fn exchange(
+        &mut self,
+        msg: &Value,
+        id: i64,
+        deadline: &Instant,
+    ) -> Result<RpcOutcome, AppError> {
+        let body = serde_json::to_string(msg).map_err(|e| AppError::Parse(e.to_string()))?;
+        let req = self
+            .agent
+            .post(&self.url)
+            .set("Content-Type", "application/json")
+            .set("Accept", "application/json, text/event-stream");
+        let resp = match self.apply_headers(req).send_string(&body) {
+            Ok(r) => r,
+            Err(ureq::Error::Status(code, _)) => return Err(http_status_error(code)),
+            Err(e) => return Err(AppError::Io(format!("HTTP-Verbindungsfehler: {e}"))),
+        };
+
+        // Bei redirects(0) liefert ureq einen 3xx als Ok zurück – nicht folgen,
+        // sondern als klaren Fehler melden (kein Header-Leak an ein Redirect-Ziel).
+        if (300..=399).contains(&resp.status()) {
+            return Err(http_status_error(resp.status()));
+        }
+
+        // Session-Id beim ersten Mal übernehmen.
+        if self.session_id.is_none() {
+            if let Some(sid) = resp.header("Mcp-Session-Id") {
+                self.session_id = Some(sid.to_string());
+            }
+        }
+
+        if resp.content_type().contains("event-stream") {
+            read_sse_response(resp, id, deadline)
+        } else {
+            let mut buf = String::new();
+            resp.into_reader()
+                .take(MAX_RESPONSE_BYTES)
+                .read_to_string(&mut buf)
+                .map_err(|e| AppError::Io(e.to_string()))?;
+            let val: Value = serde_json::from_str(buf.trim())
+                .map_err(|e| AppError::Parse(format!("ungültige JSON-Antwort: {e}")))?;
+            // Fehlerantworten (dürfen laut Spec id=null tragen) durchreichen; eine
+            // Erfolgsantwort mit fremder id ablehnen (Konsistenz mit stdio/SSE).
+            if val.get("error").is_some() || id_matches(val.get("id"), id) {
+                Ok(parse_rpc_response(&val))
+            } else {
+                Err(AppError::Io("Antwort-id passt nicht zum Request".into()))
+            }
+        }
+    }
+
+    fn notification(&mut self, msg: &Value) -> Result<(), AppError> {
+        let body = serde_json::to_string(msg).map_err(|e| AppError::Parse(e.to_string()))?;
+        let req = self
+            .agent
+            .post(&self.url)
+            .set("Content-Type", "application/json")
+            .set("Accept", "application/json, text/event-stream");
+        match self.apply_headers(req).send_string(&body) {
+            Ok(resp) if (300..=399).contains(&resp.status()) => {
+                Err(http_status_error(resp.status()))
+            }
+            Ok(_) => Ok(()), // 2xx (v. a. 202 Accepted)
+            Err(ureq::Error::Status(code, _)) => Err(http_status_error(code)),
+            Err(e) => Err(AppError::Io(format!("HTTP-Verbindungsfehler: {e}"))),
+        }
+    }
+}
+
+/// Übersetzt HTTP-Fehlerstatus in verständliche Meldungen (kein Stacktrace).
+fn http_status_error(code: u16) -> AppError {
+    match code {
+        401 | 403 => AppError::Io("Authentifizierung erforderlich".into()),
+        404 => AppError::Io("HTTP 404 – MCP-Endpoint nicht gefunden".into()),
+        405 => AppError::Io("HTTP 405 – Methode am Endpoint nicht erlaubt".into()),
+        300..=399 => AppError::Io(format!(
+            "Server antwortete mit Redirect ({code}); wird aus Sicherheitsgründen nicht gefolgt \
+             (konfigurierte Header könnten sonst an ein fremdes Ziel gelangen). Bitte die \
+             endgültige URL direkt konfigurieren."
+        )),
+        _ => AppError::Io(format!("HTTP-Fehlerstatus {code}")),
+    }
+}
+
+/// Liest einen SSE-Antwortstrom, bis das JSON-RPC-Objekt mit passender `id`
+/// auftaucht. Sammelt `data:`-Zeilen je Event; respektiert Byte-Limit/Deadline.
+fn read_sse_response(
+    resp: ureq::Response,
+    id: i64,
+    deadline: &Instant,
+) -> Result<RpcOutcome, AppError> {
+    let mut reader = BufReader::new(resp.into_reader().take(MAX_RESPONSE_BYTES));
+    let mut data = String::new();
+    let mut line = String::new();
+
+    // Versucht, das aktuell gesammelte `data` als passende Antwort zu deuten.
+    let try_data = |data: &str| -> Option<RpcOutcome> {
+        let t = data.trim();
+        if t.is_empty() {
+            return None;
+        }
+        let val = serde_json::from_str::<Value>(t).ok()?;
+        if id_matches(val.get("id"), id) {
+            Some(parse_rpc_response(&val))
+        } else {
+            None
+        }
+    };
+
+    loop {
+        if Instant::now() >= *deadline {
+            return Err(AppError::Timeout);
+        }
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => {
+                // Stream-Ende: letztes Event (ohne abschließende Leerzeile) prüfen.
+                if let Some(outcome) = try_data(&data) {
+                    return Ok(outcome);
+                }
+                return Err(AppError::Io(
+                    "SSE-Stream endete ohne passende Antwort".into(),
+                ));
+            }
+            Ok(_) => {
+                let l = line.trim_end_matches(['\r', '\n']);
+                if l.is_empty() {
+                    // Event-Ende.
+                    if let Some(outcome) = try_data(&data) {
+                        return Ok(outcome);
+                    }
+                    data.clear();
+                } else if let Some(rest) = l.strip_prefix("data:") {
+                    if !data.is_empty() {
+                        data.push('\n');
+                    }
+                    data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+                }
+                // event:/id:/retry:/Kommentarzeilen (":") werden ignoriert.
+            }
+            Err(_) => return Err(AppError::Io("Fehler beim Lesen des SSE-Streams".into())),
+        }
+    }
+}
+
+/// HTTP-Treiber: baut den `HttpTransport` (ureq-Agent, Redirects aus), führt `f`
+/// aus und schließt die Session best effort (DELETE). Geteilt von Introspektion
+/// und Playground. `logs` ist bei HTTP immer `None` (kein stderr).
+fn run_http<R>(
+    entry: &ServerEntry,
+    timeout: Duration,
+    f: impl FnOnce(
+        &mut dyn RpcTransport,
+        &Instant,
+        Instant,
+        &mut Option<u64>,
+        &mut Vec<String>,
+    ) -> Result<R, AppError>,
+) -> DriverRun<R> {
+    let mut notes: Vec<String> = Vec::new();
+    let mut connect_ms: Option<u64> = None;
+    let fail = |msg: String, notes: Vec<String>| DriverRun {
+        result: Err(AppError::Io(msg)),
+        logs: None,
+        connect_ms: None,
+        notes,
+    };
+
+    let Some(url) = entry
+        .url
+        .as_ref()
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+    else {
+        return fail("Keine URL für HTTP-Introspektion".into(), notes);
+    };
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return fail(format!("Ungültige HTTP(S)-URL: {url}"), notes);
+    }
+
+    let started = Instant::now();
+    let deadline = started + timeout;
+    // Redirects bewusst ABschalten: MCP-Endpoints sind exakte URLs. Würde ureq
+    // Redirects folgen, könnte es die konfigurierten Header (inkl. Authorization)
+    // an ein fremdes Ziel bzw. über ein http-Downgrade weitersenden. Ein 3xx wird
+    // so als Fehler mit klarer Meldung sichtbar (http_status_error).
+    let agent = ureq::AgentBuilder::new()
+        .timeout(timeout)
+        .redirects(0)
+        .build();
+    let headers: Vec<(String, String)> = entry
+        .headers
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+
+    let mut transport = HttpTransport {
+        agent,
+        url,
+        headers,
+        session_id: None,
+    };
+    let result = f(
+        &mut transport,
+        &deadline,
+        started,
+        &mut connect_ms,
+        &mut notes,
+    );
+    transport.close_session();
+
+    DriverRun {
+        result,
+        logs: None,
+        connect_ms,
+        notes,
+    }
+}
+
+/// Introspiziert einen HTTP/SSE-Server (Streamable HTTP). `entry.url` muss
+/// gesetzt sein. Gibt – wie stdio – IMMER eine `Introspection` zurück.
+pub fn introspect_http(entry: &ServerEntry, timeout: Duration) -> Introspection {
+    let run = run_http(entry, timeout, |t, deadline, started, cm, notes| {
+        run_handshake(t, deadline, started, cm, notes)
+    });
+    let mut notes = run.notes;
+    match run.result {
+        Ok((tools, resources, prompts, server_name, server_version)) => Introspection {
+            tools,
+            resources,
+            prompts,
+            server_name,
+            server_version,
+            notes,
+            logs: None,
+            error: None,
+            connect_ms: run.connect_ms,
+            introspected_at: unix_now(),
+        },
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("Authentifizierung") {
+                notes.push(
+                    "Es werden nur die konfigurierten Header gesendet; OAuth-Token der \
+                     claude-CLI sind hier nicht nutzbar. Ggf. über die Anmelden-Funktion \
+                     einloggen oder einen Authorization-Header setzen."
+                        .into(),
+                );
+            }
+            // Legacy-SSE-Entscheidung (siehe PR): reines GET-SSE wird nicht unterstützt.
+            if entry.transport.as_deref() == Some("sse") {
+                notes.push(
+                    "Reines Legacy-SSE (GET-Stream mit endpoint-Event) wird nicht \
+                     unterstützt – nur Streamable HTTP (POST)."
+                        .into(),
+                );
+            }
+            let mut intro = error_introspection(msg, None, notes);
+            intro.connect_ms = run.connect_ms;
+            intro
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Playground: Handshake + genau ein weiterer Request (tools/call, resources/read,
+// prompts/get). Ergebnis ist ROH (unmaskiert) – die Redaktion passiert im
+// Command-Layer (`commands::mask_playground`), analog zu `mask_introspection`.
+// ---------------------------------------------------------------------------
+
+/// JSON-RPC-Methode + params aus einer `PlaygroundRequest`.
+fn playground_call_spec(req: &PlaygroundRequest) -> (&'static str, Value) {
+    match req {
+        PlaygroundRequest::CallTool { name, arguments } => (
+            "tools/call",
+            json!({ "name": name, "arguments": arguments }),
+        ),
+        PlaygroundRequest::ReadResource { uri } => ("resources/read", json!({ "uri": uri })),
+        PlaygroundRequest::GetPrompt { name, arguments } => (
+            "prompts/get",
+            json!({ "name": name, "arguments": arguments.clone().unwrap_or_default() }),
+        ),
+    }
+}
+
+/// Mappt das Treiber-Ergebnis (Handshake + ein Request) auf `PlaygroundResult`.
+fn playground_result(run: DriverRun<RpcOutcome>, duration_ms: Option<u64>) -> PlaygroundResult {
+    match run.result {
+        Ok(RpcOutcome::Result(val)) => {
+            // Tool meldet inhaltlichen Fehler via `isError: true` (kein Transportfehler).
+            let is_error = val
+                .get("isError")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            PlaygroundResult {
+                ok: true,
+                is_error,
+                result: Some(val),
+                error: None,
+                notes: run.notes,
+                logs: run.logs,
+                duration_ms,
+            }
+        }
+        Ok(RpcOutcome::RpcError(msg)) => PlaygroundResult {
+            ok: false,
+            is_error: false,
+            result: None,
+            error: Some(msg),
+            notes: run.notes,
+            logs: run.logs,
+            duration_ms,
+        },
+        Err(e) => PlaygroundResult {
+            ok: false,
+            is_error: false,
+            result: None,
+            error: Some(e.to_string()),
+            notes: run.notes,
+            logs: run.logs,
+            duration_ms,
+        },
+    }
+}
+
+/// Führt eine Playground-Operation gegen einen stdio-Server aus (Handshake + ein
+/// Request). Ergebnis ist ROH – Redaktion erfolgt im Command-Layer.
+pub fn playground_stdio(
+    entry: &ServerEntry,
+    req: &PlaygroundRequest,
+    timeout: Duration,
+) -> PlaygroundResult {
+    let (method, params) = playground_call_spec(req);
+    let start = Instant::now();
+    let run = run_stdio(entry, timeout, move |t, deadline, started, cm, _notes| {
+        let mut next_id: i64 = 1;
+        initialize(t, &mut next_id, deadline, started, cm)?;
+        request(t, &mut next_id, deadline, method, params)
+    });
+    playground_result(run, Some(start.elapsed().as_millis() as u64))
+}
+
+/// Wie `playground_stdio`, aber für HTTP/SSE-Server (Streamable HTTP).
+pub fn playground_http(
+    entry: &ServerEntry,
+    req: &PlaygroundRequest,
+    timeout: Duration,
+) -> PlaygroundResult {
+    let (method, params) = playground_call_spec(req);
+    let start = Instant::now();
+    let run = run_http(entry, timeout, move |t, deadline, started, cm, _notes| {
+        let mut next_id: i64 = 1;
+        initialize(t, &mut next_id, deadline, started, cm)?;
+        request(t, &mut next_id, deadline, method, params)
+    });
+    let mut result = playground_result(run, Some(start.elapsed().as_millis() as u64));
+    // Auth-Hinweis wie bei introspect_http (nur konfigurierte Header werden gesendet).
+    if result
+        .error
+        .as_deref()
+        .is_some_and(|e| e.contains("Authentifizierung"))
+    {
+        result.notes.push(
+            "Es werden nur die konfigurierten Header gesendet; OAuth-Token der claude-CLI sind \
+             hier nicht nutzbar. Ggf. über die Anmelden-Funktion einloggen oder einen \
+             Authorization-Header setzen."
+                .into(),
+        );
+    }
+    result
 }
 
 fn str_field(item: &Value, key: &str) -> Option<String> {
@@ -495,7 +1043,11 @@ mod tests {
             ..Default::default()
         };
         let intro = introspect_stdio(&entry, Duration::from_secs(60));
-        assert!(intro.error.is_none(), "Handshake sollte gelingen: {:?}", intro.error);
+        assert!(
+            intro.error.is_none(),
+            "Handshake sollte gelingen: {:?}",
+            intro.error
+        );
         assert!(
             intro.connect_ms.is_some(),
             "erfolgreicher Handshake muss connect_ms setzen"
@@ -512,7 +1064,34 @@ mod tests {
         for n in &intro.notes {
             eprintln!("note: {n}");
         }
-        assert!(!intro.tools.is_empty(), "everything-Server sollte Tools liefern");
+        assert!(
+            !intro.tools.is_empty(),
+            "everything-Server sollte Tools liefern"
+        );
+    }
+
+    /// Opt-in: echtes `tools/call` (echo) gegen den „everything"-Server via npx.
+    /// Netz-/Toolchain-abhängig. Nur mit `-- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn playground_everything_echo() {
+        let entry = ServerEntry {
+            transport: Some("stdio".into()),
+            command: Some("npx".into()),
+            args: Some(vec![
+                "-y".into(),
+                "@modelcontextprotocol/server-everything".into(),
+            ]),
+            ..Default::default()
+        };
+        let req = PlaygroundRequest::CallTool {
+            name: "echo".into(),
+            arguments: json!({ "message": "hallo playground" }),
+        };
+        let res = playground_stdio(&entry, &req, Duration::from_secs(60));
+        eprintln!("ok={} isError={} err={:?}", res.ok, res.is_error, res.error);
+        eprintln!("result={:?}", res.result);
+        assert!(res.ok, "tools/call sollte gelingen: {:?}", res.error);
     }
 
     /// Deterministisch (kein Netz): ein Prozess, der sofort nach stderr schreibt
@@ -530,7 +1109,10 @@ mod tests {
             ..Default::default()
         };
         let intro = introspect_stdio(&entry, Duration::from_secs(5));
-        assert!(intro.error.is_some(), "fehlgeschlagener Start muss error setzen");
+        assert!(
+            intro.error.is_some(),
+            "fehlgeschlagener Start muss error setzen"
+        );
         assert!(intro.tools.is_empty());
         assert!(
             intro.connect_ms.is_none(),
@@ -559,10 +1141,85 @@ mod tests {
             ..Default::default()
         };
         let intro = introspect_stdio(&entry, Duration::from_secs(5));
-        assert!(intro.error.is_some(), "Folgefehler nach initialize muss error setzen");
+        assert!(
+            intro.error.is_some(),
+            "Folgefehler nach initialize muss error setzen"
+        );
         assert!(
             intro.connect_ms.is_some(),
             "connect_ms muss trotz Folgefehler erhalten bleiben"
+        );
+    }
+
+    /// Fake-stdio-Server für Playground-Tests: beantwortet initialize (id 1),
+    /// verwirft notifications/initialized und antwortet auf den EINEN Playground-
+    /// Request (id 2) mit `tool_reply` (rohes JSON-RPC-Result/-Error-Objekt).
+    fn playground_entry(tool_reply: &str) -> ServerEntry {
+        let script = format!(
+            "read a; printf '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"serverInfo\":{{\"name\":\"t\",\"version\":\"1\"}}}}}}\\n'; \
+             read b; read c; printf '{}\\n'",
+            tool_reply.replace('\'', "'\\''")
+        );
+        ServerEntry {
+            transport: Some("stdio".into()),
+            command: Some("sh".into()),
+            args: Some(vec!["-c".into(), script]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn playground_stdio_tool_call_ok() {
+        let entry = playground_entry(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"hi"}],"isError":false}}"#,
+        );
+        let req = PlaygroundRequest::CallTool {
+            name: "echo".into(),
+            arguments: json!({}),
+        };
+        let res = playground_stdio(&entry, &req, Duration::from_secs(5));
+        assert!(res.ok, "ok erwartet: {:?}", res.error);
+        assert!(!res.is_error);
+        let text = res.result.as_ref().and_then(|r| r.get("content")).is_some();
+        assert!(text, "content erwartet: {:?}", res.result);
+        assert!(res.duration_ms.is_some());
+    }
+
+    #[test]
+    fn playground_stdio_tool_is_error() {
+        let entry = playground_entry(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"boom"}],"isError":true}}"#,
+        );
+        let req = PlaygroundRequest::CallTool {
+            name: "fail".into(),
+            arguments: json!({}),
+        };
+        let res = playground_stdio(&entry, &req, Duration::from_secs(5));
+        assert!(res.ok, "Transport ok");
+        assert!(
+            res.is_error,
+            "isError:true muss als Tool-Fehler erkannt werden"
+        );
+    }
+
+    #[test]
+    fn playground_stdio_rpc_error() {
+        let entry = playground_entry(
+            r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"Method not found"}}"#,
+        );
+        let req = PlaygroundRequest::CallTool {
+            name: "nope".into(),
+            arguments: json!({}),
+        };
+        let res = playground_stdio(&entry, &req, Duration::from_secs(5));
+        assert!(!res.ok, "RPC-Fehler -> ok=false");
+        assert!(
+            res.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Method not found"),
+            "error: {:?}",
+            res.error
         );
     }
 
@@ -576,7 +1233,11 @@ mod tests {
         };
         let intro = introspect_stdio(&entry, Duration::from_secs(5));
         assert!(
-            intro.error.as_deref().unwrap_or_default().contains("Befehl nicht gefunden"),
+            intro
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Befehl nicht gefunden"),
             "error: {:?}",
             intro.error
         );
@@ -616,5 +1277,326 @@ mod tests {
             "Auszug nicht gedeckelt: {} Bytes",
             logs.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod http_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+
+    /// Antwort, die der Test-HTTP-Server auf einen Request gibt. Der Server baut
+    /// aus `Json`/`Sse` selbst die JSON-RPC-Hülle mit der echten Request-`id`.
+    enum Reply {
+        /// 200 application/json mit `{jsonrpc,id,result}`.
+        Json(Value),
+        /// 200 application/json + `Mcp-Session-Id`-Header.
+        JsonWithSession(Value, String),
+        /// 200 text/event-stream mit einem `data:`-Frame `{jsonrpc,id,result}`.
+        Sse(Value),
+        /// 202 ohne Body.
+        Accepted,
+        /// Fehlerstatus ohne verwertbaren Body.
+        Status(u16),
+        /// 200 application/json mit exakt diesem Body (keine id-Einsetzung).
+        Raw(String),
+    }
+
+    /// Startet einen minimalen HTTP-Server (ein Request pro Verbindung dank
+    /// `Connection: close`). Der Handler bekommt HTTP-Methode, das geparste
+    /// Request-JSON und ob ein `Mcp-Session-Id`-Header vorhanden war.
+    fn spawn_server<F>(handler: F) -> String
+    where
+        F: Fn(&str, &Value, bool) -> Reply + Send + Sync + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handler = Arc::new(handler);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut http_method = String::new();
+                let mut content_length = 0usize;
+                let mut has_session = false;
+                let mut first = true;
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let t = line.trim_end();
+                    if first {
+                        http_method = t.split_whitespace().next().unwrap_or("").to_string();
+                        first = false;
+                    }
+                    if t.is_empty() {
+                        break; // Header-Ende
+                    }
+                    let lower = t.to_ascii_lowercase();
+                    if let Some(v) = lower.strip_prefix("content-length:") {
+                        content_length = v.trim().parse().unwrap_or(0);
+                    }
+                    if lower.starts_with("mcp-session-id:") {
+                        has_session = true;
+                    }
+                }
+                let mut body = vec![0u8; content_length];
+                if content_length > 0 {
+                    let _ = reader.read_exact(&mut body);
+                }
+                let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                let id = req.get("id").cloned().unwrap_or(json!(0));
+
+                let reply = handler(&http_method, &req, has_session);
+                let (status, ctype, resp_body, session): (u16, &str, String, Option<String>) =
+                    match reply {
+                        Reply::Json(result) => (
+                            200,
+                            "application/json",
+                            json!({"jsonrpc":"2.0","id":id,"result":result}).to_string(),
+                            None,
+                        ),
+                        Reply::JsonWithSession(result, sid) => (
+                            200,
+                            "application/json",
+                            json!({"jsonrpc":"2.0","id":id,"result":result}).to_string(),
+                            Some(sid),
+                        ),
+                        Reply::Sse(result) => {
+                            let obj = json!({"jsonrpc":"2.0","id":id,"result":result});
+                            (200, "text/event-stream", format!("data: {obj}\n\n"), None)
+                        }
+                        Reply::Accepted => (202, "text/plain", String::new(), None),
+                        Reply::Status(code) => (code, "application/json", String::new(), None),
+                        Reply::Raw(body) => (200, "application/json", body, None),
+                    };
+
+                let mut head = format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                    resp_body.len()
+                );
+                if let Some(sid) = session {
+                    head.push_str(&format!("Mcp-Session-Id: {sid}\r\n"));
+                }
+                head.push_str("\r\n");
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(resp_body.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}/mcp")
+    }
+
+    fn http_entry(url: &str) -> ServerEntry {
+        ServerEntry {
+            transport: Some("http".into()),
+            url: Some(url.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn http_json_session_and_pagination() {
+        let url = spawn_server(|http_method, req, has_session| {
+            if http_method == "DELETE" {
+                return Reply::Accepted;
+            }
+            match req.get("method").and_then(|m| m.as_str()).unwrap_or("") {
+                "initialize" => Reply::JsonWithSession(
+                    json!({"serverInfo": {"name": "srv", "version": "9"}}),
+                    "sess-1".into(),
+                ),
+                "notifications/initialized" => Reply::Accepted,
+                "tools/list" => {
+                    // Verlangt die Session-Id auf Folge-Requests.
+                    if !has_session {
+                        return Reply::Status(400);
+                    }
+                    let has_cursor = req.get("params").and_then(|p| p.get("cursor")).is_some();
+                    if has_cursor {
+                        Reply::Json(json!({"tools": [{"name": "b"}]}))
+                    } else {
+                        Reply::Json(json!({"tools": [{"name": "a"}], "nextCursor": "p2"}))
+                    }
+                }
+                "resources/list" => Reply::Json(json!({"resources": []})),
+                "prompts/list" => Reply::Json(json!({"prompts": []})),
+                _ => Reply::Status(404),
+            }
+        });
+
+        let intro = introspect_http(&http_entry(&url), Duration::from_secs(10));
+        assert!(
+            intro.error.is_none(),
+            "kein Fehler erwartet: {:?}",
+            intro.error
+        );
+        assert_eq!(intro.server_name.as_deref(), Some("srv"));
+        assert!(intro.connect_ms.is_some(), "connect_ms muss gesetzt sein");
+        // Zwei Seiten -> zwei Tools; beweist Session-Weitergabe (sonst 400) + Pagination.
+        let names: Vec<&str> = intro.tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn http_sse_response_is_parsed() {
+        let url = spawn_server(|_m, req, _s| {
+            match req.get("method").and_then(|m| m.as_str()).unwrap_or("") {
+                "initialize" => Reply::JsonWithSession(
+                    json!({"serverInfo": {"name": "sse-srv", "version": "1"}}),
+                    "s".into(),
+                ),
+                "notifications/initialized" => Reply::Accepted,
+                "tools/list" => Reply::Sse(json!({"tools": [{"name": "streamed"}]})),
+                "resources/list" => Reply::Sse(json!({"resources": []})),
+                "prompts/list" => Reply::Sse(json!({"prompts": []})),
+                _ => Reply::Status(404),
+            }
+        });
+
+        let intro = introspect_http(&http_entry(&url), Duration::from_secs(10));
+        assert!(intro.error.is_none(), "kein Fehler: {:?}", intro.error);
+        assert_eq!(intro.tools.len(), 1);
+        assert_eq!(intro.tools[0].name, "streamed");
+    }
+
+    #[test]
+    fn http_401_reports_auth_required() {
+        let url = spawn_server(|_m, _req, _s| Reply::Status(401));
+        let intro = introspect_http(&http_entry(&url), Duration::from_secs(10));
+        assert!(
+            intro
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Authentifizierung erforderlich"),
+            "error: {:?}",
+            intro.error
+        );
+        assert!(
+            intro
+                .notes
+                .iter()
+                .any(|n| n.contains("konfigurierten Header")),
+            "Hinweis auf Header/OAuth erwartet: {:?}",
+            intro.notes
+        );
+    }
+
+    #[test]
+    fn http_redirect_is_not_followed() {
+        // Server antwortet auf initialize mit einem Redirect (302). Der Client darf
+        // dem NICHT folgen (sonst Header-Leak) und muss klar fehlschlagen.
+        let url = spawn_server(|_m, _req, _s| Reply::Status(302));
+        let intro = introspect_http(&http_entry(&url), Duration::from_secs(10));
+        assert!(
+            intro
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Redirect"),
+            "Redirect-Fehler erwartet: {:?}",
+            intro.error
+        );
+    }
+
+    #[test]
+    fn http_wrong_id_is_rejected() {
+        // initialize ok, aber tools/list liefert eine Antwort mit falscher id.
+        let url = spawn_server(|_m, req, _s| {
+            match req.get("method").and_then(|m| m.as_str()).unwrap_or("") {
+                "initialize" => {
+                    Reply::JsonWithSession(json!({"serverInfo": {"name": "x"}}), "s".into())
+                }
+                "notifications/initialized" => Reply::Accepted,
+                // Rohe JSON-Antwort mit fest falscher id (nicht die des Requests):
+                "tools/list" => Reply::Raw(
+                    r#"{"jsonrpc":"2.0","id":999,"result":{"tools":[{"name":"x"}]}}"#.into(),
+                ),
+                _ => Reply::Json(json!({"resources": [], "prompts": []})),
+            }
+        });
+        let intro = introspect_http(&http_entry(&url), Duration::from_secs(10));
+        assert!(
+            intro
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("id passt nicht"),
+            "Fremd-id sollte abgelehnt werden: {:?}",
+            intro.error
+        );
+    }
+
+    #[test]
+    fn http_timeout_yields_error() {
+        // Server liest den Request, wartet dann länger als das Timeout.
+        let url = spawn_server(|_m, _req, _s| {
+            std::thread::sleep(Duration::from_secs(3));
+            Reply::Json(json!({"serverInfo": {}}))
+        });
+        let intro = introspect_http(&http_entry(&url), Duration::from_secs(1));
+        assert!(intro.error.is_some(), "Timeout muss einen Fehler liefern");
+    }
+
+    #[test]
+    fn http_playground_tool_call() {
+        let url = spawn_server(|_m, req, _s| {
+            match req.get("method").and_then(|m| m.as_str()).unwrap_or("") {
+                "initialize" => {
+                    Reply::JsonWithSession(json!({"serverInfo": {"name": "x"}}), "s".into())
+                }
+                "notifications/initialized" => Reply::Accepted,
+                "tools/call" => Reply::Json(
+                    json!({"content": [{"type": "text", "text": "remote ok"}], "isError": false}),
+                ),
+                _ => Reply::Status(404),
+            }
+        });
+        let req = PlaygroundRequest::CallTool {
+            name: "echo".into(),
+            arguments: json!({"x": 1}),
+        };
+        let res = playground_http(&http_entry(&url), &req, Duration::from_secs(10));
+        assert!(res.ok, "ok erwartet: {:?}", res.error);
+        assert!(!res.is_error);
+        let text = res
+            .result
+            .as_ref()
+            .and_then(|r| r.get("content"))
+            .and_then(|c| c.get(0))
+            .and_then(|i| i.get("text"))
+            .and_then(|t| t.as_str());
+        assert_eq!(text, Some("remote ok"));
+    }
+
+    /// Opt-in-Smoke gegen einen echten öffentlichen MCP-Endpoint. Netzabhängig,
+    /// daher `#[ignore]`. Mit `-- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn http_smoke_deepwiki() {
+        let entry = http_entry("https://mcp.deepwiki.com/mcp");
+        let intro = introspect_http(&entry, Duration::from_secs(30));
+        eprintln!(
+            "server={:?} v{:?} | {} tools | connect={:?} ms | error={:?}",
+            intro.server_name,
+            intro.server_version,
+            intro.tools.len(),
+            intro.connect_ms,
+            intro.error,
+        );
+        for n in &intro.notes {
+            eprintln!("note: {n}");
+        }
+        assert!(
+            intro.error.is_none(),
+            "Handshake sollte gelingen: {:?}",
+            intro.error
+        );
+        assert!(!intro.tools.is_empty(), "deepwiki sollte Tools liefern");
     }
 }

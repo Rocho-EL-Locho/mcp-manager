@@ -10,12 +10,22 @@ import {
   loginServer,
   toggleMcpjsonServer,
   toggleUserServer,
+  listBackups,
+  createBackup,
+  restoreBackup,
+  deleteBackup,
+  listConflicts,
+  renameServer,
 } from "./ipc";
-import type { MergedServer, ProjectInfo, Scope } from "./ipc";
+import type { MergedServer, ProjectInfo, Scope, BackupInfo, ConflictInfo, AppSettings } from "./ipc";
+import { openConflictDialog, openConflictsOverview } from "./views/conflictDialog";
+import { modalsOpen } from "./modal";
+import { notifyStatusChange } from "./notify";
 import { renderServerList, defaultFilter, selectionKey } from "./views/serverList";
 import type { FilterState, BulkAction } from "./views/serverList";
 import { renderSidebar } from "./views/sidebar";
 import type { View } from "./views/sidebar";
+import { renderBackups } from "./views/backups";
 import { openDetail } from "./views/serverDetail";
 import { openServerForm } from "./views/serverForm";
 import { openServerPicker } from "./views/serverPicker";
@@ -29,6 +39,8 @@ import { icon, setIcon } from "./icons";
 interface State {
   servers: MergedServer[];
   projects: ProjectInfo[];
+  backups: BackupInfo[];
+  conflicts: ConflictInfo[];
   home: string;
   view: View;
   loading: boolean;
@@ -38,11 +50,15 @@ interface State {
   sidebarVisible: boolean;
   filter: FilterState;
   selection: Set<string>;
+  /// Laufende Live-Diagnose-Session (Feature 08): welcher Server (selectionKey) + Id.
+  logSession: { key: string; id: string } | null;
 }
 
 const state: State = {
   servers: [],
   projects: [],
+  backups: [],
+  conflicts: [],
   home: "",
   view: { kind: "global" },
   loading: false,
@@ -52,6 +68,7 @@ const state: State = {
   sidebarVisible: true,
   filter: defaultFilter(),
   selection: new Set(),
+  logSession: null,
 };
 
 let contentEl: HTMLElement;
@@ -103,11 +120,55 @@ function pruneSelection(): void {
 // die Ansicht überschreibt. Nur der jüngste Aufruf darf schreiben/rendern.
 let refreshSeq = 0;
 
+// Gecachte App-Einstellungen (Auto-Refresh-Intervall, Benachrichtigungen).
+// Beim Start geladen und im onSaved-Callback aktualisiert.
+let appSettings: AppSettings | null = null;
+let autoTimer: number | undefined;
+
+/// Momentaufnahme des Status je Server (Schlüssel -> status.kind) für den
+/// Vorher/Nachher-Vergleich der Statuswechsel-Erkennung.
+function statusSnapshot(servers: MergedServer[]): Map<string, string> {
+  const m = new Map<string, string>();
+  for (const s of servers) m.set(selectionKey(s), s.status.kind);
+  return m;
+}
+
+/// Vergleicht alten/neuen Status und benachrichtigt bei Verschlechterung
+/// (connected -> failed / needs_auth), sofern Benachrichtigungen aktiviert sind.
+function notifyDegradations(prev: Map<string, string>, next: MergedServer[]): void {
+  if (!appSettings?.notifications) return;
+  for (const s of next) {
+    const before = prev.get(selectionKey(s));
+    const after = s.status.kind;
+    if (before === "connected" && (after === "failed" || after === "needs_auth")) {
+      void notifyStatusChange(s.name, after);
+    }
+  }
+}
+
 async function refresh(): Promise<void> {
   const seq = ++refreshSeq;
   state.error = null;
   await loadProjects();
   if (seq !== refreshSeq) return;
+
+  // Backups-Ansicht: eigener, health-check-freier Ladepfad.
+  // Erst in eine lokale Variable laden, DANN den Guard prüfen, DANN zuweisen:
+  // wird der State vor der Prüfung geschrieben, überschreibt ein überholter Lauf
+  // frische Daten und der `return` verhindert nur noch das Rendern.
+  if (state.view.kind === "backups") {
+    try {
+      const backups = await listBackups();
+      if (seq !== refreshSeq) return;
+      state.backups = backups;
+    } catch (e) {
+      if (seq !== refreshSeq) return;
+      state.error = String(e);
+    }
+    renderContent();
+    return;
+  }
+
   const project = currentProjectPath();
 
   // Phase 1: schnelle Liste (Status aus Cache, kein Health-Check) -> sofort da.
@@ -116,6 +177,16 @@ async function refresh(): Promise<void> {
     if (seq !== refreshSeq) return;
     state.servers = servers;
     pruneSelection();
+    // Namenskonflikte parallel-günstig mitladen (kein Health-Check nötig).
+    // Auch hier: laden, Guard, erst dann zuweisen.
+    try {
+      const conflicts = await listConflicts(project);
+      if (seq !== refreshSeq) return;
+      state.conflicts = conflicts;
+    } catch {
+      if (seq !== refreshSeq) return;
+      state.conflicts = [];
+    }
     renderContent();
   } catch (e) {
     if (seq !== refreshSeq) return;
@@ -126,12 +197,16 @@ async function refresh(): Promise<void> {
   // Phase 2: frischer Health-Status im Hintergrund.
   state.loading = true;
   renderControls();
+  // Vorherigen Status (aus der Schnell-Liste = letzter bekannter Stand) merken,
+  // um Verschlechterungen zu erkennen.
+  const prevStatus = statusSnapshot(state.servers);
   try {
     const servers = await listServers(state.reveal, project, true);
     if (seq !== refreshSeq) return;
     state.servers = servers;
     pruneSelection();
     state.lastRefresh = new Date();
+    notifyDegradations(prevStatus, servers);
   } catch (e) {
     if (seq !== refreshSeq) return;
     state.error = String(e);
@@ -142,6 +217,26 @@ async function refresh(): Promise<void> {
       renderContent();
     }
   }
+}
+
+/// (Re)startet den Auto-Refresh-Timer gemäß den Einstellungen. 0 Minuten = aus.
+function applyAutoRefresh(): void {
+  if (autoTimer !== undefined) {
+    window.clearInterval(autoTimer);
+    autoTimer = undefined;
+  }
+  const minutes = appSettings?.auto_refresh_minutes ?? 0;
+  if (minutes <= 0) return;
+  autoTimer = window.setInterval(
+    () => {
+      // Nicht refreshen, während das Fenster im Hintergrund ist, bereits ein
+      // Refresh läuft oder ein Modal offen ist (sonst würde ein Full-Rebuild dem
+      // Nutzer ein offenes Formular unter der Hand wegreißen).
+      if (document.hidden || state.loading || modalsOpen()) return;
+      void refresh();
+    },
+    minutes * 60_000,
+  );
 }
 
 async function recheck(server: MergedServer): Promise<void> {
@@ -218,7 +313,11 @@ function refreshClaudeBadge(): void {
 
 function onSettings(): void {
   void openSettings({
-    onSaved: () => {
+    onSaved: (saved) => {
+      // Geänderte Einstellungen übernehmen: Auto-Refresh-Timer neu setzen,
+      // Benachrichtigungs-Flag cachen.
+      appSettings = saved;
+      applyAutoRefresh();
       // Pfad-/Timeout-Änderungen können Auflösung und Status betreffen.
       refreshClaudeBadge();
       void refresh();
@@ -276,11 +375,16 @@ function onLogin(server: MergedServer): void {
 
 /// Toggle-Routing (ohne Toast/Refresh) – von onToggle und den Bulk-Aktionen genutzt.
 /// Projekt-Scope über settings.local.json, User-Scope über Stash-and-restore.
-async function applyToggle(server: MergedServer, enabled: boolean): Promise<void> {
+async function applyToggle(
+  server: MergedServer,
+  enabled: boolean,
+  skipSnapshot = false,
+): Promise<void> {
   if (server.scope === "project") {
+    // Projekt-Scope schreibt nur in settings.local.json -> kein Snapshot.
     await toggleMcpjsonServer(server.name, enabled, server.project_path ?? undefined);
   } else if (server.scope === "user") {
-    await toggleUserServer(server.name, enabled);
+    await toggleUserServer(server.name, enabled, skipSnapshot);
   } else {
     throw new Error(`Kein Aktivieren/Deaktivieren für Scope „${server.origin}"`);
   }
@@ -351,7 +455,7 @@ function onBulk(action: BulkAction, servers: MergedServer[]): void {
     title: meta.title,
     message:
       action === "remove"
-        ? `${planned.length} Server werden über claude gelöscht. Das kann nicht rückgängig gemacht werden.`
+        ? `${planned.length} Server werden über claude gelöscht. Zuvor wird automatisch ein Snapshot angelegt (über „Backups" wiederherstellbar).`
         : `${planned.length} Server werden ${meta.gerund}.`,
     extra,
     confirmLabel: meta.confirmLabel,
@@ -359,15 +463,29 @@ function onBulk(action: BulkAction, servers: MergedServer[]): void {
     onConfirm: async (setStatus) => {
       done = 0;
       failures.length = 0;
+      // Destruktive Bulk-Aktionen (Entfernen/Deaktivieren) einmalig vorab
+      // sichern statt pro Server – sonst würde jeder Einzelschritt einen
+      // Snapshot anlegen und die Retention mit Kopien derselben Aktion fluten.
+      // Aktivieren ist nicht destruktiv und braucht keine Sicherung.
+      const bulkSnapshot = action !== "enable";
+      if (bulkSnapshot) {
+        setStatus("Sicherung wird erstellt…");
+        // auto=true: unterliegt der Retention (kein unbegrenztes Anwachsen) und
+        // wird korrekt als automatische Sicherung getaggt.
+        await createBackup(
+          `auto: Bulk-${meta.confirmLabel} (${planned.length} Server)`,
+          true,
+        );
+      }
       for (let i = 0; i < planned.length; i++) {
         const s = planned[i];
         setStatus(`${i + 1}/${planned.length} … ${s.name}`);
         try {
           if (action === "remove") {
             if (!s.scope) throw new Error("Externer Server kann nicht entfernt werden.");
-            await removeServer(s.name, s.scope, s.project_path ?? undefined);
+            await removeServer(s.name, s.scope, s.project_path ?? undefined, bulkSnapshot);
           } else {
-            await applyToggle(s, targetEnabled);
+            await applyToggle(s, targetEnabled, bulkSnapshot);
           }
           done++;
         } catch (e) {
@@ -405,6 +523,27 @@ function onDeleteProject(project: ProjectInfo): void {
   });
 }
 
+const backupHandlers = {
+  create: (note: string | undefined) => createBackup(note).then(() => undefined),
+  restore: (id: string, onlyPaths: string[] | undefined) => restoreBackup(id, onlyPaths),
+  remove: (id: string) => deleteBackup(id),
+  onChanged: () => void refresh(),
+};
+
+const conflictHandlers = {
+  remove: (name: string, scope: Scope, projectPath: string | undefined) =>
+    removeServer(name, scope, projectPath),
+  rename: (name: string, scope: Scope, projectPath: string | undefined, newName: string) =>
+    renameServer(name, scope, newName, projectPath),
+  onChanged: () => void refresh(),
+};
+
+/// Öffnet den Konflikt-Dialog für einen Server aus der Liste (Klick aufs Warn-Icon).
+function onConflict(server: MergedServer): void {
+  const conflict = state.conflicts.find((c) => c.name === server.name);
+  if (conflict) openConflictDialog(conflict, conflictHandlers);
+}
+
 function renderSidebarEl(): void {
   clear(sidebarEl);
   sidebarEl.append(
@@ -434,6 +573,16 @@ function renderContent(): void {
 
   clear(contentEl);
 
+  // Backups-Ansicht: eigene View statt der Server-Liste.
+  if (state.view.kind === "backups") {
+    contentEl.append(h("div", { class: "view-head" }, h("span", { text: "Backups & Snapshots" })));
+    if (state.error) {
+      contentEl.append(h("div", { class: "banner banner-error", text: state.error }));
+    }
+    contentEl.append(renderBackups(state.backups, state.home, backupHandlers));
+    return;
+  }
+
   const heading =
     state.view.kind === "project"
       ? h("div", { class: "view-head" }, h("span", { class: "mono", text: state.view.path }))
@@ -444,13 +593,43 @@ function renderContent(): void {
     contentEl.append(h("div", { class: "banner banner-error", text: state.error }));
   }
 
+  // Konflikt-Banner: bei ≥1 Namenskonflikt dezent oberhalb der Liste.
+  if (state.conflicts.length > 0) {
+    const n = state.conflicts.length;
+    const bannerText = n === 1 ? "1 Namenskonflikt" : `${n} Namenskonflikte`;
+    const banner = h(
+      "button",
+      {
+        class: "banner banner-warn conflict-banner",
+        onclick: () =>
+          n === 1
+            ? openConflictDialog(state.conflicts[0], conflictHandlers)
+            : openConflictsOverview(state.conflicts, conflictHandlers),
+      },
+      icon("alert"),
+      h("span", { text: `${bannerText} – Details anzeigen` }),
+    );
+    contentEl.append(banner);
+  }
+
   contentEl.append(
     renderServerList(
       state.servers,
       {
         onDetails: (s) =>
           openDetail(s, {
+            // Projekt-Kontext durchreichen – der Scope-Wechsel braucht ihn als
+            // Zielprojekt.
+            projectPath: currentProjectPath(),
             onChanged: () => void refresh(),
+            activeLogSession:
+              state.logSession && state.logSession.key === selectionKey(s)
+                ? state.logSession.id
+                : null,
+            onLogSessionChange: (srv, id) => {
+              state.logSession = id ? { key: selectionKey(srv), id } : null;
+              renderContent();
+            },
             onRechecked: (srv, status) => {
               // Neuen Health-Status ohne teuren Full-Refresh in die Liste übernehmen.
               const target = state.servers.find(
@@ -481,6 +660,7 @@ function renderContent(): void {
         onRemove,
         onLogin,
         onToggle: (s, enabled) => void onToggle(s, enabled),
+        onConflict,
       },
       visibleGroups(),
       {
@@ -488,6 +668,7 @@ function renderContent(): void {
         selection: state.selection,
         onBulk,
       },
+      state.logSession?.key ?? null,
     ),
   );
 
@@ -544,9 +725,13 @@ async function main(): Promise<void> {
   app.append(topbar, layout);
   applySidebarVisibility();
 
-  // Gespeichertes Theme früh anwenden (best effort; Fehler => System-Default).
+  // Einstellungen laden: Theme anwenden, Auto-Refresh-Timer starten, Flags cachen.
   void getSettings()
-    .then((s) => applyTheme(s.theme))
+    .then((s) => {
+      appSettings = s;
+      applyTheme(s.theme);
+      applyAutoRefresh();
+    })
     .catch(() => applyTheme("system"));
 
   refreshClaudeBadge();

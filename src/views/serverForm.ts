@@ -5,11 +5,12 @@ import { addServer, updateServer, revealServerEntry } from "../ipc";
 import { openModal } from "../modal";
 import type { ServerPreset } from "../presets";
 import { toast } from "../toast";
+import { transportOfEntry } from "../transport";
 
 export interface ServerFormOptions {
   mode: "add" | "edit";
   server?: MergedServer;
-  prefill?: { name?: string; entry?: ServerEntry };
+  prefill?: { name?: string; entry?: ServerEntry; secretKeys?: string[] };
   /// Gewähltes Preset (Add-Modus): liefert Prefill, docsUrl und Secret-Führung.
   preset?: ServerPreset;
   /// Zielprojekt für local/project-Scope (Add-Modus).
@@ -19,12 +20,12 @@ export interface ServerFormOptions {
   onSaved: () => void;
 }
 
-interface KvEditor {
+export interface KvEditor {
   el: HTMLElement;
   getValues: () => Record<string, string>;
 }
 
-function kvEditor(initial?: Record<string, string>, secretKeys?: string[]): KvEditor {
+export function kvEditor(initial?: Record<string, string>, secretKeys?: string[]): KvEditor {
   const rows = h("div", { class: "kv-editor" });
   const secrets = new Set(secretKeys ?? []);
 
@@ -126,14 +127,16 @@ export async function openServerForm(opts: ServerFormOptions): Promise<void> {
     if (opts.defaultScope) scope = opts.defaultScope;
   }
 
-  const secretKeys = opts.preset?.secretKeys ?? [];
+  const secretKeys = opts.prefill?.secretKeys ?? opts.preset?.secretKeys ?? [];
 
   // Ursprüngliches type merken, um bei stdio keinen "type"-Key neu hinzuzufügen.
   const hadType = initEntry.type != null;
-  // type normalisieren: nur stdio/http/sse sind gültige Optionen, sonst aus url ableiten.
-  const initTransport = ["stdio", "http", "sse"].includes(initEntry.type ?? "")
-    ? (initEntry.type as string)
-    : (initEntry.url ? "http" : "stdio");
+  // type normalisieren: nur stdio/http/sse sind gültige Optionen, sonst aus url
+  // ableiten. Bewusst über die GEMEINSAME Ableitung – eine eigene ohne die
+  // `/sse`-Regel würde `{"url": "…/sse"}` ohne explizites `type` als „http"
+  // vorbelegen, und weil beim Speichern `type` immer geschrieben wird, kippte
+  // ein beliebiger unbeteiligter Edit den Server dauerhaft von sse auf http.
+  const initTransport: string = transportOfEntry(initEntry);
 
   // Felder
   const nameInput = h("input", { class: "inp" }) as HTMLInputElement;

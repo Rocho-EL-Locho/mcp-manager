@@ -122,15 +122,90 @@ fn mask_url_query(url: &str) -> (String, bool) {
     }
 }
 
+/// Zeichen, die laut RFC 3986 nach dem führenden Buchstaben in einem URI-Schema
+/// erlaubt sind.
+fn is_scheme_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')
+}
+
+/// Maskiert das Passwort in der Userinfo eines URI (`schema://user:passwort@host/…`).
+///
+/// Gescannt wird der gesamte Text, damit auch eingebettete URIs greifen – etwa
+/// `DATABASE_URL=postgresql://user:geheim@host/db` oder ein Connection-String in
+/// kompaktem JSON. Schema, Benutzername, Host, Port, Pfad und Query bleiben
+/// lesbar; maskiert wird ausschließlich der Passwortteil. Unangetastet bleiben
+/// URIs ohne `@` in der Authority (`https://host/pfad`), Texte ohne `://`
+/// (`mailto:user@host`) und Userinfo ohne Passwort (`ssh://user@host`).
+/// Gibt (text, wurde_etwas_maskiert) zurück.
+fn mask_uri_userinfo(text: &str) -> (String, bool) {
+    let mut out = String::with_capacity(text.len());
+    let mut masked_any = false;
+    let mut copied = 0usize; // bis hierher wurde `text` bereits nach `out` übernommen
+    let mut search = 0usize;
+    while let Some(rel) = text[search..].find("://") {
+        let sep = search + rel;
+        search = sep + 3;
+        // Schema rückwärts einsammeln; es muss mit einem Buchstaben beginnen.
+        let mut scheme_start = sep;
+        for (off, c) in text[..sep].char_indices().rev() {
+            if is_scheme_char(c) {
+                scheme_start = off;
+            } else {
+                break;
+            }
+        }
+        if !text[scheme_start..sep].starts_with(|c: char| c.is_ascii_alphabetic()) {
+            continue;
+        }
+        // Die Authority endet an Pfad/Query/Fragment bzw. an Rand-/Trennzeichen.
+        let auth_start = sep + 3;
+        let auth_end = text[auth_start..]
+            .find(|c: char| {
+                c.is_whitespace()
+                    || matches!(c, '/' | '?' | '#' | '"' | '\'' | '`' | '<' | '>' | '\\')
+            })
+            .map_or(text.len(), |i| auth_start + i);
+        let authority = &text[auth_start..auth_end];
+        // Userinfo ist alles vor dem LETZTEN '@' der Authority (RFC 3986).
+        let Some(at) = authority.rfind('@') else {
+            continue; // kein Userinfo-Teil, z. B. https://host/pfad
+        };
+        let userinfo = &authority[..at];
+        let Some(colon) = userinfo.find(':') else {
+            continue; // `user@host` ohne Passwort -> nichts zu maskieren
+        };
+        if colon + 1 >= userinfo.len() {
+            continue; // leeres Passwort
+        }
+        out.push_str(&text[copied..auth_start + colon + 1]);
+        out.push_str(MASK);
+        copied = auth_start + at;
+        masked_any = true;
+        search = auth_end;
+    }
+    if !masked_any {
+        return (text.to_string(), false);
+    }
+    out.push_str(&text[copied..]);
+    (out, true)
+}
+
 /// Maskiert den Wertteil eines `KEY=VALUE`-Arguments, wenn der Schlüssel geheim wirkt.
 /// Gibt (maskiertes_arg, war_geheim) zurück.
 fn mask_kv_arg(arg: &str) -> (String, bool) {
+    // URI mit Credentials in der Userinfo (`postgresql://user:geheim@host/db`)?
+    // -> nur den Passwortteil maskieren, der Rest bleibt lesbar.
+    let (mut work, mut masked) = mask_uri_userinfo(arg);
     // URL mit geheimem Query-Anteil? -> Query-Werte maskieren, Basis behalten.
-    if looks_like_url_with_query(arg) {
-        let (masked, changed) = mask_url_query(arg);
+    if looks_like_url_with_query(&work) {
+        let (masked_url, changed) = mask_url_query(&work);
         if changed {
-            return (masked, true);
+            work = masked_url;
+            masked = true;
         }
+    }
+    if masked {
+        return (work, true);
     }
     if let Some(eq) = arg.find('=') {
         let (key, val) = arg.split_at(eq);
@@ -145,12 +220,16 @@ fn mask_kv_arg(arg: &str) -> (String, bool) {
     (arg.to_string(), false)
 }
 
-/// Enthält die Definition Geheimnisse (env/headers/verdächtige args)?
+/// Enthält die Definition Geheimnisse (env/headers/URL/verdächtige args)?
 pub fn entry_has_secrets(entry: &ServerEntry) -> bool {
     if entry.env.as_ref().is_some_and(|m| !m.is_empty()) {
         return true;
     }
     if entry.headers.as_ref().is_some_and(|m| !m.is_empty()) {
+        return true;
+    }
+    // Gehostete Endpunkte tragen ihr Token oft in der URL (Query oder Userinfo).
+    if entry.url.as_ref().is_some_and(|u| mask_kv_arg(u).1) {
         return true;
     }
     if let Some(args) = &entry.args {
@@ -176,6 +255,12 @@ pub fn mask_entry(entry: &ServerEntry, reveal: bool) -> ServerEntry {
         for v in headers.values_mut() {
             *v = MASK.to_string();
         }
+    }
+    if let Some(url) = out.url.as_mut() {
+        // Nur teilmaskieren (Query-Token bzw. Userinfo-Passwort), damit Host und
+        // Pfad lesbar bleiben — identisch zu dem, was `mask_summary` in der
+        // Listenzeile mit derselben URL macht.
+        *url = mask_kv_arg(url).0;
     }
     if let Some(args) = out.args.as_mut() {
         for a in args.iter_mut() {
@@ -383,5 +468,102 @@ mod tests {
         assert!(s.contains("properties"));
         assert!(s.contains("/home/user/data"));
         assert!(s.contains("object"));
+    }
+
+    /// Baut eine reine URL-Definition (http/sse-Transport).
+    fn url_entry(url: &str) -> ServerEntry {
+        ServerEntry {
+            url: Some(url.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn url_mit_query_token_wird_maskiert() {
+        let raw = "https://mcp.example.com/sse?api_key=EXAMPLEexample1234567890";
+        let entry = url_entry(raw);
+        // Detailansicht/Formular-Vorbelegung: URL darf das Token nicht enthalten.
+        let masked = mask_entry(&entry, false);
+        let masked_url = masked.url.expect("URL bleibt vorhanden");
+        assert!(!masked_url.contains("EXAMPLEexample1234567890"), "Token durchgerutscht: {masked_url}");
+        assert!(masked_url.contains(MASK));
+        // Host und Pfad bleiben lesbar.
+        assert!(masked_url.starts_with("https://mcp.example.com/sse?api_key="));
+        // Listenzeile und Detail müssen denselben Text zeigen.
+        assert_eq!(mask_summary(&summarize_entry(&entry), false), masked_url);
+        // Und die „hat Secrets"-Erkennung muss anschlagen (Badge + Edit-Schutz).
+        assert!(entry_has_secrets(&entry));
+    }
+
+    #[test]
+    fn url_ohne_secret_bleibt_lesbar() {
+        for raw in [
+            "https://mcp.example.com/sse",
+            "http://localhost:3000/mcp",
+            "https://mcp.example.com/mcp?version=2",
+        ] {
+            let entry = url_entry(raw);
+            assert_eq!(
+                mask_entry(&entry, false).url.as_deref(),
+                Some(raw),
+                "sollte unverändert bleiben: {raw}"
+            );
+            assert!(!entry_has_secrets(&entry), "kein Secret: {raw}");
+        }
+    }
+
+    #[test]
+    fn reveal_liefert_die_klartext_url() {
+        let raw = "https://mcp.example.com/sse?api_key=EXAMPLEexample1234567890";
+        let entry = url_entry(raw);
+        assert_eq!(mask_entry(&entry, true).url.as_deref(), Some(raw));
+        assert_eq!(mask_summary(raw, true), raw);
+    }
+
+    #[test]
+    fn uri_userinfo_passwort_wird_maskiert() {
+        // Muster des mitgelieferten postgres-Presets (Connection-String in args).
+        let conn = "postgresql://appuser:s3cr3t-pw@db.example.com:5432/appdb";
+        let (masked, changed) = mask_kv_arg(conn);
+        assert!(changed);
+        assert_eq!(masked, format!("postgresql://appuser:{MASK}@db.example.com:5432/appdb"));
+
+        // Als Argument einer Definition (Listenzeile + Detail).
+        let entry = ServerEntry {
+            command: Some("npx".into()),
+            args: Some(vec![
+                "-y".into(),
+                "@modelcontextprotocol/server-postgres".into(),
+                conn.to_string(),
+            ]),
+            ..Default::default()
+        };
+        assert!(entry_has_secrets(&entry));
+        let masked_entry = mask_entry(&entry, false);
+        let joined = masked_entry.args.expect("args bleiben erhalten").join(" ");
+        assert!(!joined.contains("s3cr3t-pw"), "Passwort durchgerutscht: {joined}");
+        assert!(joined.contains("db.example.com"), "Host soll lesbar bleiben: {joined}");
+        assert_eq!(mask_summary(&summarize_entry(&entry), false), format!("npx {joined}"));
+
+        // Auch in stderr-/Log-/Playground-Freitext und eingebettet hinter KEY=.
+        let red = redact_secrets("connect failed: postgresql://appuser:s3cr3t-pw@db.example.com/appdb");
+        assert!(!red.contains("s3cr3t-pw"), "Passwort durchgerutscht: {red}");
+        let red_env = redact_secrets("DATABASE_URL=postgresql://appuser:s3cr3t-pw@db.example.com/appdb");
+        assert!(!red_env.contains("s3cr3t-pw"), "Passwort durchgerutscht: {red_env}");
+    }
+
+    #[test]
+    fn uri_ohne_passwort_bleibt_unangetastet() {
+        for s in [
+            "https://mcp.example.com/pfad",
+            "ssh://git@github.com/org/repo.git",
+            "mailto:support@example.com",
+            "support@example.com",
+            "http://localhost:8080/mcp",
+        ] {
+            assert_eq!(mask_kv_arg(s).0, s, "sollte unverändert bleiben: {s}");
+            assert!(!mask_kv_arg(s).1, "kein Secret: {s}");
+            assert_eq!(redact_secrets(s), s, "Freitext sollte unverändert bleiben: {s}");
+        }
     }
 }

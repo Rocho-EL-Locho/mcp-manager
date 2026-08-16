@@ -2,7 +2,10 @@ import { h } from "../dom";
 import { icon } from "../icons";
 import type { ProjectInfo } from "../ipc";
 
-export type View = { kind: "global" } | { kind: "project"; path: string };
+export type View =
+  | { kind: "global" }
+  | { kind: "project"; path: string }
+  | { kind: "backups" };
 
 export interface SidebarHandlers {
   onSelect: (view: View) => void;
@@ -21,8 +24,9 @@ function shortPath(path: string, home: string): string {
 
 function isActive(view: View, item: View): boolean {
   if (view.kind !== item.kind) return false;
-  if (view.kind === "global") return true;
-  return item.kind === "project" && view.path === item.path;
+  if (view.kind === "project" && item.kind === "project") return view.path === item.path;
+  // global / backups: Gleichheit der Art genügt.
+  return true;
 }
 
 export function renderSidebar(
@@ -44,6 +48,19 @@ export function renderSidebar(
     h("span", { class: "side-label", text: "Global (user)" }),
   );
   root.append(globalItem);
+
+  // Backups-Eintrag (eigene Content-Ansicht, kein Projekt).
+  root.append(
+    h(
+      "button",
+      {
+        class: `side-item ${isActive(view, { kind: "backups" }) ? "side-active" : ""}`,
+        onclick: () => handlers.onSelect({ kind: "backups" }),
+      },
+      icon("archive"),
+      h("span", { class: "side-label", text: "Backups" }),
+    ),
+  );
 
   root.append(h("div", { class: "side-header", text: `Projekte (${projects.length})` }));
 

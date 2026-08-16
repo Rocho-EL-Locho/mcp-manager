@@ -35,6 +35,10 @@ const DEFAULT_SNAPSHOT_RETENTION: u32 = 20;
 /// Erlaubter Bereich für die konfigurierbaren Timeouts (Sekunden).
 pub const TIMEOUT_MIN: u64 = 5;
 pub const TIMEOUT_MAX: u64 = 600;
+/// Erlaubter Bereich für die Snapshot-Retention. Mindestens 1, damit der vor
+/// einer destruktiven Aktion angelegte Auto-Snapshot nie sofort evictet wird.
+pub const RETENTION_MIN: u32 = 1;
+pub const RETENTION_MAX: u32 = 500;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -131,6 +135,12 @@ pub fn validate(settings: &AppSettings) -> Result<(), AppError> {
             )));
         }
     }
+    if !(RETENTION_MIN..=RETENTION_MAX).contains(&settings.snapshot_retention) {
+        return Err(AppError::Io(format!(
+            "Snapshot-Retention muss zwischen {RETENTION_MIN} und {RETENTION_MAX} liegen (war {}).",
+            settings.snapshot_retention
+        )));
+    }
     if let Some(path) = settings.claude_path() {
         if !std::path::Path::new(path).is_file() {
             return Err(AppError::Io(format!(
@@ -195,6 +205,17 @@ mod tests {
         s.list_timeout_secs = TIMEOUT_MIN;
         s.mut_timeout_secs = 0;
         assert!(validate(&s).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_retention() {
+        let mut s = AppSettings::default();
+        s.snapshot_retention = RETENTION_MIN - 1; // 0
+        assert!(validate(&s).is_err());
+        s.snapshot_retention = RETENTION_MAX + 1;
+        assert!(validate(&s).is_err());
+        s.snapshot_retention = RETENTION_MIN;
+        assert!(validate(&s).is_ok());
     }
 
     #[test]

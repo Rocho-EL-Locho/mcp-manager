@@ -5,6 +5,7 @@ import { openModal } from "../modal";
 import type { ServerPreset } from "../presets";
 import { PRESETS, presetEntry, presetTransport } from "../presets";
 import { openAssistant } from "./assistant";
+import { openRegistryBrowser } from "./registry";
 import { openServerForm } from "./serverForm";
 
 export interface PickerContext {
@@ -64,6 +65,11 @@ export function openServerPicker(onSaved: () => void, ctx: PickerContext = {}): 
     openAssistant(onSaved, ctx);
   };
 
+  const openCatalog = () => {
+    modal.close();
+    openRegistryBrowser(onSaved, ctx);
+  };
+
   // Erste Reihe: die zwei „freien" Einstiege prominent.
   const special = h(
     "div",
@@ -79,6 +85,12 @@ export function openServerPicker(onSaved: () => void, ctx: PickerContext = {}): 
       desc: "Claude liest README/Doku einer URL und schlägt eine Konfiguration vor.",
       badge: icon("sparkles"),
       onClick: openLink,
+    }),
+    card({
+      title: "Aus Katalog wählen",
+      desc: "Server in der offiziellen MCP-Registry suchen und übernehmen.",
+      badge: icon("globe"),
+      onClick: openCatalog,
     }),
   );
 
