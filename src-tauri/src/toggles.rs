@@ -6,8 +6,9 @@
 //!
 //! Hier wohnt außerdem die **gemeinsame** Schreib-Routine für alle kleinen,
 //! selbst verwalteten Dateien (`stash.rs`, `settings.rs`, `metrics.rs`,
-//! `snapshot.rs`): nutzer-privat (0600), ohne Symlinks zu folgen, und atomar
-//! über eine Temp-Datei mit unvorhersagbarem Namen.
+//! `snapshot.rs`, `clients/claude_desktop.rs`): nutzer-privat (0600), ohne
+//! Symlinks zu folgen, und atomar über eine Temp-Datei mit unvorhersagbarem
+//! Namen.
 
 use std::path::{Path, PathBuf};
 
@@ -114,6 +115,47 @@ pub fn atomic_write_json(path: &Path, value: &Value) -> Result<(), AppError> {
     let mut text = serde_json::to_string_pretty(value).map_err(|e| AppError::Parse(e.to_string()))?;
     text.push('\n');
     atomic_write_bytes(path, text.as_bytes())
+}
+
+/// Löst `path` auf, falls der Pfad **selbst** ein Symlink ist, und liefert
+/// sonst `path` unverändert zurück.
+///
+/// Warum überhaupt folgen: `atomic_write_bytes` schreibt per `rename` und würde
+/// einen Symlink dabei durch eine reguläre Datei ersetzen. Zeigt die
+/// Konfiguration ins Dotfiles-Repo (verbreitetes Setup), hinge dieses danach
+/// lautlos ab — die Änderung landete in einer neuen Datei, die niemand
+/// versioniert. Deshalb wird für Ziele mit Symlink dem Link gefolgt.
+///
+/// Diese Funktion **entscheidet nicht allein**, ob geschrieben werden darf: sie
+/// löst nur auf. Ein toter oder exotischer Link (Ziel fehlt, ist ein Verzeichnis
+/// oder ein Gerät) liefert `path` unverändert zurück — der Aufrufer
+/// (`clients::claude_desktop::read_root`) erkennt das am unveränderten Ergebnis
+/// und bricht ab, statt den Link durch eine reguläre Datei zu ersetzen.
+///
+/// Siehe auch `snapshot::restore_write_target`: dieselbe Haltung gegenüber
+/// Symlinks, aber mit eigenen Helfern und einem strengeren Kriterium (gefolgt
+/// wird nur, wenn schon der Snapshot über genau diesen Link gesichert hat).
+///
+/// Sicherheitsabwägung (bewusst so entschieden, nicht übersehen):
+/// * Für den **Zielpfad** gilt die `O_NOFOLLOW`-Zusage aus [`open_private`]
+///   damit nicht mehr; für die Temp-Datei gilt sie unverändert.
+/// * Wer einen Symlink an diese Stelle legen kann, hat bereits Schreibrecht im
+///   Konfigurationsverzeichnis und könnte dort schlicht ein bösartiges
+///   `command` eintragen, das die Introspektion startet. Der Umweg über den
+///   Link verschafft ihm gegenüber diesem Ist-Zustand praktisch nichts.
+/// * Zwei Schranken bleiben trotzdem: gefolgt wird nur auf **reguläre**
+///   Dateien (nie auf Geräte, FIFOs oder Verzeichnisse), und geschrieben wird
+///   ausschließlich ein Dokument, das zuvor aus genau diesem Pfad gelesen und
+///   als Konfiguration verstanden wurde — eine leere Datei hinter dem Link zählt
+///   dabei ausdrücklich **nicht** als gelesenes Dokument.
+pub(crate) fn resolve_link_target(path: &Path) -> PathBuf {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => match std::fs::canonicalize(path) {
+            Ok(real) if real.is_file() => real,
+            _ => path.to_path_buf(),
+        },
+        _ => path.to_path_buf(),
+    }
 }
 
 fn string_vec(obj: &Map<String, Value>, key: &str) -> Vec<String> {
@@ -406,5 +448,40 @@ mod tests {
         forget_mcpjson(&settings, "github").unwrap();
         assert_eq!(std::fs::read_to_string(&settings).unwrap(), before);
         assert!(leftover_temps(&dir).is_empty());
+    }
+
+    /// `resolve_link_target`: reguläre Pfade bleiben unverändert, Symlinks auf
+    /// reguläre Dateien werden aufgelöst, tote Links und Links auf
+    /// Verzeichnisse nicht (dort ersetzt der Rename bewusst den Link).
+    #[cfg(unix)]
+    #[test]
+    fn resolve_link_target_folgt_nur_regulaeren_dateien() {
+        use std::os::unix::fs::symlink;
+        let dir = tmp("resolve-link");
+        let real = dir.join("echt.json");
+        std::fs::write(&real, b"{}").unwrap();
+
+        // Kein Symlink -> unverändert (auch wenn die Datei gar nicht existiert).
+        let plain = dir.join("plain.json");
+        assert_eq!(resolve_link_target(&real), real);
+        assert_eq!(resolve_link_target(&plain), plain);
+
+        // Symlink auf reguläre Datei -> aufgelöst.
+        let link = dir.join("link.json");
+        symlink(&real, &link).unwrap();
+        assert_eq!(
+            resolve_link_target(&link),
+            std::fs::canonicalize(&real).unwrap()
+        );
+
+        // Toter Symlink -> unverändert (Rename ersetzt ihn).
+        let dead = dir.join("dead.json");
+        symlink(dir.join("gibt-es-nicht"), &dead).unwrap();
+        assert_eq!(resolve_link_target(&dead), dead);
+
+        // Symlink auf ein Verzeichnis -> unverändert (niemals hineinschreiben).
+        let to_dir = dir.join("dirlink");
+        symlink(&dir, &to_dir).unwrap();
+        assert_eq!(resolve_link_target(&to_dir), to_dir);
     }
 }

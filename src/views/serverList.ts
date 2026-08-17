@@ -6,7 +6,9 @@ import type { MergedServer, ServerStatus, Scope } from "../ipc";
 
 export interface ListHandlers {
   onDetails: (server: MergedServer) => void;
-  onRecheck: (server: MergedServer) => void;
+  /// Liefert ein Promise, solange die Prüfung läuft – die Zeile blendet so lange
+  /// den Spin-/Disabled-Zustand ein (der Handshake darf bis zu 20 s dauern).
+  onRecheck: (server: MergedServer) => void | Promise<void>;
   onEdit: (server: MergedServer) => void;
   onRemove: (server: MergedServer) => void;
   onLogin: (server: MergedServer) => void;
@@ -39,15 +41,17 @@ export interface BulkContext {
   onBulk: (action: BulkAction, servers: MergedServer[]) => void;
 }
 
-/// Eindeutiger Auswahl-Schlüssel: Scope (bzw. origin bei externen) + Name + Projekt,
-/// weil derselbe Name in mehreren Scopes/Projekten vorkommen kann (collision).
+/// Eindeutiger Auswahl-Schlüssel: Client-Id bzw. Scope (bzw. origin bei externen)
+/// + Name + Projekt, weil derselbe Name in mehreren Scopes/Projekten/Clients
+/// vorkommen kann (collision).
 export function selectionKey(s: MergedServer): string {
-  return `${s.scope ?? s.origin}::${s.name}::${s.project_path ?? ""}`;
+  return `${s.client_id ?? s.scope ?? s.origin}::${s.name}::${s.project_path ?? ""}`;
 }
 
-/// Nur Server mit bekanntem Scope sind auswählbar; externe (Connector/Plugin) nicht.
+/// Auswählbar sind Server mit bekanntem Scope und Server eines Datei-Clients;
+/// externe (Connector/Plugin) nicht.
 export function isSelectable(s: MergedServer): boolean {
-  return s.scope !== null;
+  return s.scope !== null || s.client_id != null;
 }
 
 /// Transport aus der Definition ableiten (analog serverForm). Null, wenn unbekannt
@@ -124,7 +128,13 @@ const GROUPS: Group[] = [
   { key: "user", label: "Global (user)", match: (s) => s.scope === "user" },
   { key: "local", label: "Projekt-lokal (local)", match: (s) => s.scope === "local" },
   { key: "project", label: "Projekt (.mcp.json)", match: (s) => s.scope === "project" },
-  { key: "external", label: "Extern (Connector / Plugin)", match: (s) => s.scope === null },
+  // Ohne den zusätzlichen client_id-Test landeten Client-Server hier in „Extern".
+  {
+    key: "external",
+    label: "Extern (Connector / Plugin)",
+    match: (s) => s.scope === null && s.client_id == null,
+  },
+  { key: "client", label: "Weitere Clients", match: (s) => s.client_id != null },
 ];
 
 export function scopeLabel(scope: Scope | null): string {
@@ -223,16 +233,30 @@ function serverCard(
 
   const summary = h("div", { class: "card-summary mono", title: server.summary }, server.summary || "—");
 
+  // „prüfen" startet einen echten Serverprozess (bis zu INTROSPECT_TIMEOUT = 20 s,
+  // etwa bei kaltem npx/uvx). Ohne Spin-/Disabled-Zustand bliebe die Zeile so
+  // lange stumm – und jeder weitere Klick startete einen zusätzlichen Prozess.
+  // Gleiches Muster wie im Detail-Modal (`serverDetail.ts`).
+  const recheckIcon = icon("refresh");
   const recheckBtn = h(
     "button",
-    {
-      class: "btn btn-small",
-      title: "Status neu prüfen",
-      onclick: () => handlers.onRecheck(server),
-    },
-    icon("refresh"),
+    { class: "btn btn-small", title: "Status neu prüfen" },
+    recheckIcon,
     "prüfen",
-  );
+  ) as HTMLButtonElement;
+  recheckBtn.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    recheckBtn.disabled = true;
+    recheckIcon.classList.add("spin");
+    try {
+      await handlers.onRecheck(server);
+    } finally {
+      // Nach dem Refresh ist diese Zeile meist schon neu gebaut; auf einem
+      // abgehängten Knoten ist das Zurücksetzen ein harmloser No-op.
+      recheckBtn.disabled = false;
+      recheckIcon.classList.remove("spin");
+    }
+  });
 
   const detailBtn = h(
     "button",

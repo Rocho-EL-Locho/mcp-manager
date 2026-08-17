@@ -1,7 +1,14 @@
 import { h } from "../dom";
 import { icon } from "../icons";
-import type { MergedServer, Scope, ServerEntry } from "../ipc";
-import { addServer, updateServer, revealServerEntry } from "../ipc";
+import type { ClientInfo, MergedServer, Scope, ServerEntry } from "../ipc";
+import {
+  addServer,
+  updateServer,
+  revealServerEntry,
+  addClientServer,
+  updateClientServer,
+  revealClientEntry,
+} from "../ipc";
 import { openModal } from "../modal";
 import type { ServerPreset } from "../presets";
 import { toast } from "../toast";
@@ -17,6 +24,9 @@ export interface ServerFormOptions {
   projectPath?: string;
   /// Vorbelegter Scope im Add-Modus.
   defaultScope?: Scope;
+  /// Ziel-Client (Feature 16): speichert in dessen Konfigurationsdatei statt
+  /// über die claude-CLI. Im Edit-Modus für Label/Fähigkeiten des Clients.
+  client?: ClientInfo;
   onSaved: () => void;
 }
 
@@ -82,26 +92,37 @@ export async function openServerForm(opts: ServerFormOptions): Promise<void> {
   let name = "";
   let scope: Scope = "user";
 
+  // Ziel-Client (Feature 16): im Add-Modus aus den Optionen, im Edit-Modus vom
+  // Server selbst (maßgeblich). Ohne Client läuft alles wie bisher über die
+  // claude-CLI und die Scope-Auswahl.
+  const client = opts.client;
+  const clientId = isEdit ? (opts.server?.client_id ?? null) : (client?.id ?? null);
+
   if (isEdit && opts.server) {
-    name = opts.server.name;
-    scope = opts.server.scope ?? "user";
-    if (opts.server.scope) {
+    const srv = opts.server;
+    name = srv.name;
+    scope = srv.scope ?? "user";
+    if (clientId || srv.scope) {
       // Klartext-Konfiguration laden. opts.server.entry ist ggf. maskiert (••••••••)
       // und darf NICHT als Fallback ins Formular, sonst überschreibt ein Speichern
       // echte Secrets mit den Platzhaltern.
       let revealed: ServerEntry | null = null;
       try {
-        revealed = await revealServerEntry(
-          opts.server.scope,
-          name,
-          opts.server.project_path ?? undefined,
-        );
+        // Bewusst zwei getrennte Zweige statt eines Ternärs: nur so verengt
+        // TypeScript `srv.scope` von `Scope | null` auf `Scope` – ein `as
+        // Scope`-Cast auf einem Datenfeld wäre genau das Muster, das
+        // `ServerOrigin`/`originOf` beseitigen sollte.
+        if (clientId) {
+          revealed = await revealClientEntry(clientId, name);
+        } else if (srv.scope) {
+          revealed = await revealServerEntry(srv.scope, name, srv.project_path ?? undefined);
+        }
       } catch {
         revealed = null;
       }
       if (revealed) {
         initEntry = revealed;
-      } else if (opts.server.has_secrets) {
+      } else if (srv.has_secrets) {
         // Reveal fehlgeschlagen und der Server hält Secrets: nicht mit maskierten
         // Werten öffnen, um Secret-Zerstörung beim Speichern zu vermeiden.
         const info = h("div", { class: "form-status error" },
@@ -112,7 +133,7 @@ export async function openServerForm(opts: ServerFormOptions): Promise<void> {
         return;
       } else {
         // Keine Secrets: der (unmaskierte) entry ist gefahrlos verwendbar.
-        initEntry = opts.server.entry ?? {};
+        initEntry = srv.entry ?? {};
       }
     }
   } else {
@@ -162,6 +183,12 @@ export async function openServerForm(opts: ServerFormOptions): Promise<void> {
   ) as HTMLSelectElement;
   transportSelect.value = initTransport;
 
+  // Datei-Clients laden je nach Fähigkeiten nur stdio aus ihrer Konfiguration
+  // (Claude Desktop: Remote läuft dort über Connectors). Dann bleibt die
+  // Transport-Auswahl aus und hart auf stdio stehen.
+  const allowRemote = clientId ? (client?.caps.remote ?? false) : true;
+  if (!allowRemote) transportSelect.value = "stdio";
+
   // stdio-Felder
   const commandInput = h("input", { class: "inp mono", placeholder: "z. B. npx / docker / uvx" }) as HTMLInputElement;
   commandInput.value = initEntry.command ?? "";
@@ -208,21 +235,37 @@ export async function openServerForm(opts: ServerFormOptions): Promise<void> {
       )
     : null;
 
+  const clientLabel = client?.label ?? clientId ?? "";
+
+  // Ziel des Speicherns: entweder ein Claude-Code-Scope oder ein Datei-Client.
+  const targetField = clientId
+    ? field(
+        "Client",
+        h("div", { class: "mono", text: clientLabel }),
+        client?.config_path
+          ? `Wird direkt in ${client.config_path} gespeichert – ${clientLabel} lädt die Konfiguration erst beim Neustart neu.`
+          : `${clientLabel} lädt die Konfiguration erst beim Neustart neu.`,
+      )
+    : field(
+        "Scope",
+        scopeSelect,
+        isEdit
+          ? "Scope-Wechsel folgt separat."
+          : opts.projectPath
+            ? `local/project zielen auf: ${opts.projectPath}`
+            : "local/project zielen auf das Standard-Projekt (Home).",
+      );
+
+  const transportField = field("Transport", transportSelect);
+  if (!allowRemote) transportField.style.display = "none";
+
   const body = h(
     "div",
     { class: "server-form" },
     presetHead,
     field("Name", nameInput, isEdit ? "Name unveränderlich (zum Umbenennen: entfernen + neu anlegen)." : undefined),
-    field(
-      "Scope",
-      scopeSelect,
-      isEdit
-        ? "Scope-Wechsel folgt separat."
-        : opts.projectPath
-          ? `local/project zielen auf: ${opts.projectPath}`
-          : "local/project zielen auf das Standard-Projekt (Home).",
-    ),
-    field("Transport", transportSelect),
+    targetField,
+    transportField,
     stdioSection,
     remoteSection,
     status,
@@ -298,9 +341,21 @@ export async function openServerForm(opts: ServerFormOptions): Promise<void> {
     status.className = "form-status";
     status.textContent = "wird gespeichert…";
     try {
-      if (isEdit) await updateServer(finalName, finalScope, entry, opts.server?.project_path ?? undefined);
-      else await addServer(finalName, finalScope, entry, opts.projectPath);
-      toast(isEdit ? "Server gespeichert" : "Server hinzugefügt");
+      if (clientId) {
+        // Datei-Client: direkter, snapshot-gesicherter Edit seiner Konfiguration.
+        if (isEdit) await updateClientServer(clientId, finalName, entry);
+        else await addClientServer(clientId, finalName, entry);
+      } else if (isEdit) {
+        await updateServer(finalName, finalScope, entry, opts.server?.project_path ?? undefined);
+      } else {
+        await addServer(finalName, finalScope, entry, opts.projectPath);
+      }
+      const saved = isEdit ? "Server gespeichert" : "Server hinzugefügt";
+      toast(
+        clientId
+          ? `${saved} – ${clientLabel} neu starten, damit die Änderung greift.`
+          : saved,
+      );
       // Nicht blockierend: leere Secret-Keys als Hinweis nachreichen.
       const empty = emptySecretKeys(entry);
       if (empty.length) toast(`Hinweis: leer gelassen – ${empty.join(", ")}`);

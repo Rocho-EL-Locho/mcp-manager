@@ -177,9 +177,14 @@ pub struct PlaygroundResult {
 #[derive(Debug, Clone, Serialize)]
 pub struct MergedServer {
     pub name: String,
-    /// None => extern verwaltet (claude.ai-Connector / Plugin), nicht editierbar.
+    /// Claude-Code-Scope der Definition. `None` heißt **nicht** automatisch
+    /// „extern": zusammen mit gesetztem `client_id` ist es ein Datei-Client
+    /// (Claude Desktop & Co., editierbar, Definition in dessen Konfigurationsdatei);
+    /// `None` **ohne** `client_id` ist extern verwaltet (claude.ai-Connector /
+    /// Plugin) und nicht editierbar.
     pub scope: Option<Scope>,
-    /// Herkunft für die Anzeige: "user" | "local" | "project" | "connector" | "plugin" | "unbekannt".
+    /// Herkunft für die Anzeige: "user" | "local" | "project" | "connector" |
+    /// "plugin" | "unbekannt" | Client-Id (z. B. "claude-desktop").
     pub origin: String,
     pub project_path: Option<String>,
     /// Definition; None bei externen Servern ohne lokale JSON-Definition.
@@ -192,6 +197,10 @@ pub struct MergedServer {
     pub has_secrets: bool,
     /// true, wenn derselbe Name in mehreren Scopes existiert.
     pub collision: bool,
+    /// Zugehöriger Datei-Client (Feature 16), z. B. "claude-desktop".
+    /// None => Claude-Code-Server (scope gesetzt) bzw. extern verwaltet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
     /// Anzahl introspizierter Tools/Ressourcen/Prompts (nur gesetzt, wenn der
     /// Server bereits introspiziert wurde – aus dem Introspektions-Cache).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -209,6 +218,22 @@ pub struct MergedServer {
     /// Some(false) => vorhanden, Some(true) => fehlt -> Warnung.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_missing: Option<bool>,
+}
+
+/// Quelle bzw. Ziel beim Kopieren einer Server-Definition (Feature 16).
+/// Die beiden Welten bleiben bewusst getrennt: Claude Code hat Scopes und eine
+/// CLI, ein Datei-Client hat nur eine Id.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CopyEndpoint {
+    ClaudeCode {
+        scope: Scope,
+        #[serde(default)]
+        project_path: Option<String>,
+    },
+    Client {
+        id: String,
+    },
 }
 
 /// Eine einzelne Definition innerhalb eines Namenskonflikts.

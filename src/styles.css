@@ -1446,10 +1446,23 @@ select.inp option {
   transition: border-color 0.12s, background 0.12s, box-shadow 0.12s;
 }
 
-.picker-card:hover {
+.picker-card:hover:not(:disabled) {
   border-color: var(--accent);
   background: var(--accent-soft);
   box-shadow: var(--shadow-sm);
+}
+
+/* Vorlage, die der Ziel-Client nicht laden kann (Remote in einer stdio-Datei):
+   sichtbar deaktiviert, Begründung steht direkt darunter. */
+.picker-card:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.picker-card-blocked {
+  font-size: 0.72rem;
+  color: var(--warn);
+  line-height: 1.3;
 }
 
 .picker-card-head {

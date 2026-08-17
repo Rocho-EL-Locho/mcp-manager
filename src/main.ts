@@ -16,8 +16,20 @@ import {
   deleteBackup,
   listConflicts,
   renameServer,
+  listClients,
+  listClientServers,
+  removeClientServer,
+  checkClientServer,
 } from "./ipc";
-import type { MergedServer, ProjectInfo, Scope, BackupInfo, ConflictInfo, AppSettings } from "./ipc";
+import type {
+  MergedServer,
+  ProjectInfo,
+  Scope,
+  BackupInfo,
+  ConflictInfo,
+  AppSettings,
+  ClientInfo,
+} from "./ipc";
 import { openConflictDialog, openConflictsOverview } from "./views/conflictDialog";
 import { modalsOpen } from "./modal";
 import { notifyStatusChange } from "./notify";
@@ -39,6 +51,8 @@ import { icon, setIcon } from "./icons";
 interface State {
   servers: MergedServer[];
   projects: ProjectInfo[];
+  /// Erkannte Datei-Clients (Feature 16); leer, wenn keiner installiert ist.
+  clients: ClientInfo[];
   backups: BackupInfo[];
   conflicts: ConflictInfo[];
   home: string;
@@ -57,6 +71,7 @@ interface State {
 const state: State = {
   servers: [],
   projects: [],
+  clients: [],
   backups: [],
   conflicts: [],
   home: "",
@@ -91,7 +106,19 @@ function currentProjectPath(): string | undefined {
   return state.view.kind === "project" ? state.view.path : undefined;
 }
 
+/// Id des aktuell gewählten Datei-Clients (nur in der Client-Ansicht).
+function currentClientId(): string | undefined {
+  return state.view.kind === "client" ? state.view.id : undefined;
+}
+
+/// Der aktuell gewählte Datei-Client, falls (noch) bekannt.
+function currentClient(): ClientInfo | undefined {
+  const id = currentClientId();
+  return id ? state.clients.find((c) => c.id === id) : undefined;
+}
+
 function visibleGroups(): string[] {
+  if (state.view.kind === "client") return ["client"];
   return state.view.kind === "project" ? ["local", "project"] : ["user", "external"];
 }
 
@@ -102,6 +129,31 @@ async function loadProjects(): Promise<void> {
     if (home) state.home = home.path;
   } catch (e) {
     state.error = String(e);
+  }
+  renderSidebarEl();
+}
+
+/// Erkannte Datei-Clients laden. Blockiert nie: ohne installierten Client bleibt
+/// die Liste leer und die Sidebar-Sektion verschwindet.
+async function loadClients(seq: number): Promise<void> {
+  let clients: ClientInfo[];
+  try {
+    clients = await listClients();
+  } catch {
+    // Fehlschlag = keine erkannten Clients. Der View-Reset unten muss dann
+    // GENAUSO greifen wie im Erfolgsfall: bliebe die Ansicht auf einem Client
+    // stehen, dessen Sidebar-Eintrag verschwunden ist, öffnete „Hinzufügen"
+    // das Formular ohne `clientId` und legte den Server unbemerkt per
+    // `claude mcp add-json` im user-Scope an.
+    clients = [];
+  }
+  if (seq !== refreshSeq) return;
+  state.clients = clients;
+  // Ist der gewählte Client verschwunden (deinstalliert), nicht in einer toten
+  // Ansicht hängen bleiben – sein Sidebar-Eintrag ist dann ebenfalls weg.
+  const view = state.view;
+  if (view.kind === "client" && !clients.some((c) => c.id === view.id)) {
+    state.view = { kind: "global" };
   }
   renderSidebarEl();
 }
@@ -149,7 +201,15 @@ function notifyDegradations(prev: Map<string, string>, next: MergedServer[]): vo
 async function refresh(): Promise<void> {
   const seq = ++refreshSeq;
   state.error = null;
+  // Der neue Lauf besitzt ab hier den Spin-Zustand: ein überholter Lauf kehrt an
+  // seinem `refreshSeq`-Guard zurück und überspringt sein `finally`, könnte also
+  // `loading` nicht mehr zurücksetzen. Ohne diese Zeile bliebe „Aktualisieren"
+  // dauerhaft deaktiviert, sobald man während Phase 2 in eine health-check-freie
+  // Ansicht (Client, Backups) wechselt.
+  state.loading = false;
   await loadProjects();
+  if (seq !== refreshSeq) return;
+  await loadClients(seq);
   if (seq !== refreshSeq) return;
 
   // Backups-Ansicht: eigener, health-check-freier Ladepfad.
@@ -165,6 +225,35 @@ async function refresh(): Promise<void> {
       if (seq !== refreshSeq) return;
       state.error = String(e);
     }
+    // Auch hier `renderControls()`: ohne Health-Check hat der Knopf keinen
+    // Spin-Zustand mehr abzubilden (siehe `state.loading` oben).
+    renderControls();
+    renderContent();
+    return;
+  }
+
+  // Datei-Client-Ansicht (Feature 16): eigener Ladepfad. Kein Phase-2-Health-
+  // Check – `claude mcp list` kennt diese Server nicht; Status kommt einzeln
+  // über den „prüfen"-Knopf.
+  const clientId = currentClientId();
+  if (clientId) {
+    try {
+      const servers = await listClientServers(clientId, state.reveal);
+      if (seq !== refreshSeq) return;
+      state.servers = servers;
+      pruneSelection();
+      // Konflikt-Erkennung ist scope-basiert und für Datei-Clients ohne Bedeutung.
+      state.conflicts = [];
+      state.lastRefresh = new Date();
+    } catch (e) {
+      if (seq !== refreshSeq) return;
+      // Keine Server aus der vorherigen Ansicht stehen lassen.
+      state.servers = [];
+      // Eine kaputte Konfigurationsdatei meldet bereits `config_error` – den
+      // identischen Text nicht zusätzlich als zweites Banner zeigen.
+      state.error = currentClient()?.config_error ? null : String(e);
+    }
+    renderControls();
     renderContent();
     return;
   }
@@ -241,7 +330,10 @@ function applyAutoRefresh(): void {
 
 async function recheck(server: MergedServer): Promise<void> {
   try {
-    const status = await healthCheck(server.name, server.project_path ?? undefined);
+    // Datei-Clients kennt die claude-CLI nicht – dort echter MCP-Handshake.
+    const status = server.client_id
+      ? await checkClientServer(server.client_id, server.name)
+      : await healthCheck(server.name, server.project_path ?? undefined);
     const target = state.servers.find((s) => s.name === server.name && s.scope === server.scope);
     if (target) target.status = status;
   } catch (e) {
@@ -276,16 +368,28 @@ function onSelectView(view: View): void {
 }
 
 function onEdit(server: MergedServer): void {
-  void openServerForm({ mode: "edit", server, onSaved: () => void refresh() });
+  // Bei Client-Servern den Client mitgeben (Label, Pfad, Fähigkeiten).
+  const client = server.client_id
+    ? state.clients.find((c) => c.id === server.client_id)
+    : undefined;
+  void openServerForm({ mode: "edit", server, client, onSaved: () => void refresh() });
 }
 
-function addContext(): { projectPath?: string; defaultScope: Scope } {
+function addContext(): { projectPath?: string; defaultScope?: Scope; client?: ClientInfo } {
+  if (state.view.kind === "client") return { client: currentClient() };
   return state.view.kind === "project"
     ? { projectPath: state.view.path, defaultScope: "local" }
     : { defaultScope: "user" };
 }
 
 function onAdd(): void {
+  // Zweite Schranke zum View-Reset in `loadClients`: ohne Client-Info wüsste das
+  // Formular nicht, wohin es speichert, und fiele still auf Claude Code zurück.
+  // Lieber gar nicht öffnen als am falschen Ort anlegen.
+  if (state.view.kind === "client" && !currentClient()) {
+    toast("Client nicht verfügbar – bitte aktualisieren.", "error");
+    return;
+  }
   openServerPicker(() => void refresh(), addContext());
 }
 
@@ -343,13 +447,23 @@ function onRemove(server: MergedServer): void {
       ),
     );
   }
+  const client = server.client_id
+    ? state.clients.find((c) => c.id === server.client_id)
+    : undefined;
+  const clientLabel = client?.label ?? server.origin;
   openConfirm({
     title: `Server entfernen: ${server.name}`,
-    message: `„${server.name}" (${server.origin}) wirklich entfernen? Die Definition wird über claude gelöscht.`,
+    message: server.client_id
+      ? `„${server.name}" wirklich aus ${clientLabel} entfernen? Direkter, gesicherter Edit von ${client?.config_path ?? "der Konfigurationsdatei"}; ${clientLabel} übernimmt es beim Neustart.`
+      : `„${server.name}" (${server.origin}) wirklich entfernen? Die Definition wird über claude gelöscht.`,
     extra,
     confirmLabel: "Entfernen",
     danger: true,
     onConfirm: async () => {
+      if (server.client_id) {
+        await removeClientServer(server.client_id, server.name);
+        return;
+      }
       if (!server.scope) throw new Error("Externer Server kann hier nicht entfernt werden.");
       await removeServer(server.name, server.scope, server.project_path ?? undefined);
     },
@@ -424,9 +538,11 @@ function onBulk(action: BulkAction, servers: MergedServer[]): void {
   const meta = BULK_META[action];
   const targetEnabled = action === "enable";
 
+  // Entfernen gilt auch für Server eines Datei-Clients; Aktivieren/Deaktivieren
+  // bleibt über `canToggle` auf die Claude-Code-Welt beschränkt.
   const actionable = (s: MergedServer): boolean =>
     action === "remove"
-      ? s.editable && s.scope !== null
+      ? s.editable && (s.scope !== null || s.client_id != null)
       : canToggle(s) && s.enabled !== targetEnabled;
 
   const planned = servers.filter(actionable);
@@ -455,7 +571,11 @@ function onBulk(action: BulkAction, servers: MergedServer[]): void {
     title: meta.title,
     message:
       action === "remove"
-        ? `${planned.length} Server werden über claude gelöscht. Zuvor wird automatisch ein Snapshot angelegt (über „Backups" wiederherstellbar).`
+        ? `${planned.length} Server werden ${
+            planned.every((s) => s.client_id != null)
+              ? "direkt aus der Client-Konfiguration"
+              : "über claude"
+          } gelöscht. Zuvor wird automatisch ein Snapshot angelegt (über „Backups" wiederherstellbar).`
         : `${planned.length} Server werden ${meta.gerund}.`,
     extra,
     confirmLabel: meta.confirmLabel,
@@ -482,8 +602,13 @@ function onBulk(action: BulkAction, servers: MergedServer[]): void {
         setStatus(`${i + 1}/${planned.length} … ${s.name}`);
         try {
           if (action === "remove") {
-            if (!s.scope) throw new Error("Externer Server kann nicht entfernt werden.");
-            await removeServer(s.name, s.scope, s.project_path ?? undefined, bulkSnapshot);
+            if (s.client_id) {
+              await removeClientServer(s.client_id, s.name, bulkSnapshot);
+            } else if (s.scope) {
+              await removeServer(s.name, s.scope, s.project_path ?? undefined, bulkSnapshot);
+            } else {
+              throw new Error("Externer Server kann nicht entfernt werden.");
+            }
           } else {
             await applyToggle(s, targetEnabled, bulkSnapshot);
           }
@@ -547,7 +672,7 @@ function onConflict(server: MergedServer): void {
 function renderSidebarEl(): void {
   clear(sidebarEl);
   sidebarEl.append(
-    renderSidebar(state.projects, state.view, state.home, {
+    renderSidebar(state.projects, state.clients, state.view, state.home, {
       onSelect: onSelectView,
       onDeleteProject,
     }),
@@ -583,14 +708,38 @@ function renderContent(): void {
     return;
   }
 
+  const client = currentClient();
   const heading =
     state.view.kind === "project"
       ? h("div", { class: "view-head" }, h("span", { class: "mono", text: state.view.path }))
-      : h("div", { class: "view-head" }, h("span", { text: "Globale & externe Server" }));
+      : state.view.kind === "client"
+        ? h(
+            "div",
+            { class: "view-head" },
+            h("span", { text: client?.label ?? "Weitere Clients" }),
+            h("span", { class: "mono", text: client?.config_path ?? "" }),
+          )
+        : h("div", { class: "view-head" }, h("span", { text: "Globale & externe Server" }));
   contentEl.append(heading);
+
+  if (state.view.kind === "client") {
+    contentEl.append(
+      h("p", {
+        class: "muted",
+        text: `${client?.label ?? "Der Client"} lädt die Konfiguration erst beim Neustart neu.`,
+      }),
+    );
+  }
 
   if (state.error) {
     contentEl.append(h("div", { class: "banner banner-error", text: state.error }));
+  }
+
+  // Kaputte Client-Konfiguration: Fehler statt Liste zeigen. Schreibaktionen
+  // sind in diesem Zustand ohnehin gesperrt (das Backend verweigert sie).
+  if (client?.config_error) {
+    contentEl.append(h("div", { class: "banner banner-error", text: client.config_error }));
+    return;
   }
 
   // Konflikt-Banner: bei ≥1 Namenskonflikt dezent oberhalb der Liste.
@@ -621,6 +770,8 @@ function renderContent(): void {
             // Projekt-Kontext durchreichen – der Scope-Wechsel braucht ihn als
             // Zielprojekt.
             projectPath: currentProjectPath(),
+            // Erkannte Datei-Clients für „Kopieren nach…" und den Pfad-Hinweis.
+            clients: state.clients,
             onChanged: () => void refresh(),
             activeLogSession:
               state.logSession && state.logSession.key === selectionKey(s)

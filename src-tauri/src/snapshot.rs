@@ -43,6 +43,15 @@ pub struct SnapshotManifest {
     pub auto: bool,
     /// Gesicherte Dateien.
     pub files: Vec<SnapshotFile>,
+    /// Wurde beim Erstellen für **jede** Datei erhoben, ob ihr Pfad selbst ein
+    /// Symlink war? Manifeste aus der Zeit vor [`SnapshotFile::link_target`]
+    /// kennen das Feld nicht (`serde(default)` ⇒ `false`); dort bedeutet
+    /// `link_target: None` „nicht aufgezeichnet“ und gerade **nicht** „war
+    /// nachweislich kein Symlink“. Nur mit dieser Unterscheidung kann
+    /// [`restore_write_target`] einen untergeschobenen Link erkennen, ohne jeden
+    /// älteren Snapshot unbrauchbar zu machen.
+    #[serde(default)]
+    pub link_targets_recorded: bool,
     /// Manifest fehlte/war unlesbar (nur beim Auflisten gesetzt) – dann ist nur
     /// noch Löschen sinnvoll.
     #[serde(default)]
@@ -65,6 +74,14 @@ pub struct SnapshotFile {
     /// inzwischen gelöschten Projekts nicht wieder auferstehen lassen).
     #[serde(default)]
     pub create_parent: bool,
+    /// Kanonisches Ziel, falls `original_path` beim Sichern **selbst** ein
+    /// Symlink war (Dotfiles-Setup). Nur dann darf der Restore demselben Link
+    /// wieder folgen — siehe [`restore_write_target`]. `None` heißt allerdings
+    /// nur dann nachweislich „war kein Symlink“, wenn das Manifest
+    /// [`SnapshotManifest::link_targets_recorded`] gesetzt hat; sonst ist der
+    /// Zustand von damals schlicht unbekannt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_target: Option<String>,
 }
 
 /// Wurzelverzeichnis aller Snapshots (nutzer-privat, neben Stash/Settings).
@@ -128,7 +145,9 @@ fn create_private_dir(path: &Path) -> Result<(), AppError> {
 /// Alle Quellpfade, die ein Snapshot sichert, je mit `create_parent`-Flag:
 /// globale Dateien (Flag `true` – Zielverzeichnis beim Restore neu anlegen) +
 /// pro bekanntem Projekt dessen `.mcp.json` und `.claude/settings.local.json`
-/// (Flag `false` – gelöschte Projekte nicht wieder auferstehen lassen).
+/// (Flag `false` – gelöschte Projekte nicht wieder auferstehen lassen) +
+/// die Konfiguration jedes **erkannten** Datei-Clients (ebenfalls Flag `false`,
+/// siehe `client_source_paths`).
 /// Doppelte Pfade (z. B. Home-Projekt == globale settings.local.json) werden
 /// entfernt; das globale Flag `true` gewinnt dabei.
 fn collect_source_paths() -> Vec<(PathBuf, bool)> {
@@ -148,11 +167,23 @@ fn collect_source_paths() -> Vec<(PathBuf, bool)> {
             }
         }
     }
+    // Konfiguration erkannter Datei-Clients (Feature 16).
+    v.extend(client_source_paths());
     // Nach Pfad sortieren; bei Duplikaten den Eintrag mit create_parent=true
     // (globale Datei) bevorzugen.
     v.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
     v.dedup_by(|a, b| a.0 == b.0);
     v
+}
+
+/// Config-Dateien aller **erkannten** Datei-Clients (Feature 16), je mit
+/// `create_parent = false`: auf einem Rechner ohne den jeweiligen Client darf ein
+/// Restore dessen Verzeichnis nicht wieder auferstehen lassen.
+fn client_source_paths() -> Vec<(PathBuf, bool)> {
+    crate::clients::adapters()
+        .into_iter()
+        .filter_map(|a| a.detect().map(|p| (p, false)))
+        .collect()
 }
 
 /// Erstellt einen Snapshot der aktuellen Konfiguration.
@@ -198,6 +229,14 @@ fn create_in(
         let base = src.file_name().and_then(|f| f.to_str()).unwrap_or("datei");
         let stored = format!("{i:03}-{base}");
         let mut size = 0u64;
+        // Ist der Quellpfad selbst ein Symlink, gesichert wird der Inhalt
+        // DAHINTER (`std::fs::read` folgt dem Link). Genau dieses Ziel wird
+        // festgehalten, damit der Restore weiß, wohin er zurückschreiben darf.
+        let link_target = if existed {
+            canonical_link_target(src)
+        } else {
+            None
+        };
         if existed {
             let bytes = std::fs::read(src).map_err(|e| AppError::Io(e.to_string()))?;
             size = bytes.len() as u64;
@@ -209,6 +248,7 @@ fn create_in(
             existed,
             size,
             create_parent: *create_parent,
+            link_target,
         });
     }
 
@@ -218,6 +258,9 @@ fn create_in(
         note,
         auto,
         files,
+        // Ab hier wird `link_target` für jede Datei erhoben – dieses Manifest
+        // darf also als Beweis gelesen werden (siehe `restore_write_target`).
+        link_targets_recorded: true,
         corrupt: false,
     };
     let text =
@@ -226,6 +269,87 @@ fn create_in(
 
     enforce_retention(root, retention);
     Ok(manifest)
+}
+
+/// Kanonisches Ziel von `src`, **falls** `src` selbst ein Symlink ist; sonst
+/// `None`. Ein toter oder nicht auflösbarer Link liefert ebenfalls `None` — dann
+/// gilt er als „nicht über einen Link gesichert“ und der Restore folgt ihm nicht.
+fn canonical_link_target(src: &Path) -> Option<String> {
+    let meta = std::fs::symlink_metadata(src).ok()?;
+    if !meta.file_type().is_symlink() {
+        return None;
+    }
+    std::fs::canonicalize(src)
+        .ok()
+        .map(|p| p.to_string_lossy().to_string())
+}
+
+/// Der einzige Ausweg aus einem Symlink-bedingten Abbruch – gehört an jede
+/// dieser Meldungen, sonst steht der Nutzer vor einer Sackgasse.
+const ABWAEHLEN: &str = "Diese Datei in der Auswahl abwählen, um die übrigen wiederherzustellen.";
+
+/// Wohin ein Restore die gesicherten Bytes schreiben darf. `Ok(None)` bedeutet
+/// „diese eine Datei überspringen“ (siehe unten), nicht „Restore abbrechen“.
+///
+/// Grundregel: einem Symlink wird **nur** gefolgt, wenn schon der Snapshot über
+/// genau diesen Link gesichert hat. Andernfalls schriebe der Restore rohe Bytes
+/// in eine Datei, die er nie gelesen hat (z. B. ein untergeschobener Link auf
+/// `~/.ssh/authorized_keys`); die stumme Alternative — den Link durch eine
+/// reguläre Datei zu ersetzen — hängte ein Dotfiles-Repo ab. Beides ist es wert,
+/// den Restore stattdessen mit einer klaren Meldung abzubrechen.
+///
+/// Ob „kein `link_target` aufgezeichnet“ tatsächlich „war kein Symlink“ heißt,
+/// weiß allein das Manifest ([`SnapshotManifest::link_targets_recorded`]):
+/// * **Neues Manifest** (Feld erhoben): `None` ist ein Beweis. Liegt heute
+///   trotzdem ein Link am Pfad, ist er nachträglich entstanden — genau der
+///   Angriffsfall oben, also harter Abbruch des gesamten Restores.
+/// * **Altmanifest** (Feld nie geschrieben): `None` ist keine Aussage. Ein
+///   Abbruch machte hier jeden vor diesem Feld angelegten Snapshot unbrauchbar,
+///   sobald der Nutzer sein Dotfiles-Setup einrichtet — und zwar komplett, weil
+///   der Fehler aus der Vorbereitungsphase kommt. Deshalb wird nur **diese eine
+///   Datei** ausgelassen und gemeldet; alle übrigen werden normal
+///   wiederhergestellt. Blind dem Link zu folgen scheidet aus: dann schriebe
+///   der Restore doch wieder in eine nie gelesene Datei.
+fn restore_write_target(
+    manifest: &SnapshotManifest,
+    file: &SnapshotFile,
+) -> Result<Option<PathBuf>, AppError> {
+    let original = PathBuf::from(&file.original_path);
+    let is_link = std::fs::symlink_metadata(&original)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    if !is_link {
+        // Am sichtbaren Ort liegt kein Link (oder gar nichts) ⇒ dorthin
+        // zurückschreiben. Auch wenn beim Sichern ein Link im Spiel war: was
+        // der Nutzer heute sieht, ist eine reguläre Datei.
+        return Ok(Some(original));
+    }
+    let Some(recorded) = &file.link_target else {
+        if !manifest.link_targets_recorded {
+            return Ok(None);
+        }
+        return Err(AppError::Io(format!(
+            "{} ist heute ein Symlink, war es beim Sichern aber nicht – \
+             Restore abgebrochen, um weder den Link noch sein Ziel zu überschreiben. \
+             {ABWAEHLEN}",
+            file.original_path
+        )));
+    };
+    let current = std::fs::canonicalize(&original).map_err(|e| {
+        AppError::Io(format!(
+            "{} ist ein Symlink, dessen Ziel nicht auflösbar ist ({e}) – \
+             Restore abgebrochen. {ABWAEHLEN}",
+            file.original_path
+        ))
+    })?;
+    if current.as_path() != Path::new(recorded) {
+        return Err(AppError::Io(format!(
+            "{} zeigt inzwischen auf ein anderes Ziel als beim Sichern – \
+             Restore abgebrochen. {ABWAEHLEN}",
+            file.original_path
+        )));
+    }
+    Ok(Some(current))
 }
 
 /// Listet alle Snapshots, neueste zuerst.
@@ -273,6 +397,8 @@ fn list_in(root: &Path) -> Result<Vec<SnapshotManifest>, AppError> {
                 note: Some("(beschädigt)".into()),
                 auto: false,
                 files: Vec::new(),
+                // Ohne Dateien belanglos; `false` ist der konservative Wert.
+                link_targets_recorded: false,
                 corrupt: true,
             }),
         }
@@ -288,7 +414,16 @@ fn list_in(root: &Path) -> Result<Vec<SnapshotManifest>, AppError> {
 /// Stellt einen Snapshot wieder her. Legt vorher selbst einen Auto-Snapshot des
 /// Ist-Zustands an ("auto: vor Restore"), damit der Restore umkehrbar ist.
 /// `only_paths` (Originalpfade) beschränkt auf einen Teil der Dateien.
-pub fn restore(id: &str, only_paths: Option<Vec<String>>, retention: u32) -> Result<(), AppError> {
+///
+/// Liefert die Originalpfade, die übersprungen werden mussten (siehe
+/// [`restore_write_target`]) – eine leere Liste heißt „vollständig
+/// wiederhergestellt“. Der Aufrufer muss sie dem Nutzer zeigen, sonst wirkt ein
+/// Teil-Restore wie ein vollständiger.
+pub fn restore(
+    id: &str,
+    only_paths: Option<Vec<String>>,
+    retention: u32,
+) -> Result<Vec<String>, AppError> {
     restore_in(&snapshots_root(), id, only_paths, retention)
 }
 
@@ -297,7 +432,7 @@ fn restore_in(
     id: &str,
     only_paths: Option<Vec<String>>,
     retention: u32,
-) -> Result<(), AppError> {
+) -> Result<Vec<String>, AppError> {
     let snap_dir = snapshot_dir(root, id)?;
     let manifest = read_manifest(&snap_dir)?;
 
@@ -315,6 +450,9 @@ fn restore_in(
     // Beim create_parent-Restore neu angelegte Verzeichnisse, um sie bei einem
     // Abbruch der Vorbereitungsphase wieder zu entfernen (Ausgangszustand).
     let mut created_dirs: Vec<PathBuf> = Vec::new();
+    // Übersprungene Originalpfade (Altmanifest + heute Symlink) für die Meldung
+    // an den Nutzer.
+    let mut skipped: Vec<String> = Vec::new();
 
     let cleanup = |temps: &[(PathBuf, PathBuf)], dirs: &[PathBuf]| {
         for (tmp, _) in temps {
@@ -333,47 +471,78 @@ fn restore_in(
                 continue;
             }
         }
-        let target = PathBuf::from(&file.original_path);
+        // Ziel bestimmen. Schreiben und Löschen haben hier BEWUSST verschiedene
+        // Semantik (siehe `restore_write_target`):
+        //  * schreiben – einem Symlink wird nur gefolgt, wenn schon der Snapshot
+        //    über genau diesen Link gesichert hat; sonst Abbruch (bzw. bei
+        //    einem Altmanifest ohne Linkaufzeichnung: nur diese Datei
+        //    überspringen).
+        //  * löschen – immer der UNaufgelöste Pfad (siehe unten).
+        // Wichtig: Temp-Datei und Rename müssen im Elternverzeichnis des
+        // tatsächlichen Ziels liegen, sonst scheitert der Rename über eine
+        // Dateisystemgrenze hinweg.
+        if !file.existed {
+            // Existierte beim Snapshot nicht ⇒ am **sichtbaren** Ort entfernen.
+            // Der unaufgelöste Pfad ist hier richtig: „war nicht da" bezieht sich
+            // auf das, was der Nutzer sieht. Ein Symlink verschwindet damit als
+            // Link; sein Ziel (etwa die versionierte Datei im Dotfiles-Repo)
+            // bleibt unangetastet. `symlink_metadata` statt `exists()`, damit
+            // auch ein toter Link erkannt und mitentfernt wird.
+            let original = PathBuf::from(&file.original_path);
+            if std::fs::symlink_metadata(&original).is_ok() {
+                to_remove.push(original);
+            }
+            continue;
+        }
+        let target = match restore_write_target(&manifest, file) {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                // Altmanifest ohne Linkaufzeichnung, heute liegt dort ein
+                // Symlink: nur diese Datei auslassen (siehe
+                // `restore_write_target`) und am Ende melden.
+                skipped.push(file.original_path.clone());
+                continue;
+            }
+            Err(e) => {
+                cleanup(&to_rename, &created_dirs);
+                return Err(e);
+            }
+        };
         let Some(parent) = target.parent() else {
             continue;
         };
 
-        if file.existed {
-            // Fehlendes Zielverzeichnis: für globale Config neu anlegen, für
-            // Projektdateien (gelöschtes Projekt) überspringen.
-            if !parent.is_dir() {
-                if file.create_parent {
-                    if let Err(e) = create_private_dir(parent) {
-                        cleanup(&to_rename, &created_dirs);
-                        return Err(e);
-                    }
-                    created_dirs.push(parent.to_path_buf());
-                } else {
-                    continue;
-                }
-            }
-            let bytes = match std::fs::read(snap_dir.join(&file.stored)) {
-                Ok(b) => b,
-                Err(e) => {
-                    cleanup(&to_rename, &created_dirs);
-                    return Err(AppError::Io(e.to_string()));
-                }
-            };
-            // Temp-Datei mit unvorhersagbarem Namen, exklusiv angelegt und ohne
-            // Symlinks zu folgen: das Zielverzeichnis (z. B. ein Projektordner)
-            // ist nicht zwingend nutzer-privat.
-            let tmp = match write_private_temp(parent, &bytes) {
-                Ok(p) => p,
-                Err(e) => {
+        // Fehlendes Zielverzeichnis: für globale Config neu anlegen, für
+        // Projektdateien (gelöschtes Projekt) überspringen.
+        if !parent.is_dir() {
+            if file.create_parent {
+                if let Err(e) = create_private_dir(parent) {
                     cleanup(&to_rename, &created_dirs);
                     return Err(e);
                 }
-            };
-            to_rename.push((tmp, target));
-        } else if target.exists() && parent.is_dir() {
-            // Existierte beim Snapshot nicht -> beim Restore entfernen.
-            to_remove.push(target);
+                created_dirs.push(parent.to_path_buf());
+            } else {
+                continue;
+            }
         }
+        let bytes = match std::fs::read(snap_dir.join(&file.stored)) {
+            Ok(b) => b,
+            Err(e) => {
+                cleanup(&to_rename, &created_dirs);
+                return Err(AppError::Io(e.to_string()));
+            }
+        };
+        // Temp-Datei mit unvorhersagbarem Namen, exklusiv angelegt und ohne
+        // Symlinks zu folgen: das Zielverzeichnis (z. B. ein Projektordner)
+        // ist nicht zwingend nutzer-privat.
+        let tmp = match write_private_temp(parent, &bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                cleanup(&to_rename, &created_dirs);
+                return Err(e);
+            }
+        };
+        to_rename.push((tmp, target));
     }
 
     // Jetzt – nachdem der Ziel-Snapshot komplett gelesen ist – den Ist-Zustand
@@ -403,7 +572,7 @@ fn restore_in(
     for target in &to_remove {
         std::fs::remove_file(target).map_err(|e| AppError::Io(e.to_string()))?;
     }
-    Ok(())
+    Ok(skipped)
 }
 
 /// Löscht einen Snapshot samt Verzeichnis.
@@ -558,6 +727,271 @@ mod tests {
         write(&missing, "neu");
         restore_in(&root, &m.id, None, 20).unwrap();
         assert!(!missing.exists());
+    }
+
+    /// Ist das Ziel ein Symlink (Config ins Dotfiles-Repo verlinkt), muss der
+    /// Restore dem Link folgen statt ihn durch eine reguläre Datei zu ersetzen –
+    /// gleiche Semantik wie beim Schreiben der Client-Konfiguration.
+    #[cfg(unix)]
+    #[test]
+    fn restore_folgt_symlink_statt_ihn_zu_ersetzen() {
+        use std::os::unix::fs::symlink;
+        let base = tmp("restore-symlink");
+        let root = base.join("snapshots");
+        // Echtes Ziel liegt in einem anderen Verzeichnis („Dotfiles-Repo").
+        let repo = base.join("dotfiles");
+        std::fs::create_dir_all(&repo).unwrap();
+        let real = repo.join("claude_desktop_config.json");
+        write(&real, "ALT");
+
+        let cfg_dir = base.join("config");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let link = cfg_dir.join("claude_desktop_config.json");
+        symlink(&real, &link).unwrap();
+
+        let m = create_in(&root, &[(link.clone(), false)], None, false, 20).unwrap();
+        write(&real, "NEU");
+        restore_in(&root, &m.id, None, 20).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "der Symlink muss ein Symlink bleiben"
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "ALT");
+    }
+
+    /// Gegenprobe zum Test darüber: existierte am Pfad beim Sichern NICHTS
+    /// (`existed == false`), entfernt der Restore den **Link**, nicht die Datei
+    /// dahinter. Andernfalls löschte ein Restore aus der Zeit vor Claude Desktop
+    /// die versionierte Datei im Dotfiles-Repo.
+    #[cfg(unix)]
+    #[test]
+    fn restore_entfernt_den_symlink_nicht_sein_ziel() {
+        use std::os::unix::fs::symlink;
+        let base = tmp("restore-symlink-delete");
+        let root = base.join("snapshots");
+        let cfg_dir = base.join("config");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let link = cfg_dir.join("claude_desktop_config.json");
+
+        // Snapshot, solange am Pfad noch gar nichts liegt.
+        let m = create_in(&root, &[(link.clone(), false)], None, false, 20).unwrap();
+        assert!(!m.files[0].existed);
+
+        // Danach richtet der Nutzer sein Dotfiles-Setup ein.
+        let repo = base.join("dotfiles");
+        std::fs::create_dir_all(&repo).unwrap();
+        let real = repo.join("claude_desktop_config.json");
+        write(&real, "VERSIONIERT");
+        symlink(&real, &link).unwrap();
+
+        restore_in(&root, &m.id, None, 20).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link).is_err(),
+            "der Link muss verschwinden"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            "VERSIONIERT",
+            "das Ziel hinter dem Link darf nicht angefasst werden"
+        );
+    }
+
+    /// Auch ein **toter** Link wird entfernt – sonst bliebe er stehen und der
+    /// nächste Schreibvorgang ersetzte ihn durch eine reguläre Datei.
+    #[cfg(unix)]
+    #[test]
+    fn restore_entfernt_auch_einen_toten_symlink() {
+        use std::os::unix::fs::symlink;
+        let base = tmp("restore-symlink-dead");
+        let root = base.join("snapshots");
+        let cfg_dir = base.join("config");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let link = cfg_dir.join("claude_desktop_config.json");
+
+        let m = create_in(&root, &[(link.clone(), false)], None, false, 20).unwrap();
+        symlink(base.join("gibt-es-nicht"), &link).unwrap();
+
+        restore_in(&root, &m.id, None, 20).unwrap();
+        assert!(std::fs::symlink_metadata(&link).is_err());
+    }
+
+    /// Beim Sichern eine reguläre Datei, beim Restore ein Symlink: der Restore
+    /// bricht ab, statt entweder den Link zu ersetzen oder blind in eine nie
+    /// gelesene Datei zu schreiben. Gegenprobe zum Altmanifest-Test weiter
+    /// unten: hier ist `link_target: None` ein **Beweis**, weil das Manifest
+    /// `link_targets_recorded` gesetzt hat.
+    #[cfg(unix)]
+    #[test]
+    fn restore_bricht_ab_wenn_der_pfad_neuerdings_ein_symlink_ist() {
+        use std::os::unix::fs::symlink;
+        let base = tmp("restore-symlink-neu");
+        let root = base.join("snapshots");
+        let cfg = base.join("config/claude_desktop_config.json");
+        write(&cfg, "ALT");
+
+        let m = create_in(&root, &[(cfg.clone(), false)], None, false, 20).unwrap();
+        assert!(m.files[0].link_target.is_none());
+        assert!(m.link_targets_recorded, "neues Manifest erhebt das Feld");
+
+        // Der Pfad wird nachträglich zu einem Link auf eine fremde Datei.
+        let fremd = base.join("fremd.txt");
+        write(&fremd, "FREMD");
+        std::fs::remove_file(&cfg).unwrap();
+        symlink(&fremd, &cfg).unwrap();
+
+        assert!(restore_in(&root, &m.id, None, 20).is_err());
+        assert_eq!(std::fs::read_to_string(&fremd).unwrap(), "FREMD");
+        assert!(std::fs::symlink_metadata(&cfg)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(leftover_temps(base.join("config").as_path()).is_empty());
+    }
+
+    /// Beim Sichern über Link A, beim Restore zeigt derselbe Pfad auf B: Abbruch.
+    #[cfg(unix)]
+    #[test]
+    fn restore_bricht_ab_wenn_der_symlink_umgehaengt_wurde() {
+        use std::os::unix::fs::symlink;
+        let base = tmp("restore-symlink-umgehaengt");
+        let root = base.join("snapshots");
+        let a = base.join("a.txt");
+        let b = base.join("b.txt");
+        write(&a, "A");
+        write(&b, "B");
+        let cfg_dir = base.join("config");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let link = cfg_dir.join("claude_desktop_config.json");
+        symlink(&a, &link).unwrap();
+
+        let m = create_in(&root, &[(link.clone(), false)], None, false, 20).unwrap();
+        assert!(m.files[0].link_target.is_some());
+
+        std::fs::remove_file(&link).unwrap();
+        symlink(&b, &link).unwrap();
+
+        assert!(restore_in(&root, &m.id, None, 20).is_err());
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "B");
+    }
+
+    /// Beim Sichern ein Symlink, beim Restore eine reguläre Datei: geschrieben
+    /// wird an den **sichtbaren** Ort. Das ist bewusst so (siehe
+    /// `restore_write_target`) – der Nutzer hat sein Dotfiles-Setup aufgelöst,
+    /// also gehört die Datei dorthin und nicht mehr ins alte Repo.
+    #[cfg(unix)]
+    #[test]
+    fn restore_schreibt_an_den_sichtbaren_ort_wenn_der_symlink_verschwunden_ist() {
+        use std::os::unix::fs::symlink;
+        let base = tmp("restore-symlink-aufgeloest");
+        let root = base.join("snapshots");
+        let repo = base.join("dotfiles");
+        std::fs::create_dir_all(&repo).unwrap();
+        let real = repo.join("claude_desktop_config.json");
+        write(&real, "ALT");
+
+        let cfg_dir = base.join("config");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let link = cfg_dir.join("claude_desktop_config.json");
+        symlink(&real, &link).unwrap();
+
+        let m = create_in(&root, &[(link.clone(), false)], None, false, 20).unwrap();
+        assert!(m.files[0].link_target.is_some());
+
+        // Der Nutzer löst das Dotfiles-Setup auf: aus dem Link wird eine
+        // eigenständige Datei, das Repo lebt unabhängig weiter.
+        std::fs::remove_file(&link).unwrap();
+        write(&link, "NEU");
+        write(&real, "REPO");
+
+        assert!(restore_in(&root, &m.id, None, 20).unwrap().is_empty());
+        assert!(
+            !std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "es darf kein Link entstehen"
+        );
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "ALT");
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            "REPO",
+            "das ehemalige Linkziel bleibt unangetastet"
+        );
+    }
+
+    /// Altmanifest (geschrieben, bevor es `link_targets_recorded` gab): ein
+    /// fehlendes `link_target` heißt dort „nicht aufgezeichnet“, nicht „war kein
+    /// Symlink“. Richtet der Nutzer danach sein Dotfiles-Setup ein, darf das
+    /// nicht den **ganzen** Restore kippen – nur die betroffene Datei wird
+    /// ausgelassen und gemeldet.
+    #[cfg(unix)]
+    #[test]
+    fn altmanifest_ueberspringt_nur_die_symlink_datei() {
+        use std::os::unix::fs::symlink;
+        let base = tmp("restore-altmanifest");
+        let root = base.join("snapshots");
+        let cfg_dir = base.join("config");
+        let a = cfg_dir.join("a.json");
+        let b = cfg_dir.join("b.json");
+        write(&a, "A-ALT");
+        write(&b, "B-ALT");
+
+        let m = create_in(
+            &root,
+            &[(a.clone(), false), (b.clone(), false)],
+            None,
+            false,
+            20,
+        )
+        .unwrap();
+
+        // Manifest auf den Stand von vor diesem Feld zurückdrehen.
+        let mp = root.join(&m.id).join("manifest.json");
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&mp).unwrap()).unwrap();
+        assert!(
+            doc.as_object_mut()
+                .unwrap()
+                .remove("link_targets_recorded")
+                .is_some(),
+            "das Feld muss überhaupt geschrieben worden sein"
+        );
+        std::fs::write(&mp, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+
+        // Erst danach richtet der Nutzer sein Dotfiles-Setup für `a` ein.
+        let repo = base.join("dotfiles");
+        std::fs::create_dir_all(&repo).unwrap();
+        let real = repo.join("a.json");
+        write(&real, "REPO");
+        std::fs::remove_file(&a).unwrap();
+        symlink(&real, &a).unwrap();
+        write(&b, "B-NEU");
+
+        let skipped = restore_in(&root, &m.id, None, 20).unwrap();
+        assert_eq!(skipped, vec![a.to_string_lossy().to_string()]);
+        assert!(
+            std::fs::symlink_metadata(&a)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "der Link bleibt ein Link"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            "REPO",
+            "das Ziel hinter dem Link darf nicht überschrieben werden"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&b).unwrap(),
+            "B-ALT",
+            "alle übrigen Dateien werden normal wiederhergestellt"
+        );
+        assert!(leftover_temps(&cfg_dir).is_empty());
     }
 
     #[test]
@@ -891,5 +1325,28 @@ mod tests {
             0o600,
             "Kopie 0600"
         );
+    }
+
+    /// Reale Umgebung: ist Claude Desktop installiert, muss dessen Config im
+    /// Snapshot-Umfang stehen – mit `create_parent == false`, damit ein Restore
+    /// kein Client-Verzeichnis neu entstehen lässt. `cargo test -- --ignored`.
+    /// (Ein nicht-ignorierter Zwilling dieses Tests wäre ohne installierten
+    /// Client eine leere Schleife und sicherte deshalb nichts zu.)
+    #[test]
+    #[ignore]
+    fn real_env_collect_source_paths_enthaelt_client_config() {
+        let clients = client_source_paths();
+        if clients.is_empty() {
+            eprintln!("kein Datei-Client erkannt – Test übersprungen");
+            return;
+        }
+        let all = collect_source_paths();
+        for (path, _) in clients {
+            let found = all.iter().find(|(p, _)| *p == path);
+            let (_, create_parent) = found.unwrap_or_else(|| {
+                panic!("{} fehlt im Snapshot-Umfang", path.display());
+            });
+            assert!(!create_parent, "{}: create_parent=false", path.display());
+        }
     }
 }
