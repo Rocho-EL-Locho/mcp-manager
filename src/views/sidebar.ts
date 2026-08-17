@@ -1,11 +1,13 @@
 import { h } from "../dom";
 import { icon } from "../icons";
-import type { ProjectInfo } from "../ipc";
+import type { ClientInfo, ProjectInfo } from "../ipc";
 
 export type View =
   | { kind: "global" }
   | { kind: "project"; path: string }
-  | { kind: "backups" };
+  | { kind: "backups" }
+  /// Ein erkannter Datei-Client (Feature 16), z. B. Claude Desktop.
+  | { kind: "client"; id: string };
 
 export interface SidebarHandlers {
   onSelect: (view: View) => void;
@@ -25,12 +27,14 @@ function shortPath(path: string, home: string): string {
 function isActive(view: View, item: View): boolean {
   if (view.kind !== item.kind) return false;
   if (view.kind === "project" && item.kind === "project") return view.path === item.path;
+  if (view.kind === "client" && item.kind === "client") return view.id === item.id;
   // global / backups: Gleichheit der Art genügt.
   return true;
 }
 
 export function renderSidebar(
   projects: ProjectInfo[],
+  clients: ClientInfo[],
   view: View,
   home: string,
   handlers: SidebarHandlers,
@@ -104,6 +108,36 @@ export function renderSidebar(
 
   if (projects.length === 0) {
     root.append(h("div", { class: "muted side-empty", text: "Keine Projekte" }));
+  }
+
+  // Weitere (dateibasierte) MCP-Clients. Nicht erkannte Clients erscheinen gar
+  // nicht – kein Grab leerer Einträge.
+  if (clients.length > 0) {
+    root.append(h("div", { class: "side-header", text: "Weitere Clients" }));
+    for (const c of clients) {
+      const itemView: View = { kind: "client", id: c.id };
+      const label = h("span", { class: "side-label", text: c.label });
+      label.title = c.config_path;
+      root.append(
+        h(
+          "button",
+          {
+            class: `side-item ${isActive(view, itemView) ? "side-active" : ""}`,
+            onclick: () => handlers.onSelect(itemView),
+          },
+          icon("monitor"),
+          label,
+          h(
+            "span",
+            { class: "side-meta" },
+            c.server_count > 0
+              ? h("span", { class: "side-count", text: String(c.server_count) })
+              : null,
+            c.config_error ? icon("alert", "side-missing", c.config_error) : null,
+          ),
+        ),
+      );
+    }
   }
   return root;
 }

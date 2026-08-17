@@ -1,7 +1,16 @@
 import { h, clear, svgEl } from "../dom";
 import { icon, setIcon } from "../icons";
-import type { MergedServer, ServerEntry, Scope, Introspection, ServerStatus, RuntimePreflight, ProjectInfo, MetricPoint } from "../ipc";
-import { revealServerEntry, setScope, cloneServer, listProjects, introspectServer, peekIntrospection, healthCheck, preflightServer, getMetrics } from "../ipc";
+import type { MergedServer, ServerEntry, Scope, Introspection, ServerStatus, RuntimePreflight, ProjectInfo, MetricPoint, ClientInfo, CopyEndpoint } from "../ipc";
+import { revealServerEntry, setScope, listProjects, introspectServer, peekIntrospection, healthCheck, preflightServer, getMetrics } from "../ipc";
+import {
+  revealClientEntry,
+  checkClientServer,
+  introspectClientServer,
+  peekClientIntrospection,
+  preflightClientServer,
+  copyServerTo,
+} from "../ipc";
+import { transportOfEntry } from "../transport";
 import { openModal } from "../modal";
 import { openConfirm } from "../confirm";
 import { toast } from "../toast";
@@ -11,6 +20,29 @@ import { openToolPlayground, openResourcePlayground, openPromptPlayground } from
 import { createLogView } from "./logView";
 
 const ALL_SCOPES: Scope[] = ["user", "local", "project"];
+
+const SCOPE_LABELS: Record<Scope, string> = {
+  user: "Claude Code – user (global)",
+  local: "Claude Code – local (projekt-privat)",
+  project: "Claude Code – project (.mcp.json)",
+};
+
+/// Herkunft eines Servers als getaggte Union. Löst die Invariante „ohne
+/// `client_id` ist `scope` gesetzt" **einmal** auf, statt sie an jeder
+/// Aufrufstelle per `as Scope` zu behaupten.
+/// `null` = extern verwaltet (claude.ai-Connector / Plugin): weder lokale
+/// Definition noch Aktionen.
+type ServerOrigin =
+  | { kind: "client"; id: string }
+  | { kind: "scope"; scope: Scope; projectPath?: string };
+
+function originOf(server: MergedServer): ServerOrigin | null {
+  if (server.client_id) return { kind: "client", id: server.client_id };
+  if (server.scope) {
+    return { kind: "scope", scope: server.scope, projectPath: server.project_path ?? undefined };
+  }
+  return null;
+}
 
 function row(label: string, value: Node | string): HTMLElement {
   return h(
@@ -106,9 +138,10 @@ function playgroundBtn(label: string, onClick: () => void): HTMLElement {
 /// vorhanden) werden in beiden Fällen angehängt.
 function renderIntrospection(intro: Introspection, server: MergedServer): HTMLElement {
   const wrap = h("div", { class: "caps" });
-  // Playground-Aktionen nur für aktivierte Server (kein heimlicher Start eines
-  // deaktivierten Servers).
-  const canRun = server.enabled;
+  // Playground-Aktionen nur für aktivierte Claude-Code-Server: der Playground
+  // löst die Definition über Scope + Projekt auf und kennt Datei-Clients nicht –
+  // sonst erschienen tote „Testen…"-Knöpfe.
+  const canRun = server.enabled && server.scope != null;
 
   if (intro.error) {
     wrap.append(h("p", { class: "form-status error", text: intro.error }));
@@ -234,13 +267,19 @@ function renderPreflight(pf: RuntimePreflight): HTMLElement {
 /// (node/npx, python/uvx, docker, …) auf PATH verfügbar ist. Billig – startet
 /// den Server nicht (Version nur für bekannte Laufzeiten via `--version`).
 function runtimeSection(server: MergedServer): HTMLElement | null {
-  // Nur für Server mit lokalem Befehl (stdio) und bekanntem Scope sinnvoll.
-  if (!server.entry?.command || !server.scope) return null;
-  const scope = server.scope;
+  // Nur für Server mit lokalem Befehl (stdio) und bekannter Herkunft sinnvoll
+  // (Claude-Code-Scope oder Datei-Client).
+  const origin = originOf(server);
+  if (!server.entry?.command || !origin) return null;
 
   const content = h("div", { class: "caps-content" }, h("p", { class: "muted", text: "Wird geprüft…" }));
 
-  void preflightServer(server.name, scope, server.project_path ?? undefined)
+  const request =
+    origin.kind === "client"
+      ? preflightClientServer(origin.id, server.name)
+      : preflightServer(server.name, origin.scope, origin.projectPath);
+
+  void request
     .then((pf) => {
       // Modal inzwischen geschlossen? Dann nichts mehr rendern.
       if (!content.isConnected) return;
@@ -355,9 +394,9 @@ function logsSection(
 }
 
 function capabilitiesSection(server: MergedServer, opts: DetailOptions): HTMLElement | null {
-  // Nur für Server mit lokaler Definition (Scope bekannt) sinnvoll.
-  if (!server.entry || !server.scope) return null;
-  const scope = server.scope;
+  // Nur für Server mit lokaler Definition (Claude-Code-Scope oder Datei-Client).
+  const origin = originOf(server);
+  if (!server.entry || !origin) return null;
 
   const content = h("div", { class: "caps-content" }, h("p", { class: "muted", text: "Noch nicht geladen." }));
 
@@ -390,7 +429,11 @@ function capabilitiesSection(server: MergedServer, opts: DetailOptions): HTMLEle
     clear(content);
     content.append(h("p", { class: "muted", text: "Server wird gestartet und abgefragt…" }));
     try {
-      showResult(await introspectServer(server.name, scope, server.project_path ?? undefined, refresh));
+      showResult(
+        origin.kind === "client"
+          ? await introspectClientServer(origin.id, server.name, refresh)
+          : await introspectServer(server.name, origin.scope, origin.projectPath, refresh),
+      );
     } catch (e) {
       clear(content);
       content.append(
@@ -406,7 +449,11 @@ function capabilitiesSection(server: MergedServer, opts: DetailOptions): HTMLEle
   loadBtn.addEventListener("click", () => void load(loadedOnce));
 
   // Bereits gecachtes Ergebnis sofort anzeigen (kein Prozessstart).
-  void peekIntrospection(server.name, scope, server.project_path ?? undefined)
+  const peek =
+    origin.kind === "client"
+      ? peekClientIntrospection(origin.id, server.name)
+      : peekIntrospection(server.name, origin.scope, origin.projectPath);
+  void peek
     .then((cached) => {
       if (cached && !loadedOnce) showResult(cached);
     })
@@ -436,23 +483,89 @@ export interface DetailOptions {
   /// Aktuell gewählter Projekt-Kontext (`undefined` = kein Projekt gewählt).
   /// Wird beim Scope-Wechsel als ZIEL-Projekt gebraucht.
   projectPath?: string;
+  /// Erkannte Datei-Clients (Feature 16) – für „Kopieren nach…" und den
+  /// Pfad-/Neustart-Hinweis bei Client-Servern.
+  clients?: ClientInfo[];
 }
 
-/// Öffnet ein Formular-Modal zum Duplizieren eines Servers (Original bleibt bestehen).
-function openDuplicateModal(server: MergedServer, onDone: () => void): void {
-  const currentScope = server.scope as Scope;
+/// Ein wählbares Ziel beim Kopieren – getaggt, damit der Select-Wert nur an
+/// EINER Stelle interpretiert wird.
+type CopyTarget = { kind: "client"; client: ClientInfo } | { kind: "scope"; scope: Scope };
+
+interface TargetOption {
+  value: string;
+  label: string;
+  target: CopyTarget;
+  /// Das Ziel kann diese Definition nicht laden (Remote-Server in einen
+  /// Client ohne Remote-Fähigkeit) – die Option wird deaktiviert statt den
+  /// Fehler bis zum Speichern zu verstecken.
+  blocked?: boolean;
+}
+
+/// Alle Ziel-Optionen: die drei Claude-Code-Scopes plus je ein erkannter
+/// Datei-Client (die Quelle selbst ausgenommen).
+function targetOptions(
+  clients: ClientInfo[],
+  sourceClientId: string | null,
+  isRemote: boolean,
+): TargetOption[] {
+  const options: TargetOption[] = ALL_SCOPES.map((scope) => ({
+    value: `scope:${scope}`,
+    label: SCOPE_LABELS[scope],
+    target: { kind: "scope", scope },
+  }));
+  for (const client of clients) {
+    if (client.id === sourceClientId) continue;
+    const blocked = isRemote && !client.caps.remote;
+    options.push({
+      value: `client:${client.id}`,
+      label: blocked ? `${client.label} – nimmt keine Remote-Server` : client.label,
+      target: { kind: "client", client },
+      blocked,
+    });
+  }
+  return options;
+}
+
+function buildTargetSelect(options: TargetOption[], selected: string): HTMLSelectElement {
+  const select = h("select", { class: "inp" }) as HTMLSelectElement;
+  for (const option of options) {
+    const el = h("option", { value: option.value }, option.label) as HTMLOptionElement;
+    if (option.blocked) el.disabled = true;
+    select.append(el);
+  }
+  select.value = selected;
+  return select;
+}
+
+/// Öffnet ein Formular-Modal zum Kopieren eines Servers. Das Original bleibt
+/// bestehen; Ziel ist ein Claude-Code-Scope oder ein erkannter Datei-Client.
+function openCopyModal(server: MergedServer, clients: ClientInfo[], onDone: () => void): void {
+  const source = originOf(server);
+  if (!source) return; // extern verwaltet: nichts zu kopieren
+  const sourceClientId = source.kind === "client" ? source.id : null;
+  const sourceScope = source.kind === "scope" ? source.scope : null;
+
+  // Quelle als Endpunkt – unveränderlich, kommt aus dem angezeigten Server.
+  const from: CopyEndpoint =
+    source.kind === "client"
+      ? { kind: "client", id: source.id }
+      : { kind: "claude_code", scope: source.scope, project_path: server.project_path };
+
+  // Remote-Definition (http/sse)? Dann sind Clients ohne Remote-Fähigkeit kein
+  // gültiges Ziel.
+  const isRemote = server.entry ? transportOfEntry(server.entry) !== "stdio" : false;
 
   const nameInput = h("input", { class: "inp" }) as HTMLInputElement;
-  nameInput.value = `${server.name}-kopie`;
+  let nameTouched = false;
+  nameInput.addEventListener("input", () => {
+    nameTouched = true;
+  });
 
-  const scopeSelect = h(
-    "select",
-    { class: "inp" },
-    h("option", { value: "user" }, "user (global)"),
-    h("option", { value: "local" }, "local (projekt-privat)"),
-    h("option", { value: "project" }, "project (.mcp.json)"),
-  ) as HTMLSelectElement;
-  scopeSelect.value = currentScope;
+  const options = targetOptions(clients, sourceClientId, isRemote);
+  // Vorbelegung: bei Claude-Code-Servern der eigene Scope (klassisches
+  // Duplizieren), bei Client-Servern der erste Eintrag (user).
+  const targetSelect = buildTargetSelect(options, `scope:${sourceScope ?? "user"}`);
 
   // Projekt-Auswahl: Dropdown aus bekannten Projekten + Freitext-Pfad.
   const projSelect = h("select", { class: "inp" }, h("option", { value: "" }, "– Projekt wählen –")) as HTMLSelectElement;
@@ -485,51 +598,72 @@ function openDuplicateModal(server: MergedServer, onDone: () => void): void {
     h("div", { class: "scope-row" }, projSelect, projInput),
     "Ziel-Verzeichnis für local/project (Dropdown oder eigener Pfad).",
   );
-  const scopeHint = h("div", { class: "field-hint", text: "" });
+  const targetHint = h("div", { class: "field-hint", text: "" });
 
-  const syncScopeUi = () => {
-    const isProjectScoped = scopeSelect.value === "local" || scopeSelect.value === "project";
-    projField.style.display = isProjectScoped ? "" : "none";
-    scopeHint.textContent =
-      scopeSelect.value === "project"
-        ? "Der Server wird in .mcp.json des Zielprojekts angelegt und muss dort ggf. erst bestätigt werden."
-        : "";
+  /// Gewähltes Ziel. Der Select wird ausschließlich aus `options` aufgebaut,
+  /// daher greift der Fallback (erster Scope) nie.
+  const currentTarget = (): CopyTarget =>
+    (options.find((o) => o.value === targetSelect.value) ?? options[0]).target;
+
+  /// Ziel als Endpunkt für das Backend.
+  const endpointOf = (to: CopyTarget): CopyEndpoint =>
+    to.kind === "client"
+      ? { kind: "client", id: to.client.id }
+      : {
+          kind: "claude_code",
+          scope: to.scope,
+          project_path: to.scope === "user" ? null : projInput.value.trim() || null,
+        };
+
+  const syncTargetUi = () => {
+    const to = currentTarget();
+    projField.style.display = to.kind === "scope" && to.scope !== "user" ? "" : "none";
+    targetHint.textContent =
+      to.kind === "client"
+        ? `${to.client.label} lädt die Konfiguration beim Neustart. Datei: ${to.client.config_path}`
+        : to.scope === "project"
+          ? "Der Server wird in .mcp.json des Zielprojekts angelegt und muss dort ggf. erst bestätigt werden."
+          : "";
+    // Zeigt das Ziel auf denselben Ort wie die Quelle, braucht die Kopie zwingend
+    // einen anderen Namen. Solange der Nutzer den Namen nicht angefasst hat,
+    // passend vorbelegen.
+    const sameTarget = to.kind === "scope" && to.scope === sourceScope;
+    if (!nameTouched) nameInput.value = sameTarget ? `${server.name}-kopie` : server.name;
   };
-  scopeSelect.addEventListener("change", syncScopeUi);
-  syncScopeUi();
+  targetSelect.addEventListener("change", syncTargetUi);
+  syncTargetUi();
 
   const status = h("p", { class: "form-status" });
   const cancelBtn = h("button", { class: "btn" }, "Abbrechen") as HTMLButtonElement;
-  const okBtn = h("button", { class: "btn btn-primary" }, "Duplizieren") as HTMLButtonElement;
+  const okBtn = h("button", { class: "btn btn-primary" }, "Kopieren") as HTMLButtonElement;
 
   const form = h(
     "div",
     { class: "server-form" },
-    field("Neuer Name", nameInput),
-    field("Ziel-Scope", scopeSelect, undefined),
-    scopeHint,
+    field("Name der Kopie", nameInput),
+    field("Ziel", targetSelect),
+    targetHint,
     projField,
     status,
   );
 
-  const modal = openModal(`Duplizieren: ${server.name}`, form, [cancelBtn, okBtn]);
+  const modal = openModal(`Kopieren nach…: ${server.name}`, form, [cancelBtn, okBtn]);
   cancelBtn.addEventListener("click", () => modal.close());
   nameInput.focus();
   nameInput.select();
 
   okBtn.addEventListener("click", async () => {
     const newName = nameInput.value.trim();
-    const toScope = scopeSelect.value as Scope;
-    const isProjectScoped = toScope === "local" || toScope === "project";
-    const toProject = isProjectScoped ? projInput.value.trim() : undefined;
+    const to = currentTarget();
+    const endpoint = endpointOf(to);
 
     status.className = "form-status";
     if (!newName) {
       status.className = "form-status error";
-      status.textContent = "Bitte einen neuen Namen angeben.";
+      status.textContent = "Bitte einen Namen für die Kopie angeben.";
       return;
     }
-    if (isProjectScoped && !toProject) {
+    if (endpoint.kind === "claude_code" && endpoint.scope !== "user" && !endpoint.project_path) {
       status.className = "form-status error";
       status.textContent = "Bitte ein Zielprojekt wählen oder einen Pfad angeben.";
       return;
@@ -539,15 +673,12 @@ function openDuplicateModal(server: MergedServer, onDone: () => void): void {
     cancelBtn.disabled = true;
     status.textContent = "wird angelegt…";
     try {
-      await cloneServer(
-        server.name,
-        currentScope,
-        newName,
-        toScope,
-        server.project_path ?? undefined,
-        toProject,
+      await copyServerTo(server.name, from, endpoint, newName);
+      toast(
+        to.kind === "client"
+          ? `„${newName}" in ${to.client.label} angelegt – Neustart nötig, damit es greift.`
+          : `„${newName}" in ${to.scope} angelegt`,
       );
-      toast(`„${newName}" in ${toScope} angelegt`);
       modal.close();
       onDone();
     } catch (e) {
@@ -600,7 +731,10 @@ export function openDetail(server: MergedServer, opts: DetailOptions = {}): void
     recheckBtn.disabled = true;
     recheckIcon.classList.add("spin");
     try {
-      const status = await healthCheck(server.name, server.project_path ?? undefined);
+      // Datei-Clients kennt die claude-CLI nicht – dort per echtem Handshake prüfen.
+      const status = server.client_id
+        ? await checkClientServer(server.client_id, server.name)
+        : await healthCheck(server.name, server.project_path ?? undefined);
       server.status = status;
       renderStatus();
       opts.onRechecked?.(server, status);
@@ -636,11 +770,15 @@ export function openDetail(server: MergedServer, opts: DetailOptions = {}): void
   };
 
   revealBtn.addEventListener("click", async () => {
-    if (!server.scope) return;
+    const origin = originOf(server);
+    if (!origin) return;
     if (!revealed) {
       try {
         revealBtn.disabled = true;
-        revealedEntry = await revealServerEntry(server.scope, server.name, server.project_path ?? undefined);
+        revealedEntry =
+          origin.kind === "client"
+            ? await revealClientEntry(origin.id, server.name)
+            : await revealServerEntry(origin.scope, server.name, origin.projectPath);
         revealed = true;
         setIcon(revealIcon, "eye-off");
         revealLabel.textContent = "Secrets verbergen";
@@ -660,82 +798,102 @@ export function openDetail(server: MergedServer, opts: DetailOptions = {}): void
 
   renderDef();
 
-  // Scope-Wechsel (nur für editierbare Server mit bekanntem Scope).
+  // Scope-Wechsel und Kopieren. Der Abschnitt erscheint für beide Welten;
+  // „Scope ändern" gibt es nur in der Claude-Code-Welt.
   let scopeSection: HTMLElement | null = null;
-  if (server.editable && server.scope) {
-    const currentScope = server.scope;
-    const select = h(
-      "select",
-      { class: "inp" },
-      ...ALL_SCOPES.filter((s) => s !== currentScope).map((s) => h("option", { value: s }, s)),
-    ) as HTMLSelectElement;
-    const moveBtn = h("button", { class: "btn btn-small" }, "Verschieben");
-    moveBtn.addEventListener("click", () => {
-      const target = select.value as Scope;
-      // Zielprojekt MUSS mit: ohne den Parameter fällt das Backend aufs
-      // Home-Verzeichnis zurück und legt dort an. Weil die Verifikation dann
-      // ebenfalls Home liest, bleibt der Fehler unentdeckt – und danach wird die
-      // Quelle korrekt gelöscht: der Server verschwindet aus dem Projekt und
-      // liegt unbemerkt im Home-Projekt.
-      const targetProject = opts.projectPath ?? server.project_path ?? undefined;
-      // user-Scope liegt immer global in ~/.claude.json, unabhängig vom Projekt.
-      const targetLabel =
-        target === "user" ? "global (~/.claude.json)" : (targetProject ?? "Home-Verzeichnis");
-      openConfirm({
-        title: `Scope ändern: ${server.name}`,
-        message: `„${server.name}" von ${currentScope} nach ${target} verschieben? Zuerst im Ziel anlegen, dann aus der Quelle entfernen.`,
-        extra: h(
-          "p",
-          { class: "muted" },
-          "Ziel: ",
-          h("span", { class: "mono", text: targetLabel }),
-        ),
-        confirmLabel: "Verschieben",
-        onConfirm: async () => {
-          await setScope(
-            server.name,
-            currentScope,
-            target,
-            server.project_path ?? undefined,
-            targetProject,
-          );
-        },
-        onDone: () => {
-          toast(`Scope → ${target}`);
-          modal.close();
-          opts.onChanged?.();
-        },
+  if (server.editable && (server.scope || server.client_id)) {
+    const parts: Array<HTMLElement | null> = [];
+    if (server.scope) {
+      const currentScope = server.scope;
+      const select = h(
+        "select",
+        { class: "inp" },
+        ...ALL_SCOPES.filter((s) => s !== currentScope).map((s) => h("option", { value: s }, s)),
+      ) as HTMLSelectElement;
+      const moveBtn = h("button", { class: "btn btn-small" }, "Verschieben");
+      moveBtn.addEventListener("click", () => {
+        const target = select.value as Scope;
+        // Zielprojekt MUSS mit: ohne den Parameter fällt das Backend aufs
+        // Home-Verzeichnis zurück und legt dort an. Weil die Verifikation dann
+        // ebenfalls Home liest, bleibt der Fehler unentdeckt – und danach wird die
+        // Quelle korrekt gelöscht: der Server verschwindet aus dem Projekt und
+        // liegt unbemerkt im Home-Projekt.
+        const targetProject = opts.projectPath ?? server.project_path ?? undefined;
+        // user-Scope liegt immer global in ~/.claude.json, unabhängig vom Projekt.
+        const targetLabel =
+          target === "user" ? "global (~/.claude.json)" : (targetProject ?? "Home-Verzeichnis");
+        openConfirm({
+          title: `Scope ändern: ${server.name}`,
+          message: `„${server.name}" von ${currentScope} nach ${target} verschieben? Zuerst im Ziel anlegen, dann aus der Quelle entfernen.`,
+          extra: h(
+            "p",
+            { class: "muted" },
+            "Ziel: ",
+            h("span", { class: "mono", text: targetLabel }),
+          ),
+          confirmLabel: "Verschieben",
+          onConfirm: async () => {
+            await setScope(
+              server.name,
+              currentScope,
+              target,
+              server.project_path ?? undefined,
+              targetProject,
+            );
+          },
+          onDone: () => {
+            toast(`Scope → ${target}`);
+            modal.close();
+            opts.onChanged?.();
+          },
+        });
       });
-    });
-    const dupBtn = h("button", { class: "btn btn-small" }, "Duplizieren");
-    dupBtn.addEventListener("click", () => {
-      openDuplicateModal(server, () => {
+      parts.push(
+        h("h3", { text: "Scope ändern" }),
+        h("div", { class: "scope-row" }, select, moveBtn),
+      );
+    }
+
+    const copyBtn = h("button", { class: "btn btn-small" }, "Kopieren nach…");
+    copyBtn.addEventListener("click", () => {
+      openCopyModal(server, opts.clients ?? [], () => {
         modal.close();
         opts.onChanged?.();
       });
     });
-    scopeSection = h(
-      "div",
-      { class: "detail-scope" },
-      h("h3", { text: "Scope ändern" }),
-      h("div", { class: "scope-row" }, select, moveBtn),
-      h("h3", { text: "Duplizieren" }),
+    parts.push(
+      h("h3", { text: "Kopieren nach…" }),
       h(
         "div",
         { class: "scope-row" },
-        h("span", { class: "muted", text: "Kopie in einen anderen Scope / ein anderes Projekt anlegen." }),
-        dupBtn,
+        h("span", {
+          class: "muted",
+          text: "Kopie in einen anderen Scope, ein anderes Projekt oder einen anderen Client anlegen.",
+        }),
+        copyBtn,
       ),
     );
+    scopeSection = h("div", { class: "detail-scope" }, ...parts);
   }
 
   const logs = logsSection(server, opts);
+  // Datei-Client (Feature 16): Herkunftsdatei und Neustart-Hinweis zeigen.
+  const clientInfo = server.client_id
+    ? (opts.clients ?? []).find((c) => c.id === server.client_id)
+    : undefined;
   const body = h(
     "div",
     { class: "detail" },
     metaWrap,
     server.project_path
       ? h("p", { class: "muted mono", text: `Projekt: ${server.project_path}` })
+      : null,
+    clientInfo ? h("p", { class: "muted mono", text: clientInfo.config_path }) : null,
+    server.client_id
+      ? h("p", {
+          class: "muted",
+          text: `${clientInfo?.label ?? "Der Client"} lädt die Konfiguration erst beim Neustart neu.`,
+        })
       : null,
     h(
       "div",

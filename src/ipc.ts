@@ -40,6 +40,11 @@ export interface MergedServer {
   editable: boolean;
   has_secrets: boolean;
   collision: boolean;
+  /** Zugehöriger Datei-Client (Feature 16), z. B. "claude-desktop".
+   *  Nicht gesetzt => Claude-Code-Server (scope) bzw. extern verwaltet.
+   *  Rust hat `skip_serializing_if = "Option::is_none"`: das Feld ist entweder
+   *  abwesend oder ein String – `null` kommt nie an. */
+  client_id?: string;
   /** Nur gesetzt, wenn der Server bereits introspiziert wurde (aus dem Cache). */
   tool_count?: number;
   resource_count?: number;
@@ -466,24 +471,6 @@ export async function setScope(
   });
 }
 
-export async function cloneServer(
-  name: string,
-  fromScope: Scope,
-  newName: string,
-  toScope: Scope,
-  fromProject?: string,
-  toProject?: string,
-): Promise<void> {
-  return invoke("clone_server", {
-    name,
-    fromScope,
-    newName,
-    toScope,
-    fromProject: fromProject ?? null,
-    toProject: toProject ?? null,
-  });
-}
-
 /** Eine im Snapshot gesicherte Datei (Feldnamen = snake_case, serde). */
 export interface BackupFile {
   original_path: string;
@@ -511,8 +498,13 @@ export async function createBackup(note?: string, auto = false): Promise<BackupI
   return invoke<BackupInfo>("create_snapshot", { note: note ?? null, auto });
 }
 
-export async function restoreBackup(id: string, onlyPaths?: string[]): Promise<void> {
-  return invoke("restore_snapshot", { id, onlyPaths: onlyPaths ?? null });
+/**
+ * Stellt einen Snapshot wieder her. Liefert die Originalpfade, die übersprungen
+ * werden mussten: dort liegt heute ein Symlink, dessen Zustand das (ältere)
+ * Manifest nicht aufgezeichnet hat. Leeres Array = vollständig wiederhergestellt.
+ */
+export async function restoreBackup(id: string, onlyPaths?: string[]): Promise<string[]> {
+  return invoke<string[]>("restore_snapshot", { id, onlyPaths: onlyPaths ?? null });
 }
 
 export async function deleteBackup(id: string): Promise<void> {
@@ -548,4 +540,117 @@ export async function renameServer(
   projectPath?: string,
 ): Promise<void> {
   return invoke("rename_server", { name, scope, newName, projectPath: projectPath ?? null });
+}
+
+// --- Dateibasierte Clients (Feature 16) ---
+
+/** Was ein Datei-Client kann (Spiegel von Rust `ClientCaps`).
+ *
+ *  Bewusst auf das eine Merkmal beschränkt, das heute tatsächlich unterschieden
+ *  wird: stdio kann jeder Datei-Client, und ob ein Server ein-/ausschaltbar ist,
+ *  entscheidet weiterhin `main.ts::canToggle` über den Scope. */
+export interface ClientCaps {
+  /** Remote-Server (url/type != stdio) werden aus der Datei geladen. */
+  remote: boolean;
+}
+
+/** Ein erkannter Datei-Client (Spiegel von Rust `ClientInfo`). */
+export interface ClientInfo {
+  id: string;
+  label: string;
+  config_path: string;
+  server_count: number;
+  caps: ClientCaps;
+  /** Gesetzt, wenn die Datei existiert, aber nicht lesbar ist (kaputtes JSON). */
+  config_error?: string;
+}
+
+/** Quelle/Ziel beim Kopieren (serde tag "kind", snake_case). Die inneren
+ *  Feldnamen entsprechen exakt der Rust-Definition (keine camelCase-Wandlung). */
+export type CopyEndpoint =
+  | { kind: "claude_code"; scope: Scope; project_path?: string | null }
+  | { kind: "client"; id: string };
+
+export async function listClients(): Promise<ClientInfo[]> {
+  return invoke<ClientInfo[]>("list_clients");
+}
+
+export async function listClientServers(
+  clientId: string,
+  reveal = false,
+): Promise<MergedServer[]> {
+  return invoke<MergedServer[]>("list_client_servers", { clientId, reveal });
+}
+
+export async function addClientServer(
+  clientId: string,
+  name: string,
+  entry: ServerEntry,
+): Promise<void> {
+  return invoke("add_client_server", { clientId, name, entry });
+}
+
+export async function updateClientServer(
+  clientId: string,
+  name: string,
+  entry: ServerEntry,
+): Promise<void> {
+  return invoke("update_client_server", { clientId, name, entry });
+}
+
+export async function removeClientServer(
+  clientId: string,
+  name: string,
+  skipSnapshot = false,
+): Promise<void> {
+  return invoke("remove_client_server", { clientId, name, skipSnapshot });
+}
+
+/// UNMASKIERTE Definition eines Client-Servers – nur auf ausdrückliche Nutzer-Aktion.
+export async function revealClientEntry(
+  clientId: string,
+  name: string,
+): Promise<ServerEntry | null> {
+  return invoke<ServerEntry | null>("reveal_client_entry", { clientId, name });
+}
+
+export async function introspectClientServer(
+  clientId: string,
+  name: string,
+  refresh = false,
+): Promise<Introspection> {
+  return invoke<Introspection>("introspect_client_server", { clientId, name, refresh });
+}
+
+export async function peekClientIntrospection(
+  clientId: string,
+  name: string,
+): Promise<Introspection | null> {
+  return invoke<Introspection | null>("peek_client_introspection", { clientId, name });
+}
+
+/// „prüfen" für Client-Server: echter Handshake statt `claude mcp get`.
+export async function checkClientServer(
+  clientId: string,
+  name: string,
+): Promise<ServerStatus> {
+  return invoke<ServerStatus>("check_client_server", { clientId, name });
+}
+
+export async function preflightClientServer(
+  clientId: string,
+  name: string,
+): Promise<RuntimePreflight | null> {
+  return invoke<RuntimePreflight | null>("preflight_client_server", { clientId, name });
+}
+
+/// Kopiert eine Definition zwischen Claude Code und einem Datei-Client (in beide
+/// Richtungen). Die Quelle bleibt bestehen.
+export async function copyServerTo(
+  name: string,
+  from: CopyEndpoint,
+  to: CopyEndpoint,
+  newName?: string,
+): Promise<void> {
+  return invoke("copy_server_to", { name, newName: newName ?? null, from, to });
 }

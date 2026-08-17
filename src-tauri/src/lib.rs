@@ -1,5 +1,6 @@
 mod assistant;
 mod claude_cli;
+mod clients;
 mod commands;
 mod config_read;
 mod introspect;
@@ -47,7 +48,6 @@ pub fn run() {
             commands::toggle_mcpjson_server,
             commands::toggle_user_server,
             commands::set_scope,
-            commands::clone_server,
             commands::list_conflicts,
             commands::rename_server,
             commands::run_claude_assistant,
@@ -58,6 +58,18 @@ pub fn run() {
             commands::list_snapshots,
             commands::restore_snapshot,
             commands::delete_snapshot,
+            // Feature 16 – Datei-Clients (Claude Desktop)
+            commands::list_clients,
+            commands::list_client_servers,
+            commands::add_client_server,
+            commands::update_client_server,
+            commands::remove_client_server,
+            commands::reveal_client_entry,
+            commands::introspect_client_server,
+            commands::peek_client_introspection,
+            commands::check_client_server,
+            commands::preflight_client_server,
+            commands::copy_server_to,
         ])
         .build(tauri::generate_context!())
         .expect("Fehler beim Starten der Tauri-Anwendung")

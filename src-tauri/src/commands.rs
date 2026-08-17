@@ -2,7 +2,7 @@
 //! claude_cli / config_read / mask / parse.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Mutex, RwLock};
 use std::time::Duration;
@@ -10,6 +10,7 @@ use std::time::Duration;
 use tauri::{Emitter, State};
 
 use crate::claude_cli::{home_dir, resolve_claude, run_claude};
+use crate::clients::{self, ClientAdapter, ClientInfo};
 use crate::config_read::{
     claude_json_path, collect_definitions, collect_disabled, default_project_path,
     project_settings_local_path, read_json_value, settings_local_path, ScopedEntry,
@@ -18,8 +19,9 @@ use crate::mask::{
     entry_has_secrets, mask_entry, mask_summary, redact_json, redact_secrets, summarize_entry,
 };
 use crate::models::{
-    AppError, ClaudeInfo, ConflictDefinition, ConflictInfo, Introspection, MergedServer,
-    PlaygroundRequest, PlaygroundResult, ProjectInfo, Scope, ServerEntry, ServerStatus,
+    AppError, ClaudeInfo, ConflictDefinition, ConflictInfo, CopyEndpoint, Introspection,
+    MergedServer, PlaygroundRequest, PlaygroundResult, ProjectInfo, Scope, ServerEntry,
+    ServerStatus,
 };
 use crate::parse::{failure_detail, parse_list, status_from_text};
 use crate::preflight::RuntimePreflight;
@@ -119,6 +121,17 @@ impl AppState {
         }
     }
 
+    /// Räumt den Introspektions-Cache für genau einen Server eines Datei-Clients
+    /// ab (Feature 16). Nur dieser Cache: der Status-Cache ist projekt- und
+    /// CLI-basiert und für Datei-Clients ohne Bedeutung.
+    fn invalidate_client_server(&self, client_id: &str, name: &str) {
+        let key = introspection_key_client(client_id, name);
+        self.introspection_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
+    }
+
     /// Leert beide Caches vollständig. Nach einem Restore, der beliebig viele
     /// Definitionen in beliebigen Scopes und Projekten zurückdreht – da ist
     /// gezieltes Invalidieren nicht möglich.
@@ -149,7 +162,10 @@ impl AppState {
 /// Eine leere oder nur aus Leerraum bestehende `url` ist KEINE URL – sonst
 /// würde `{"command": "x", "url": ""}` als http gewertet und der Server liefe
 /// über den falschen Pfad. `src/transport.ts` muss identisch bleiben.
-fn transport_of(entry: &ServerEntry) -> &'static str {
+///
+/// `pub(crate)`, weil `clients::validate_entry` dieselbe Ableitung braucht:
+/// eine zweite Remote-Regel würde Frontend und Backend auseinanderlaufen lassen.
+pub(crate) fn transport_of(entry: &ServerEntry) -> &'static str {
     match entry.transport.as_deref() {
         Some("stdio") => return "stdio",
         Some("http") => return "http",
@@ -195,6 +211,37 @@ fn resolve_entry(
 fn introspection_key(scope: Scope, name: &str, project_path: &Option<String>) -> String {
     let dir = resolve_project_dir(project_path.clone());
     format!("{}::{}::{}", scope.cli_value(), name, dir.to_string_lossy())
+}
+
+/// Cache-Schlüssel für die Introspektion eines Servers in einem Datei-Client.
+/// Das Präfix `client:` kann nicht mit `introspection_key` kollidieren, weil
+/// dort an erster Stelle immer ein Scope-Wert (user/local/project) steht.
+fn introspection_key_client(client_id: &str, name: &str) -> String {
+    format!("client:{client_id}::{name}::")
+}
+
+fn apply_cached_introspection(server: &mut MergedServer, intro: &Introspection, set_status: bool) {
+    if intro.error.is_none() {
+        server.tool_count = Some(intro.tools.len());
+        server.resource_count = Some(intro.resources.len());
+        server.prompt_count = Some(intro.prompts.len());
+        server.connect_ms = intro.connect_ms;
+    }
+    if set_status {
+        server.status = status_of(intro);
+    }
+}
+
+/// Introspektions-Ergebnis als Status – die **einzige** Stelle dieser Abbildung.
+/// Stünde sie zweimal im Code (Liste und „prüfen"-Knopf), zeigte die eine Seite
+/// früher oder später etwas anderes als die andere.
+fn status_of(intro: &Introspection) -> ServerStatus {
+    match &intro.error {
+        Some(detail) => ServerStatus::Failed {
+            detail: Some(detail.clone()),
+        },
+        None => ServerStatus::Connected,
+    }
 }
 
 /// Prüft beim Start, ob die claude-CLI verfügbar ist, und liefert ihre Version.
@@ -278,14 +325,9 @@ pub async fn list_servers(
     for s in &mut servers {
         if let Some(scope) = s.scope {
             if let Some(intro) = cache.get(&introspection_key(scope, &s.name, &s.project_path)) {
-                // Ein gecachter Fehlversuch (error gesetzt, leere Listen) darf kein
-                // irreführendes „0·0·0"-Badge erzeugen.
-                if intro.error.is_none() {
-                    s.tool_count = Some(intro.tools.len());
-                    s.resource_count = Some(intro.resources.len());
-                    s.prompt_count = Some(intro.prompts.len());
-                    s.connect_ms = intro.connect_ms;
-                }
+                // Ohne Status: den liefert für Claude-Code-Server der
+                // Health-Check (`claude mcp list`).
+                apply_cached_introspection(s, intro, false);
             }
         }
     }
@@ -441,6 +483,7 @@ fn gather_servers(
             editable: true,
             has_secrets,
             collision: name_counts.get(&d.name).copied().unwrap_or(0) > 1,
+            client_id: None,
             tool_count: None,
             resource_count: None,
             prompt_count: None,
@@ -469,6 +512,7 @@ fn gather_servers(
             editable: false,
             has_secrets: false,
             collision: false,
+            client_id: None,
             tool_count: None,
             resource_count: None,
             prompt_count: None,
@@ -502,6 +546,7 @@ fn gather_servers(
             editable: true,
             has_secrets,
             collision: false,
+            client_id: None,
             tool_count: None,
             resource_count: None,
             prompt_count: None,
@@ -836,26 +881,21 @@ pub async fn preflight_server(
 ) -> Result<Option<RuntimePreflight>, AppError> {
     // Unmaskierte Definition auflösen (wie introspect_server): der Preflight
     // braucht den echten command/env-PATH.
-    let dir = resolve_project_dir(project_path.clone());
-    let entry = collect_definitions(&dir)
-        .into_iter()
-        .find(|d| d.scope == scope && d.name == name)
-        .map(|d| d.entry)
-        .or_else(|| {
-            (scope == Scope::User)
-                .then(|| crate::stash::peek(&name).map(|i| i.entry))
-                .flatten()
-        })
-        .ok_or_else(|| AppError::Io("Server-Definition nicht gefunden".into()))?;
+    let entry = resolve_entry(scope, &name, &project_path)?;
+    Ok(redacted_preflight(&entry))
+}
 
-    let mut preflight = crate::preflight::check(&entry);
-    // Version stammt aus Subprozess-Ausgabe – defensiv redigieren (Boundary).
+/// Laufzeit-Preflight mit redigierter Version. Die Version stammt aus der
+/// Ausgabe eines Subprozesses und wird vor dem Weg ins Webview redigiert
+/// (Boundary-Regel) – gemeinsam für Claude-Code- und Client-Server.
+fn redacted_preflight(entry: &ServerEntry) -> Option<RuntimePreflight> {
+    let mut preflight = crate::preflight::check(entry);
     if let Some(pf) = preflight.as_mut() {
         if let Some(v) = pf.version.as_mut() {
             *v = redact_secrets(v);
         }
     }
-    Ok(preflight)
+    preflight
 }
 
 /// Maskiert geheim aussehende Werte in Tool-Schemata, Beschreibungen und Notizen,
@@ -1055,7 +1095,21 @@ fn update_server_impl(
 /// Legt einen Auto-Snapshot an, sofern `note` gesetzt ist (`None` überspringt –
 /// z. B. wenn der Aufrufer für eine Bulk-Aktion bereits einen gemeinsamen
 /// Snapshot angelegt hat). Schlägt die Sicherung fehl, bricht die aufrufende
-/// destruktive Aktion ab (lieber nicht ändern als ungesichert ändern).
+/// Aktion ab (lieber nicht ändern als ungesichert ändern).
+///
+/// Zwei Auslöser, beide mit demselben Ziel „kein Vorzustand geht verloren":
+/// * vor **destruktiven** Aktionen (löschen, umbenennen, Scope wechseln) – der
+///   alte Stand wäre sonst weg;
+/// * vor **direkten Schreibvorgängen in fremde Konfigurationsdateien**
+///   (Datei-Clients wie Claude Desktop), deren Vorzustand die App nicht
+///   anderweitig rekonstruieren kann. Das gilt auch für reine Neuanlagen
+///   (`add_client_server`, `copy_to_client`): die Datei gehört uns nicht, und
+///   wir schreiben sie im Ganzen zurück.
+///
+/// Umgekehrt sichern die Claude-Code-Pfade beim Anlegen NICHT
+/// (`add_server`, `update_server`, `copy_to_claude_code`): dort schreibt die
+/// `claude`-CLI, und ein neuer Eintrag zerstört nichts – jede Kopie
+/// verbrauchte sonst einen Retention-Platz.
 ///
 /// Bewusst OHNE Rollback: der Aufrufer legt den Snapshot erst NACH allen
 /// billigen Vorbedingungsprüfungen an (kein Waisen-Snapshot bei „nicht
@@ -1300,7 +1354,7 @@ fn ensure_name_free(
 
 /// Kopiert eine Server-Definition verifiziert in einen Ziel-Scope: via
 /// `claude mcp add-json` anlegen, danach über `collect_definitions` bestätigen.
-/// Gemeinsame Basis für `set_scope` (Verschieben) und `clone_server` (Duplizieren) –
+/// Gemeinsame Basis für `set_scope` (Verschieben) und `copy_server_to` (Kopieren) –
 /// der Aufrufer entscheidet, ob die Quelle danach entfernt wird.
 fn copy_definition(
     settings: &AppSettings,
@@ -1423,97 +1477,6 @@ fn set_scope_impl(
     Ok(())
 }
 
-/// Dupliziert einen Server in einen (ggf. anderen) Scope/ein anderes Projekt.
-/// Die Quelle bleibt bestehen. Secrets werden backend-seitig aufgelöst und
-/// wandern nicht durchs Webview.
-#[tauri::command]
-pub async fn clone_server(
-    state: State<'_, AppState>,
-    name: String,
-    from_scope: Scope,
-    from_project: Option<String>,
-    new_name: String,
-    to_scope: Scope,
-    to_project: Option<String>,
-) -> Result<(), AppError> {
-    let result = clone_server_impl(
-        &state.settings(),
-        name,
-        from_scope,
-        from_project,
-        new_name.clone(),
-        to_scope,
-        to_project.clone(),
-    );
-    // Nur das Ziel – die Quelle bleibt unverändert bestehen.
-    state.invalidate_server(to_scope, &new_name, &to_project);
-    result
-}
-
-fn clone_server_impl(
-    settings: &AppSettings,
-    name: String,
-    from_scope: Scope,
-    from_project: Option<String>,
-    new_name: String,
-    to_scope: Scope,
-    to_project: Option<String>,
-) -> Result<(), AppError> {
-    let new_name = new_name.trim().to_string();
-    if new_name.is_empty() {
-        return Err(AppError::Io("Neuer Name darf nicht leer sein".into()));
-    }
-
-    let from_dir = resolve_project_dir(from_project.clone());
-    let to_dir = resolve_project_dir(to_project.clone());
-
-    // Ziel-Projektverzeichnis muss existieren – sonst könnte die CLI die Definition
-    // ins Leere schreiben. User-Scope braucht kein Projektverzeichnis.
-    if matches!(to_scope, Scope::Local | Scope::Project) && !to_dir.is_dir() {
-        return Err(AppError::Io(format!(
-            "Zielprojekt existiert nicht: {}",
-            to_dir.display()
-        )));
-    }
-
-    // 1. Unmaskierte Quell-Definition auflösen (Config zuerst, dann Stash für
-    //    deaktivierte User-Server – analog zu reveal_server_entry).
-    let from_defs = collect_definitions(&from_dir);
-    let entry = from_defs
-        .iter()
-        .find(|d| d.scope == from_scope && d.name == name)
-        .map(|d| d.entry.clone())
-        .or_else(|| {
-            if from_scope == Scope::User {
-                crate::stash::peek(&name).map(|item| item.entry)
-            } else {
-                None
-            }
-        })
-        .ok_or_else(|| AppError::Io("Quell-Definition nicht gefunden".into()))?;
-
-    // 2. Kollision im Ziel prüfen – niemals überschreiben. Deaktivierte User-Server
-    //    liegen ausschließlich im Stash (nicht in der Config) und müssen mitgeprüft
-    //    werden, sonst überschreibt ein späteres Deaktivieren den Klon lautlos.
-    //    Quell-Definitionen wiederverwenden, wenn Quelle und Ziel dasselbe
-    //    Verzeichnis meinen – auch bei unterschiedlicher Schreibweise (Symlink,
-    //    Trailing-Slash) via Kanonisierung, sonst nur ein zusätzlicher Read.
-    let same_dir = from_dir == to_dir
-        || matches!(
-            (std::fs::canonicalize(&from_dir), std::fs::canonicalize(&to_dir)),
-            (Ok(a), Ok(b)) if a == b
-        );
-    let to_defs = if same_dir {
-        from_defs
-    } else {
-        collect_definitions(&to_dir)
-    };
-    ensure_name_free(&to_defs, to_scope, &new_name, "Ziel-Scope")?;
-
-    // 3. Verifiziert im Ziel anlegen.
-    copy_definition(settings, &entry, &new_name, to_scope, &to_project)
-}
-
 /// Hash über die normalisierte Definition. `env`/`headers` sind `BTreeMap` →
 /// deterministische JSON-Serialisierung → stabiler Fingerprint (unabhängig von
 /// der Key-Reihenfolge). Kein Krypto nötig, nur Gleichheitsvergleich.
@@ -1606,7 +1569,7 @@ pub fn list_conflicts(project_path: Option<String>) -> Result<Vec<ConflictInfo>,
 
 /// Benennt einen Server innerhalb desselben Scopes um: Kopie unter dem neuen
 /// Namen verifiziert anlegen, dann das Original entfernen (Muster wie
-/// `clone_server`/`set_scope`). Lehnt ab, wenn der Zielname im selben Scope
+/// `copy_server_to`/`set_scope`). Lehnt ab, wenn der Zielname im selben Scope
 /// bereits existiert.
 #[tauri::command]
 pub async fn rename_server(
@@ -1887,12 +1850,17 @@ pub async fn list_snapshots() -> Result<Vec<crate::snapshot::SnapshotManifest>, 
 /// Stellt einen Snapshot wieder her (optional nur ausgewählte Dateien). Legt
 /// vorher selbst einen Auto-Snapshot des Ist-Zustands an. `async`: siehe
 /// `create_snapshot`.
+///
+/// Rückgabe: die übersprungenen Originalpfade (Altmanifest ohne Linkaufzeichnung
+/// und heute ein Symlink am Ziel, siehe `snapshot::restore_write_target`). Leer
+/// heißt „vollständig wiederhergestellt“; das Frontend muss den nicht-leeren
+/// Fall sichtbar machen.
 #[tauri::command]
 pub async fn restore_snapshot(
     state: State<'_, AppState>,
     id: String,
     only_paths: Option<Vec<String>>,
-) -> Result<(), AppError> {
+) -> Result<Vec<String>, AppError> {
     let result = crate::snapshot::restore(&id, only_paths, state.settings().snapshot_retention);
     // Ein Restore dreht beliebig viele Definitionen in beliebigen Scopes und
     // Projekten zurück – gezieltes Invalidieren ist nicht möglich, also alles
@@ -1905,6 +1873,534 @@ pub async fn restore_snapshot(
 #[tauri::command]
 pub async fn delete_snapshot(id: String) -> Result<(), AppError> {
     crate::snapshot::delete(&id)
+}
+
+// ---------------------------------------------------------------------------
+// Feature 16 – dateibasierte Clients (Claude Desktop)
+//
+// Bewusst eigene, dünne Commands statt `scope: Option<Scope>` + `client_id` in
+// die bestehenden zu fädeln: der gut getestete Claude-Code-Pfad bleibt
+// unangetastet, und weil alles über `client_id` schlüsselt, tragen dieselben
+// Commands später auch Cursor & Co. (Feature 17).
+// ---------------------------------------------------------------------------
+
+/// Ein Namens-Scan über `adapter.list()` – gemeinsame Basis der Helfer
+/// darunter, die sich nur darin unterscheiden, was sie aus dem Treffer machen.
+/// Ein Lesefehler der Konfigurationsdatei wird unverfälscht weitergereicht
+/// (kaputtes JSON darf nie als „nicht gefunden" erscheinen).
+fn find_client_entry(
+    adapter: &dyn ClientAdapter,
+    name: &str,
+) -> Result<Option<ServerEntry>, AppError> {
+    Ok(adapter
+        .list()?
+        .into_iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, e)| e))
+}
+
+/// Unmaskierte Definition eines Servers aus einem Datei-Client.
+fn client_entry(adapter: &dyn ClientAdapter, name: &str) -> Result<ServerEntry, AppError> {
+    find_client_entry(adapter, name)?.ok_or_else(|| {
+        AppError::Io(format!(
+            "Server „{name}“ in {} nicht gefunden",
+            adapter.label()
+        ))
+    })
+}
+
+/// Kollisionsschutz beim Anlegen/Kopieren – niemals eine fremde Definition
+/// überschreiben (Gegenstück zu `ensure_name_free` für Claude Code).
+fn ensure_client_name_free(adapter: &dyn ClientAdapter, name: &str) -> Result<(), AppError> {
+    if find_client_entry(adapter, name)?.is_some() {
+        return Err(AppError::Io(format!(
+            "Ein Server namens „{name}“ existiert in {} bereits",
+            adapter.label()
+        )));
+    }
+    Ok(())
+}
+
+/// Bestätigt nach einer Mutation den erwarteten Zustand (Muster
+/// `copy_definition`): ohne diese Gegenprobe bliebe ein nicht angekommener
+/// Schreibvorgang unbemerkt.
+fn verify_client(adapter: &dyn ClientAdapter, name: &str, expected: bool) -> Result<(), AppError> {
+    let present = find_client_entry(adapter, name)?.is_some();
+    if present != expected {
+        return Err(AppError::Io(if expected {
+            format!("Anlegen von „{name}“ wurde nicht bestätigt.")
+        } else {
+            format!("Entfernen von „{name}“ wurde nicht bestätigt.")
+        }));
+    }
+    Ok(())
+}
+
+/// Baut die Listenzeile für einen Client-Server (maskiert, sofern nicht `reveal`).
+fn merged_client_server(
+    client_id: &str,
+    name: String,
+    entry: &ServerEntry,
+    reveal: bool,
+) -> MergedServer {
+    MergedServer {
+        name,
+        // Kein Claude-Code-Scope: die Definition lebt in der Client-Datei.
+        scope: None,
+        origin: client_id.to_string(),
+        project_path: None,
+        entry: Some(mask_entry(entry, reveal)),
+        summary: mask_summary(&summarize_entry(entry), reveal),
+        // Datei-Clients haben keinen Bulk-Health-Check (kein `claude mcp list`);
+        // Status kommt erst über „prüfen" aus dem Introspektions-Cache.
+        status: ServerStatus::Unknown,
+        enabled: true,
+        editable: true,
+        has_secrets: entry_has_secrets(entry),
+        // Konflikt-Erkennung (Feature 04) ist scope-basiert; Namensgleichheit
+        // über Client-Grenzen hinweg gehört zu Feature 17.
+        collision: false,
+        client_id: Some(client_id.to_string()),
+        tool_count: None,
+        resource_count: None,
+        prompt_count: None,
+        connect_ms: None,
+        runtime_missing: runtime_missing_for(entry),
+    }
+}
+
+/// Erkannte Datei-Clients für die Seitenleiste. Nicht installierte Clients
+/// erscheinen gar nicht; eine kaputte Datei wird über `config_error` gemeldet.
+#[tauri::command]
+pub async fn list_clients() -> Result<Vec<ClientInfo>, AppError> {
+    Ok(clients::adapters()
+        .into_iter()
+        .filter_map(|a| {
+            let path = a.detect()?;
+            let (server_count, config_error) = match a.list() {
+                Ok(list) => (list.len(), None),
+                Err(e) => (0, Some(e.to_string())),
+            };
+            Some(ClientInfo {
+                id: a.id().to_string(),
+                label: a.label().to_string(),
+                config_path: path.to_string_lossy().to_string(),
+                server_count,
+                caps: a.capabilities(),
+                config_error,
+            })
+        })
+        .collect())
+}
+
+/// Server eines Datei-Clients als Listenzeilen (`reveal=false` maskiert alles).
+#[tauri::command]
+pub async fn list_client_servers(
+    state: State<'_, AppState>,
+    client_id: String,
+    reveal: bool,
+) -> Result<Vec<MergedServer>, AppError> {
+    let adapter = clients::adapter(&client_id)?;
+    let mut servers: Vec<MergedServer> = adapter
+        .list()?
+        .into_iter()
+        .map(|(name, entry)| merged_client_server(&client_id, name, &entry, reveal))
+        .collect();
+    servers.sort_by_key(|s| s.name.to_lowercase());
+
+    // Aus dem Introspektions-Cache anreichern: Zähler, Latenz und Status – so
+    // überlebt ein „prüfen" den nächsten Refresh. Anders als bei Claude Code ist
+    // der Cache hier die einzige Statusquelle (kein `claude mcp list`).
+    let cache = state
+        .introspection_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for s in &mut servers {
+        if let Some(intro) = cache.get(&introspection_key_client(&client_id, &s.name)) {
+            apply_cached_introspection(s, intro, true);
+        }
+    }
+    drop(cache);
+
+    Ok(servers)
+}
+
+/// Legt einen Server in der Konfigurationsdatei eines Clients an.
+#[tauri::command]
+pub async fn add_client_server(
+    state: State<'_, AppState>,
+    client_id: String,
+    name: String,
+    entry: ServerEntry,
+) -> Result<(), AppError> {
+    let adapter = clients::adapter(&client_id)?;
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err(AppError::Io("Name darf nicht leer sein".into()));
+    }
+    // Alle billigen Prüfungen VOR dem Snapshot (siehe `auto_snapshot`).
+    clients::validate_entry(&entry, adapter.capabilities())?;
+    ensure_client_name_free(&*adapter, &name)?;
+
+    auto_snapshot(
+        &state.settings(),
+        Some(format!("auto: {name} in {} anlegen", adapter.label())),
+    )?;
+    let result = adapter
+        .upsert(&name, &entry)
+        .and_then(|()| verify_client(&*adapter, &name, true));
+    state.invalidate_client_server(&client_id, &name);
+    result
+}
+
+/// Bearbeitet einen bestehenden Server eines Clients (kein stilles Anlegen).
+#[tauri::command]
+pub async fn update_client_server(
+    state: State<'_, AppState>,
+    client_id: String,
+    name: String,
+    entry: ServerEntry,
+) -> Result<(), AppError> {
+    let adapter = clients::adapter(&client_id)?;
+    let caps = adapter.capabilities();
+    // Alle billigen Prüfungen VOR dem Snapshot (siehe `auto_snapshot`) – auch
+    // die Remote-Prüfung, damit kein Waisen-Snapshot für eine Aktion entsteht,
+    // die `upsert` gleich darauf ablehnt.
+    clients::validate_entry(&entry, caps)?;
+    // Muss existieren: ein Tippfehler im Namen darf keinen zweiten Server
+    // anlegen. `client_entry` reicht einen Lesefehler der Datei unverfälscht
+    // weiter (kaputtes JSON darf nicht als „nicht gefunden" erscheinen).
+    let existing = client_entry(&*adapter, &name)?;
+    clients::ensure_overwritable(&name, &existing, adapter.label(), caps)?;
+
+    auto_snapshot(
+        &state.settings(),
+        Some(format!("auto: {name} in {} bearbeiten", adapter.label())),
+    )?;
+    let result = adapter
+        .upsert(&name, &entry)
+        .and_then(|()| verify_client(&*adapter, &name, true));
+    state.invalidate_client_server(&client_id, &name);
+    result
+}
+
+/// Entfernt einen Server aus der Konfigurationsdatei eines Clients.
+/// `skip_snapshot` unterdrückt den Auto-Snapshot (Bulk sichert einmalig vorab).
+#[tauri::command]
+pub async fn remove_client_server(
+    state: State<'_, AppState>,
+    client_id: String,
+    name: String,
+    skip_snapshot: Option<bool>,
+) -> Result<(), AppError> {
+    let adapter = clients::adapter(&client_id)?;
+    // Existenz vorab prüfen, damit kein Waisen-Snapshot für ein „nicht gefunden"
+    // entsteht (und ein Lesefehler der Datei als solcher gemeldet wird).
+    client_entry(&*adapter, &name)?;
+
+    auto_snapshot(
+        &state.settings(),
+        (!skip_snapshot.unwrap_or(false))
+            .then(|| format!("auto: {name} aus {} entfernen", adapter.label())),
+    )?;
+    let result = adapter
+        .remove(&name)
+        .and_then(|()| verify_client(&*adapter, &name, false));
+    state.invalidate_client_server(&client_id, &name);
+    result
+}
+
+/// UNMASKIERTE Definition eines Client-Servers – nur auf ausdrückliche
+/// Nutzer-Aktion. Ohne diesen Weg schriebe das Bearbeiten-Formular die
+/// Masken-Platzhalter zurück in die Datei.
+#[tauri::command]
+pub fn reveal_client_entry(
+    client_id: String,
+    name: String,
+) -> Result<Option<ServerEntry>, AppError> {
+    let adapter = clients::adapter(&client_id)?;
+    find_client_entry(&*adapter, &name)
+}
+
+/// Gemeinsamer Kern von `introspect_client_server` und `check_client_server`.
+fn introspect_client_impl(
+    state: &AppState,
+    client_id: &str,
+    name: &str,
+    refresh: bool,
+) -> Result<Introspection, AppError> {
+    let key = introspection_key_client(client_id, name);
+    if !refresh {
+        if let Some(cached) = state
+            .introspection_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .cloned()
+        {
+            return Ok(cached);
+        }
+    }
+
+    let adapter = clients::adapter(client_id)?;
+    let entry = client_entry(&*adapter, name)?;
+    // Für **App-geschriebene** Einträge garantiert `clients::validate_entry`,
+    // dass in der Datei nur stdio steht. `list()` parst die Datei aber bloß und
+    // prüft keine Capabilities: ein von Hand eingetragener Remote-Server
+    // erscheint sehr wohl in der Liste. Ihn durch `introspect_stdio` zu
+    // schicken, ergäbe ein irreführendes „kein command“ — deshalb hier dieselbe
+    // Prüfung mit derselben Begründung wie beim Schreiben.
+    clients::validate_entry(&entry, adapter.capabilities())?;
+    let mut introspection = crate::introspect::introspect_stdio(&entry, INTROSPECT_TIMEOUT);
+    mask_introspection(&mut introspection);
+
+    // Bewusst OHNE `metrics::record`: Client-Server haben keine Historie
+    // (die Sparkline ist an Scope + Projektpfad gebunden).
+    state
+        .introspection_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, introspection.clone());
+    Ok(introspection)
+}
+
+/// Introspiziert einen Client-Server per MCP-Handshake (startet den Prozess).
+#[tauri::command]
+pub async fn introspect_client_server(
+    state: State<'_, AppState>,
+    client_id: String,
+    name: String,
+    refresh: bool,
+) -> Result<Introspection, AppError> {
+    introspect_client_impl(&state, &client_id, &name, refresh)
+}
+
+/// Gecachtes Introspektions-Ergebnis eines Client-Servers – ohne Prozessstart.
+#[tauri::command]
+pub fn peek_client_introspection(
+    state: State<'_, AppState>,
+    client_id: String,
+    name: String,
+) -> Result<Option<Introspection>, AppError> {
+    let key = introspection_key_client(&client_id, &name);
+    Ok(state
+        .introspection_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned())
+}
+
+/// Der „prüfen"-Knopf für Client-Server: echter Handshake statt `claude mcp get`
+/// (die CLI kennt diese Server nicht). Füllt dabei den Introspektions-Cache, die
+/// Detailansicht zeigt die Fähigkeiten anschließend sofort.
+#[tauri::command]
+pub async fn check_client_server(
+    state: State<'_, AppState>,
+    client_id: String,
+    name: String,
+) -> Result<ServerStatus, AppError> {
+    let intro = introspect_client_impl(&state, &client_id, &name, true)?;
+    Ok(status_of(&intro))
+}
+
+/// Laufzeit-Preflight für einen Client-Server (startet den Server nicht).
+#[tauri::command]
+pub async fn preflight_client_server(
+    client_id: String,
+    name: String,
+) -> Result<Option<RuntimePreflight>, AppError> {
+    let adapter = clients::adapter(&client_id)?;
+    let entry = client_entry(&*adapter, &name)?;
+    Ok(redacted_preflight(&entry))
+}
+
+/// Zielname einer Kopie: `new_name` (getrimmt) oder – bei `None` – der
+/// Quellname. Ein ausdrücklich übergebener, aber leerer Name ist ein Fehler
+/// (der Nutzer wollte umbenennen); leer bleibt hier nie stillschweigend stehen.
+fn copy_target_name(name: &str, new_name: Option<String>) -> Result<String, AppError> {
+    let target = match new_name {
+        Some(n) => n.trim().to_string(),
+        None => name.trim().to_string(),
+    };
+    if target.is_empty() {
+        return Err(AppError::Io("Name darf nicht leer sein".into()));
+    }
+    Ok(target)
+}
+
+/// Meinen zwei Pfade dasselbe Verzeichnis – auch bei unterschiedlicher
+/// Schreibweise (Symlink, Trailing-Slash)?
+fn same_project_dir(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(x), Ok(y)) if x == y
+        )
+}
+
+/// Aufgelöste Quelle einer Kopie.
+struct CopySource {
+    /// Unmaskierte Definition.
+    entry: ServerEntry,
+    /// Nur bei einer Claude-Code-Quelle: Verzeichnis und die dort gelesenen
+    /// Definitionen. Meint das Ziel dasselbe Verzeichnis, spart das den zweiten
+    /// `collect_definitions`-Read.
+    claude_code: Option<(PathBuf, Vec<ScopedEntry>)>,
+}
+
+/// Löst die unmaskierte Quell-Definition eines Kopier-Endpunkts auf.
+fn copy_source(from: &CopyEndpoint, name: &str) -> Result<CopySource, AppError> {
+    match from {
+        CopyEndpoint::ClaudeCode {
+            scope,
+            project_path,
+        } => {
+            let dir = resolve_project_dir(project_path.clone());
+            let defs = collect_definitions(&dir);
+            let entry = defs
+                .iter()
+                .find(|d| d.scope == *scope && d.name == name)
+                .map(|d| d.entry.clone())
+                // Deaktivierte user-Server stehen nicht in der Config, sondern
+                // ausschließlich im Stash.
+                .or_else(|| {
+                    (*scope == Scope::User)
+                        .then(|| crate::stash::peek(name).map(|i| i.entry))
+                        .flatten()
+                })
+                .ok_or_else(|| AppError::Io("Quell-Definition nicht gefunden".into()))?;
+            Ok(CopySource {
+                entry,
+                claude_code: Some((dir, defs)),
+            })
+        }
+        CopyEndpoint::Client { id } => {
+            let adapter = clients::adapter(id)?;
+            Ok(CopySource {
+                entry: client_entry(&*adapter, name)?,
+                claude_code: None,
+            })
+        }
+    }
+}
+
+/// Kopieren mit Claude-Code-Ziel: Verzeichnis- und Kollisionsprüfung,
+/// verifiziertes Anlegen. Bewusst ohne Tauri-State – so bleibt der Pfad testbar
+/// (er hat den früheren `clone_server` abgelöst); den Cache räumt der Aufrufer ab.
+fn copy_to_claude_code(
+    settings: &AppSettings,
+    entry: &ServerEntry,
+    target: &str,
+    to_scope: Scope,
+    to_project: &Option<String>,
+    source: Option<(PathBuf, Vec<ScopedEntry>)>,
+) -> Result<(), AppError> {
+    let to_dir = resolve_project_dir(to_project.clone());
+    // Ohne existierendes Zielverzeichnis schriebe die CLI ins Leere.
+    if matches!(to_scope, Scope::Local | Scope::Project) && !to_dir.is_dir() {
+        return Err(AppError::Io(format!(
+            "Zielprojekt existiert nicht: {}",
+            to_dir.display()
+        )));
+    }
+    // Kollision im Ziel – niemals überschreiben. Die Definitionen der Quelle
+    // werden wiederverwendet, wenn beide Seiten dasselbe Verzeichnis meinen.
+    let to_defs = match source {
+        Some((from_dir, defs)) if same_project_dir(&from_dir, &to_dir) => defs,
+        _ => collect_definitions(&to_dir),
+    };
+    ensure_name_free(&to_defs, to_scope, target, "Ziel-Scope")?;
+
+    // BEWUSST ohne `auto_snapshot`: `auto_snapshot` sichert laut eigenem Vertrag
+    // vor einer *destruktiven* Aktion. Hier entsteht nur ein neuer Eintrag —
+    // Kollisionen hat `ensure_name_free` bereits abgelehnt, die Quelle bleibt
+    // unangetastet. Genau wie `add_server`/`update_server` sichert dieser Zweig
+    // deshalb nicht; jede Kopie verbrauchte sonst einen Retention-Platz.
+    // Für Datei-Clients (`copy_to_client`) gilt das Gegenteil: dort schreiben
+    // wir direkt in eine fremde Datei, die vorher gesichert gehört.
+    copy_definition(settings, entry, target, to_scope, to_project)
+}
+
+/// Kopieren mit Datei-Client als Ziel: Kollisionsprüfung, Sicherung,
+/// verifiziertes Anlegen.
+fn copy_to_client(
+    settings: &AppSettings,
+    name: &str,
+    entry: &ServerEntry,
+    target: &str,
+    adapter: &dyn ClientAdapter,
+) -> Result<(), AppError> {
+    ensure_client_name_free(adapter, target)?;
+    auto_snapshot(
+        settings,
+        Some(format!("auto: {name} nach {} kopieren", adapter.label())),
+    )?;
+    adapter
+        .upsert(target, entry)
+        .and_then(|()| verify_client(adapter, target, true))
+}
+
+/// Kopiert eine Server-Definition zwischen den Welten (Claude Code ↔ Datei-Client)
+/// bzw. innerhalb einer Welt. Die Quelle bleibt unangetastet; Secrets werden
+/// backend-seitig aufgelöst und wandern nicht durchs Webview.
+#[tauri::command]
+pub async fn copy_server_to(
+    state: State<'_, AppState>,
+    name: String,
+    new_name: Option<String>,
+    from: CopyEndpoint,
+    to: CopyEndpoint,
+) -> Result<(), AppError> {
+    let target = copy_server_to_impl(&state.settings(), &name, new_name, &from, &to)?;
+    // Nur der ZIEL-Schlüssel wird abgeräumt – die Quelle bleibt unangetastet und
+    // behält ihren Cache. Nur im Erfolgsfall: der Zielname war vorher garantiert
+    // frei (`ensure_name_free` / `ensure_client_name_free`), unter ihm kann also
+    // kein alter Cache-Eintrag liegen, den ein Fehlschlag stehen ließe.
+    match &to {
+        CopyEndpoint::ClaudeCode {
+            scope,
+            project_path,
+        } => state.invalidate_server(*scope, &target, project_path),
+        CopyEndpoint::Client { id } => state.invalidate_client_server(id, &target),
+    }
+    Ok(())
+}
+
+/// Kern von [`copy_server_to`] ohne Tauri-State – dieselbe Reihenfolge, die auch
+/// die Tests prüfen (Muster `set_scope_impl` / `rename_server_impl`): Zielname →
+/// Quelle auflösen → Capability-Prüfung am Ziel → Kollision → ggf. Sicherung →
+/// verifiziertes Anlegen. Liefert den Zielnamen für die Cache-Invalidierung.
+fn copy_server_to_impl(
+    settings: &AppSettings,
+    name: &str,
+    new_name: Option<String>,
+    from: &CopyEndpoint,
+    to: &CopyEndpoint,
+) -> Result<String, AppError> {
+    let target = copy_target_name(name, new_name)?;
+    let source = copy_source(from, name)?;
+    match to {
+        // Claude Code als Ziel hat keine Capability-Einschränkung: stdio und
+        // Remote sind dort beide möglich – deshalb hier keine Prüfung.
+        CopyEndpoint::ClaudeCode {
+            scope,
+            project_path,
+        } => copy_to_claude_code(
+            settings,
+            &source.entry,
+            &target,
+            *scope,
+            project_path,
+            source.claude_code,
+        )?,
+        CopyEndpoint::Client { id } => {
+            let adapter = clients::adapter(id)?;
+            clients::validate_entry(&source.entry, adapter.capabilities())?;
+            copy_to_client(settings, name, &source.entry, &target, &*adapter)?
+        }
+    }
+    Ok(target)
 }
 
 #[cfg(test)]
@@ -1949,8 +2445,11 @@ mod tests {
     ) -> Result<(), AppError> {
         toggle_mcpjson_server_impl(name, project_path, enabled)
     }
-    #[allow(clippy::too_many_arguments)]
-    fn clone_server(
+    /// Test-Hülle für den Claude-Code-Zweig von `copy_server_to`: ruft dieselbe
+    /// Orchestrierungs-Funktion wie der Command (nur ohne Tauri-State und damit
+    /// ohne Cache-Invalidierung), damit die Reihenfolge der Schritte im echten
+    /// Pfad geprüft wird und nicht in einer Nachbildung.
+    fn copy_to_scope(
         name: String,
         from_scope: Scope,
         from_project: Option<String>,
@@ -1958,7 +2457,15 @@ mod tests {
         to_scope: Scope,
         to_project: Option<String>,
     ) -> Result<(), AppError> {
-        clone_server_impl(&cfg(), name, from_scope, from_project, new_name, to_scope, to_project)
+        let from = CopyEndpoint::ClaudeCode {
+            scope: from_scope,
+            project_path: from_project,
+        };
+        let to = CopyEndpoint::ClaudeCode {
+            scope: to_scope,
+            project_path: to_project,
+        };
+        copy_server_to_impl(&cfg(), &name, Some(new_name), &from, &to).map(|_| ())
     }
 
     /// Muss mit `src/transport.ts::transportOfEntry` exakt übereinstimmen –
@@ -2441,32 +2948,30 @@ mod tests {
     }
 
     /// Leerer Zielname wird abgelehnt, bevor irgendetwas an der Umgebung passiert.
+    /// (Rein rechnend – kein Dateisystem.)
     #[test]
-    fn clone_server_rejects_empty_name() {
-        let err = clone_server(
-            "irgendwas".into(),
-            Scope::User,
-            None,
-            "   ".into(),
-            Scope::User,
-            None,
-        )
-        .expect_err("leerer Name muss abgelehnt werden");
+    fn copy_target_name_rejects_empty_name() {
+        let err = copy_target_name("irgendwas", Some("   ".into()))
+            .expect_err("leerer Name muss abgelehnt werden");
         assert!(matches!(err, AppError::Io(_)));
+        // Kein neuer Name ⇒ Quellname; nur Leerraum als Quelle ist ebenfalls leer.
+        assert_eq!(copy_target_name(" quelle ", None).unwrap(), "quelle");
+        assert_eq!(copy_target_name("quelle", Some(" neu ".into())).unwrap(), "neu");
+        assert!(copy_target_name("   ", None).is_err());
     }
 
-    /// Opt-in: Duplizieren user -> local. Quelle bleibt bestehen, Klon entsteht
+    /// Opt-in: Kopieren user -> local. Quelle bleibt bestehen, die Kopie entsteht
     /// unter neuem Namen.
     #[test]
     #[ignore]
-    fn clone_server_roundtrip() {
-        let name = "mcpmgr-clonetest".to_string();
-        let clone_name = "mcpmgr-clonetest-kopie".to_string();
+    fn copy_to_scope_roundtrip() {
+        let name = "mcpmgr-copytest".to_string();
+        let copy_name = "mcpmgr-copytest-kopie".to_string();
         let dir = default_project_path();
         let proj = dir.to_string_lossy().to_string();
 
         let _ = remove_server(name.clone(), Scope::User, None);
-        let _ = remove_server(clone_name.clone(), Scope::Local, Some(proj.clone()));
+        let _ = remove_server(copy_name.clone(), Scope::Local, Some(proj.clone()));
 
         let e = ServerEntry {
             transport: Some("stdio".into()),
@@ -2476,46 +2981,46 @@ mod tests {
         };
         add_server(name.clone(), Scope::User, None, e).expect("add");
 
-        clone_server(
+        copy_to_scope(
             name.clone(),
             Scope::User,
             None,
-            clone_name.clone(),
+            copy_name.clone(),
             Scope::Local,
             Some(proj.clone()),
         )
-        .expect("clone_server");
+        .expect("copy_to_scope");
 
         let defs = collect_definitions(&dir);
         let src_stays = defs.iter().any(|d| d.scope == Scope::User && d.name == name);
-        let clone_here = defs.iter().any(|d| d.scope == Scope::Local && d.name == clone_name);
+        let copy_here = defs.iter().any(|d| d.scope == Scope::Local && d.name == copy_name);
         assert!(src_stays, "Quelle bleibt in user");
-        assert!(clone_here, "Klon liegt in local");
+        assert!(copy_here, "Kopie liegt in local");
 
-        // Kollision: erneutes Klonen auf denselben Zielnamen muss scheitern.
-        let dup = clone_server(
+        // Kollision: erneutes Kopieren auf denselben Zielnamen muss scheitern.
+        let dup = copy_to_scope(
             name.clone(),
             Scope::User,
             None,
-            clone_name.clone(),
+            copy_name.clone(),
             Scope::Local,
             Some(proj.clone()),
         );
         assert!(dup.is_err(), "Kollision wird abgelehnt");
 
         remove_server(name, Scope::User, None).expect("cleanup src");
-        remove_server(clone_name, Scope::Local, Some(proj)).expect("cleanup clone");
-        eprintln!("clone_server OK");
+        remove_server(copy_name, Scope::Local, Some(proj)).expect("cleanup copy");
+        eprintln!("copy_to_scope OK");
     }
 
-    /// Opt-in: Klonen auf den Namen eines nur deaktivierten (im Stash liegenden)
-    /// User-Servers muss als Kollision abgelehnt werden – sonst würde der Klon
+    /// Opt-in: Kopieren auf den Namen eines nur deaktivierten (im Stash liegenden)
+    /// User-Servers muss als Kollision abgelehnt werden – sonst würde die Kopie
     /// den deaktivierten Eintrag beim nächsten Deaktivieren lautlos überschreiben.
     #[test]
     #[ignore]
-    fn clone_rejects_stashed_name_collision() {
-        let src = "mcpmgr-clonesrc".to_string();
-        let target = "mcpmgr-clonestash".to_string();
+    fn copy_to_scope_rejects_stashed_name_collision() {
+        let src = "mcpmgr-copysrc".to_string();
+        let target = "mcpmgr-copystash".to_string();
         let e = ServerEntry {
             transport: Some("stdio".into()),
             command: Some("echo".into()),
@@ -2528,12 +3033,12 @@ mod tests {
         add_server(src.clone(), Scope::User, None, e.clone()).expect("add src");
         crate::stash::upsert(&target, e).expect("stash target");
 
-        let res = clone_server(src.clone(), Scope::User, None, target.clone(), Scope::User, None);
+        let res = copy_to_scope(src.clone(), Scope::User, None, target.clone(), Scope::User, None);
         assert!(res.is_err(), "Kollision mit Stash-Eintrag muss abgelehnt werden");
 
         remove_server(src, Scope::User, None).expect("cleanup src");
         crate::stash::remove(&target).expect("cleanup stash");
-        eprintln!("clone_rejects_stashed_name_collision OK");
+        eprintln!("copy_to_scope_rejects_stashed_name_collision OK");
     }
 
     /// Opt-in: echter Assistent-Aufruf gegen einen bekannten MCP-Server (ruft
@@ -2589,5 +3094,116 @@ mod tests {
             before.len(),
             after.len()
         );
+    }
+
+    // --- Feature 16: Datei-Clients ---
+
+    /// Adapter gegen ein leeres Temp-Verzeichnis – die Client-Helfer sind reine
+    /// Lesevorgänge über den Adapter und damit ohne reale Umgebung testbar.
+    fn client_in_tmp(tag: &str) -> clients::claude_desktop::ClaudeDesktop {
+        let dir = std::env::temp_dir().join(format!("mcpmgr-cmd-client-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        clients::claude_desktop::ClaudeDesktop::with_path(dir.join("claude_desktop_config.json"))
+    }
+
+    #[test]
+    fn ensure_client_name_free_meldet_belegten_namen() {
+        let a = client_in_tmp("name-frei");
+        let entry = ServerEntry {
+            command: Some("npx".into()),
+            ..Default::default()
+        };
+        // Leere Datei: jeder Name ist frei.
+        ensure_client_name_free(&a, "demo").expect("frei vor dem Anlegen");
+
+        a.upsert("demo", &entry).unwrap();
+        let err = ensure_client_name_free(&a, "demo")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("demo"), "Fehler nennt den Namen: {err}");
+        // Groß-/Kleinschreibung ist in der Datei bedeutsam – anderer Name, frei.
+        ensure_client_name_free(&a, "Demo").expect("anderer Name bleibt frei");
+    }
+
+    #[test]
+    fn verify_client_erkennt_nicht_angekommenen_schreibvorgang() {
+        let a = client_in_tmp("verify");
+        let entry = ServerEntry {
+            command: Some("npx".into()),
+            ..Default::default()
+        };
+        // Erwartet „angelegt", ist aber nicht da ⇒ Fehler.
+        assert!(verify_client(&a, "demo", true).is_err());
+        // Erwartet „entfernt", ist auch nicht da ⇒ ok.
+        verify_client(&a, "demo", false).expect("abwesend wie erwartet");
+
+        a.upsert("demo", &entry).unwrap();
+        verify_client(&a, "demo", true).expect("angelegt wie erwartet");
+        // Erwartet „entfernt", liegt aber noch da ⇒ Fehler.
+        assert!(verify_client(&a, "demo", false).is_err());
+    }
+
+    #[test]
+    fn introspection_key_client_kollidiert_nicht_mit_scope_schluessel() {
+        let client = introspection_key_client("claude-desktop", "demo");
+        let scoped = introspection_key(Scope::User, "demo", &None);
+        assert_ne!(client, scoped);
+        assert!(client.starts_with("client:"));
+        // Zwei Clients mit gleichem Servernamen bleiben unterscheidbar.
+        assert_ne!(client, introspection_key_client("cursor", "demo"));
+    }
+
+    /// Reale Umgebung: liest die echte Claude-Desktop-Konfiguration.
+    /// `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn list_clients_reale_umgebung() {
+        for a in crate::clients::adapters() {
+            let Some(path) = a.detect() else {
+                eprintln!("{} nicht erkannt", a.label());
+                continue;
+            };
+            assert!(!path.as_os_str().is_empty(), "Pfad gesetzt");
+            match a.list() {
+                Ok(list) => eprintln!("{}: {} Server ({})", a.label(), list.len(), path.display()),
+                Err(e) => eprintln!("{}: Konfiguration nicht lesbar: {e}", a.label()),
+            }
+        }
+    }
+
+    /// Reale Umgebung: Wegwerf-Server in Claude Desktop anlegen, auslesen und
+    /// wieder entfernen. `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn client_roundtrip_reale_umgebung() {
+        let adapter = crate::clients::adapter("claude-desktop").expect("adapter");
+        if adapter.detect().is_none() {
+            eprintln!("Claude Desktop nicht installiert – Test übersprungen");
+            return;
+        }
+        let name = "mcpmgr-selftest-desktop";
+        let _ = adapter.remove(name);
+
+        let entry = ServerEntry {
+            command: Some("echo".into()),
+            args: Some(vec!["hallo".into()]),
+            ..Default::default()
+        };
+        adapter.upsert(name, &entry).expect("upsert");
+        let found = adapter
+            .list()
+            .expect("list")
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .expect("angelegt");
+        assert_eq!(found.1.command.as_deref(), Some("echo"));
+
+        adapter.remove(name).expect("remove");
+        assert!(
+            !adapter.list().expect("list2").iter().any(|(n, _)| n == name),
+            "wieder entfernt"
+        );
+        eprintln!("client_roundtrip OK");
     }
 }

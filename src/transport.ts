@@ -11,6 +11,10 @@ export type Transport = "stdio" | "http" | "sse";
 /// Bewusst identisch gehalten: exakte (case-sensitive) Schreibweise von `type`,
 /// case-sensitive `/sse`-Erkennung, beliebig viele End-Slashes, leere bzw.
 /// blanke `url` zählt nicht als URL, und ohne alles gilt stdio.
+///
+/// Auch die Capability-Prüfung der Datei-Clients (`clients::validate_entry`)
+/// leitet „Remote?" aus `transport_of` ab – es gibt also genau **eine** Regel
+/// auf beiden Seiten, keine dritte für Clients.
 export function transportOfEntry(e: ServerEntry): Transport {
   if (e.type === "stdio" || e.type === "http" || e.type === "sse") return e.type;
   // type fehlt: SSE-Endpunkte enden konventionell auf „/sse" – sonst http annehmen.

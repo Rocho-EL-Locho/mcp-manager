@@ -8,8 +8,9 @@ import type { BackupInfo } from "../ipc";
 export interface BackupHandlers {
   /// Erstellt einen manuellen Snapshot (reiner IPC-Aufruf).
   create: (note: string | undefined) => Promise<void>;
-  /// Stellt einen Snapshot wieder her; `onlyPaths` = undefined bedeutet „alle".
-  restore: (id: string, onlyPaths: string[] | undefined) => Promise<void>;
+  /// Stellt einen Snapshot wieder her; `onlyPaths` = undefined bedeutet „alle“.
+  /// Liefert die übersprungenen Originalpfade (leer = vollständig).
+  restore: (id: string, onlyPaths: string[] | undefined) => Promise<string[]>;
   /// Löscht einen Snapshot.
   remove: (id: string) => Promise<void>;
   /// Nach jeder erfolgreichen Änderung aufrufen (löst refresh() aus).
@@ -72,7 +73,7 @@ function openCreateDialog(handlers: BackupHandlers): void {
       input,
       h("div", {
         class: "field-hint",
-        text: "Sichert ~/.claude.json, die settings-Dateien und alle Projekt-.mcp.json.",
+        text: "Sichert ~/.claude.json, die settings-Dateien, alle Projekt-.mcp.json und die Konfiguration erkannter Clients.",
       }),
     ),
     status,
@@ -146,6 +147,10 @@ function openRestoreDialog(backup: BackupInfo, home: string, handlers: BackupHan
     fileList,
   );
 
+  // Vom Backend übersprungene Pfade – zwischen onConfirm und onDone gemerkt,
+  // damit die Erfolgsmeldung einen Teil-Restore nicht als vollständigen ausgibt.
+  let skipped: string[] = [];
+
   openConfirm({
     title: "Snapshot wiederherstellen",
     message: `Snapshot vom ${formatTime(backup.created_at)} wiederherstellen?`,
@@ -159,10 +164,21 @@ function openRestoreDialog(backup: BackupInfo, home: string, handlers: BackupHan
       }
       // Alle ausgewählt -> undefined (kompletter Restore), sonst Teilmenge.
       const onlyPaths = selected.length === boxes.length ? undefined : selected;
-      await handlers.restore(backup.id, onlyPaths);
+      skipped = await handlers.restore(backup.id, onlyPaths);
     },
     onDone: () => {
-      toast("Wiederhergestellt");
+      if (skipped.length > 0) {
+        toast(
+          "Teilweise wiederhergestellt. Übersprungen, weil dort heute ein Symlink liegt, " +
+            `den der Snapshot nicht vermerkt hat: ${skipped
+              .map((p) => shortPath(p, home))
+              .join(", ")}`,
+          "error",
+          8000,
+        );
+      } else {
+        toast("Wiederhergestellt");
+      }
       handlers.onChanged();
     },
   });
